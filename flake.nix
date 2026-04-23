@@ -36,6 +36,7 @@
               };
               markdownlint = {
                 enable = true;
+                settings.globs = "src/content/docs/**/*.{md,mdx}";
               };
               nixfmt-rfc-style.enable = true;
             };
