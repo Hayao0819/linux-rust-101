@@ -1,0 +1,780 @@
+---
+title: "Rust for Linux 2026 年最新状況"
+description: "Linux 7.0 での正式採用, upstream ドライバ一覧, Tyr GPU, Android 本番デプロイ, DRM Rust 方針 — 2026 年 4 月時点の全体像"
+---
+
+import { Aside, Steps, Tabs, TabItem, Badge } from "@astrojs/starlight/components";
+{/* ================================================================ */}
+{/* 1. イントロダクション                                            */}
+{/* ================================================================ */}
+
+## はじめに — 2026 年 4 月の風景
+
+2026 年 4 月 12 日、Linux カーネル **7.0** が正式にリリースされた。
+メジャーバージョンの数字自体に技術的な意味はない（6.19 の次が 7.0 になっただけ）が、
+このリリースには歴史的な意味が込められている。
+
+> **Rust は実験ではなくなった。Rust はここに残る。**
+>
+> --- Miguel Ojeda, Rust-for-Linux プロジェクトリード
+
+2025 年 12 月に東京で開催された **Kernel Maintainers Summit** での宣言が、
+7.0 のコミットとして結実した。
+`MAINTAINERS` ファイルから「**EXPERIMENTAL**」タグが削除され、
+Rust で書かれたドライバやカーネルモジュールは、C と同等の**第一級市民**として扱われるようになった。
+
+本章では、2026 年 4 月時点の Rust-for-Linux（RfL）の全体像を包括的にまとめる。
+
+---
+
+{/* ================================================================ */}
+{/* 2. Linux 7.0 の主要変更                                          */}
+{/* ================================================================ */}
+
+## Linux 7.0 — Rust 正式採用の詳細
+
+### 実験フラグの削除
+
+Linux 7.0-rc1 のパッチで、Rust サポートから `EXPERIMENTAL` 指定が除去された。
+これにより、ディストリビューションは Rust を有効にしたカーネルを
+「実験的」の注釈なしに出荷できるようになった。
+
+### dev_printk の全デバイスタイプ対応
+
+7.0 では、Rust のデバイスドライバから `dev_printk` マクロを
+**すべてのデバイスタイプ**で利用できるようになった。
+これまで PCI デバイスなど一部に限られていた制約が解消され、
+Platform デバイス・USB デバイス・I2C デバイスなど、
+あらゆるバスに接続されたデバイスで統一的なログ出力が可能となった。
+
+```rust
+// Linux 7.0: 任意の Device 型で dev_info! が利用可能
+dev_info!(dev, "firmware version: {}\n", ver);
+```
+
+### dma_set_max_seg_size() Rust API
+
+DMA の最大セグメントサイズを設定するための `dma_set_max_seg_size()` が
+Rust API としてラップされた。これにより、高性能 I/O を行うドライバが
+Rust 側から DMA パラメータを適切にチューニングできる。
+
+```rust
+// dma_set_max_seg_size の Rust ラッパー
+dma::set_max_seg_size(&dev, size)?;
+```
+
+### その他の注目点
+
+| 機能 | 説明 |
+|------|------|
+| PCI デバイス列挙 | Rust から PCI デバイスのプローブ・列挙が可能 |
+| 割り込みハンドリング | IRQ ハンドラの Rust 実装サポート |
+| DMA マッピング | coherent / streaming DMA の安全な抽象化 |
+| Platform デバイス登録 | `platform_driver` の Rust 実装 |
+
+---
+
+{/* ================================================================ */}
+{/* 3. コンパイラ要件                                                */}
+{/* ================================================================ */}
+
+## Rust コンパイラ要件
+
+### 最小バージョン
+
+Linux 7.1 以降のカーネルビルドに必要な Rust ツールチェインの最小バージョンは以下のとおりである。
+
+| ツール | 最小バージョン | 備考 |
+|--------|--------------|------|
+| **rustc** | **1.85.0** | Linux 7.1 で引き上げ（従来は 1.78） |
+| **bindgen** | **0.71.1** | 従来は 0.65.1 |
+| **libclang** (LLVM) | LLVM 18+ | bindgen が C ヘッダを解析するために必要 |
+
+### Debian Stable アンカーポリシー
+
+Rust-for-Linux は、最小バージョンを **Debian Stable（Trixie）で提供される Rust バージョン**に
+アンカーする方針を採っている。
+2025 年 8 月にリリースされた Debian Trixie には Rust 1.85 と bindgen 0.71.1 が含まれており、
+これが 7.1 の最小要件と一致する。
+
+この方針により、以下のメリットが得られる。
+
+- ディストリビューションの安定版ツールチェインだけでカーネルがビルドできる
+- カーネルビルダーが nightly Rust に依存しなくて済む
+- 長期サポートカーネルとの互換性が確保される
+
+### feature gate 撲滅の目標
+
+Rust-for-Linux の最終目標の一つは、カーネルコード内の
+**`#![feature(...)]` 宣言をすべて排除する**ことである。
+つまり、stable Rust だけでカーネルがビルドできる世界を目指している。
+
+2026 年 4 月時点で、主要な unstable feature の状況は以下のとおりである。
+
+| feature gate | 用途 | 安定化状況 |
+|-------------|------|-----------|
+| `arbitrary_self_types` | スマートポインタの `self` メソッド | 安定化済み（Rust 1.85） |
+| `derive(CoercePointee)` | 侵入型リンクリストのスマートポインタ | 安定化済み（Rust 1.84） |
+| `lint_reasons` | lint の理由記述 | 安定化済み |
+| `new_uninit` | 未初期化メモリの安全な操作 | 安定化作業中 |
+| `offset_of_nested` | ネストした構造体のオフセット取得 | 安定化作業中 |
+
+<Aside type="tip" title="LLVM バージョンの一致">
+  `LLVM=1` でビルドする場合、Clang の LLVM メジャーバージョンと
+  rustc が使用する LLVM メジャーバージョンを一致させる必要がある。
+  バージョン不一致は LTO（Link-Time Optimization）使用時にリンクエラーの原因となる。
+</Aside>
+
+---
+
+{/* ================================================================ */}
+{/* 4. Upstream ドライバ一覧                                         */}
+{/* ================================================================ */}
+
+## Upstream ドライバ一覧 — 2026 年 4 月時点の 7 ドライバ
+
+2026 年 4 月時点で、Linux カーネルの mainline ツリーにマージされている
+Rust ドライバは **7 つ**である。
+以下に、マージされたカーネルバージョンとともに一覧を示す。
+
+| # | ドライバ名 | サブシステム | マージ版 | 説明 |
+|---|-----------|------------|---------|------|
+| 1 | **ASIX AX88796B PHY** | net/phy | **v6.8** | Asix Electronics PHY（X-Surf 100）。C 版と共存し、Kconfig で選択可能。約 100 行の小規模ドライバ |
+| 2 | **rnull** (null block driver) | block (blk-mq) | **v6.11** | `null_blk` の Rust 実装。ブロック層の Rust バインディング評価用 |
+| 3 | **DRM Panic QR code generator** | DRM | **v6.12** | カーネルパニック時に QR コードを表示。メモリ安全性が重要なパニックハンドラを Rust で実装 |
+| 4 | **AMCC QT2025 PHY** | net/phy | **v6.12** | Applied Micro Circuits Corporation の 10GbE PHY ドライバ。C22/C45 レジスタの統一的な読み書き API |
+| 5 | **Nova GPU** | DRM/GPU | **v6.15** | NVIDIA Turing 世代以降の GPU ドライバ。`nova-core` + `nova-drm` の 2 クレート構成 |
+| 6 | **Android Binder** | IPC/misc | **v6.18** | Android の IPC メカニズム。C 版からの完全書き換え |
+| 7 | **Tyr GPU** | DRM/GPU | **v6.18** | Arm Mali CSF ベース GPU ドライバ。Collabora / Arm / Google の共同開発 |
+
+### タイムライン図
+
+```
+2024                     2025                     2026
+ |                        |                        |
+ v6.8  v6.11 v6.12       v6.15    v6.18           v7.0
+  |     |     |            |        |               |
+  AX88  rnull DRM-Panic   Nova    Binder           Rust
+  796B        QR Code     GPU     + Tyr            正式
+              + QT2025                             採用
+```
+
+<Aside type="note" title="ドライバ数の増加ペース">
+  2024 年初頭には upstream Rust ドライバは 2 つだった。
+  2 年間で 7 つに増え、特に 2025 年後半の 6.18 で
+  Binder と Tyr の 2 つが同時にマージされた点が注目に値する。
+</Aside>
+
+---
+
+{/* ================================================================ */}
+{/* 5. Nova GPU ドライバの詳細                                       */}
+{/* ================================================================ */}
+
+## Nova GPU ドライバ
+
+### 概要
+
+Nova は、NVIDIA GPU のための**モダンなオープンソースドライバ**であり、
+既存の Nouveau ドライバを将来的に置き換えることを目指している。
+Red Hat の Danilo Krummrich 氏が中心となって開発を主導し、
+**Linux 6.15**（2025 年 5 月）で mainline にマージされた。
+
+### 対象ハードウェア
+
+Nova は **GPU System Processor（GSP）** を搭載した NVIDIA GPU をターゲットとしている。
+具体的には以下の世代が対象である。
+
+- **Turing** (RTX 20 シリーズ、GTX 1600 シリーズ)
+- それ以降の GSP 対応 GPU
+
+### アーキテクチャ: 2 クレート分割
+
+Nova は 2 つの独立したクレートに分割されている。
+
+| クレート | パス | 役割 |
+|---------|------|------|
+| **nova-core** | `drivers/gpu/nova-core/` | ハードウェア初期化、GSP ファームウェアとの通信 |
+| **nova-drm** | `drivers/gpu/drm/nova/` | Linux DRM API の実装、ユーザ空間インターフェース |
+
+この分割により、ハードウェア抽象化レイヤーと DRM フレームワークとの結合を疎にし、
+テスト容易性とメンテナンス性を高めている。
+
+### NVIDIA エンジニアの co-maintainer 就任
+
+2025 年中に、NVIDIA のエンジニアが Nova-Core ドライバの **co-maintainer** として就任した。
+これは、NVIDIA がオープンソース Rust ドライバの開発に本格的にコミットしていることの表れである。
+
+### 現状の制約
+
+2026 年 4 月時点で、Nova は**エンドユーザ向けの段階には達していない**。
+
+- GPU の基本的な初期化と GSP との通信は動作する
+- DebugFS サポートや GSM-RM ログバッファの閲覧が可能
+- ディスプレイ出力や 3D アクセラレーションはまだ実装途中
+- Linux 7.1 では Falcon ファームウェアハンドリングのリファクタリングや大規模 RPC サポートが追加予定
+
+```
+Nova GPU ドライバのアーキテクチャ
+
+  +------------------+     +------------------+
+  |    ユーザ空間     |     |   GSP ファーム    |
+  |  (Mesa / Vulkan) |     |   ウェア (FW)    |
+  +--------+---------+     +--------+---------+
+           |                        |
+           | ioctl                  | RPC
+           |                        |
+  +--------v---------+     +--------v---------+
+  |    nova-drm       |<--->|    nova-core      |
+  |  (DRM API 実装)   |     | (HW 初期化・通信) |
+  +------------------+     +------------------+
+           |
+           | DRM subsystem
+           v
+  +------------------+
+  |   Linux Kernel   |
+  |   DRM Framework  |
+  +------------------+
+```
+
+---
+
+{/* ================================================================ */}
+{/* 6. Tyr GPU ドライバの詳細                                       */}
+{/* ================================================================ */}
+
+## Tyr GPU ドライバ
+
+### 概要
+
+Tyr は、**Arm Mali CSF（Command Stream Frontend）ベースの GPU** 向け
+Rust ドライバであり、**Collabora**、**Arm**、**Google** の共同プロジェクトとして開発された。
+**Linux 6.18** で初期スケルトンが mainline にマージされた。
+
+Collabora は Tyr の開発を通じて、**Rust-for-Linux イニシアティブに正式参加した
+最初のコンサルタンシ企業**となった。
+
+### 開発の経緯
+
+| 時期 | マイルストーン |
+|------|--------------|
+| 2025 年初頭 | プロジェクト開始。GPU ジョブの基本的な実行 |
+| 2025 年 8 月 | Collabora ブログ「Writing a Rust GPU kernel driver」公開 |
+| 2025 年 11 月 | Linux Plumbers Conference で SuperTuxKart のデモ |
+| 2025 年 12 月 | LWN.net「The future for Tyr」記事掲載 |
+| 2026 年 1 月 | FOSDEM 2026 で発表 |
+| 2026 年 (6.18) | 初期スケルトンが mainline マージ |
+
+### Downstream プロトタイプの成果
+
+mainline にマージされたのは初期スケルトンのみだが、
+**downstream のプロトタイプ**では以下の動作が確認されている。
+
+- **GNOME デスクトップ**の完全な動作
+- **Weston** (Wayland コンポジタ) の動作
+- **SuperTuxKart**（3D レーシングゲーム）のフルスクリーン実行
+- C ドライバ（panfrost / panthor）と**同等のパフォーマンス**を達成
+
+<Aside type="caution" title="Upstream と Downstream の差">
+  mainline にマージされたコードは初期スケルトンであり、
+  上記のデスクトップや 3D ゲームの動作は downstream プロトタイプでのみ確認されている。
+  MCU（Micro Controller Unit）対応や電力管理・周波数スケーリングのコードは
+  まだ upstream に含まれておらず、対応する Rust 抽象化の開発が必要である。
+</Aside>
+
+### 2026 年のロードマップ
+
+Tyr チームは 2026 年中に以下の作業を upstream に持ち込む計画を示している。
+
+1. MCU の動作サポート
+2. 電力管理（power management）コード
+3. 周波数スケーリング（frequency scaling）コード
+4. upstream 用の Rust 抽象化の拡充
+
+---
+
+{/* ================================================================ */}
+{/* 7. Android Binder ドライバ                                      */}
+{/* ================================================================ */}
+
+## Android Binder ドライバ
+
+### マージの経緯
+
+Android の IPC（プロセス間通信）メカニズムである Binder の Rust 実装は、
+**2025 年 11 月 30 日に Linux 6.18-rc1 にマージ**された。
+Google が主導し、C 版の Binder を Rust で完全に書き直したものである。
+
+### CVE-2025-68260 — mainline Rust コード初の CVE
+
+Binder のマージ直後、**CVE-2025-68260** が報告された。
+これは、**mainline Linux カーネルの Rust コードに対して割り当てられた最初の CVE** として
+大きな注目を集めた。
+
+| 項目 | 詳細 |
+|------|------|
+| **CVE 番号** | CVE-2025-68260 |
+| **種別** | レースコンディション（競合状態） |
+| **影響箇所** | `rust_binder` モジュールの `death_list` 管理 |
+| **影響** | 侵入型リンクリストポインタの破損 → カーネル oops / panic（DoS） |
+| **影響バージョン** | Linux 6.18 以降（Rust Binder が有効な構成のみ） |
+| **修正バージョン** | **6.18.1** および **6.19-rc1** |
+
+<Aside type="note" title="Rust でも CVE は出る">
+  CVE-2025-68260 は「Rust の失敗」ではなく、**並行性のセマンティクスの問題**である。
+  Rust の型システムはメモリ安全性を保証するが、ロジックレベルの競合状態は
+  `unsafe` ブロックを介して依然として発生しうる。
+  重要なのは、この脆弱性がクラッシュ（DoS）にとどまり、
+  **任意コード実行には至らなかった**点である。
+  C の Binder で過去に報告された CVE の多くがメモリ破壊を伴う
+  権限昇格脆弱性であったことと比較すると、Rust の安全性保証の効果が見て取れる。
+</Aside>
+
+---
+
+{/* ================================================================ */}
+{/* 8. Android 本番デプロイメント                                     */}
+{/* ================================================================ */}
+
+## Android 本番デプロイメント
+
+### ashmem — 数億台の電話で稼働する Rust カーネルコード
+
+**Android 16** を搭載するデバイスは **Linux カーネル 6.12** を基盤としており、
+共有メモリアロケータ **ashmem**（Anonymous Shared Memory）が
+**Rust で完全に書き直されたバージョン**で出荷されている。
+
+これは、**数億台のスマートフォン**上で Rust カーネルコードが
+本番環境で稼働していることを意味する。
+
+### パフォーマンスの改善
+
+Google の報告によると、Rust 版 ashmem は C 版と比較して
+**約 35% のレイテンシ改善**を達成している。
+これは、Rust のゼロコスト抽象化と最適化されたメモリ管理コードが
+実運用環境で効果を発揮していることを示している。
+
+| 指標 | C 版 ashmem | Rust 版 ashmem | 改善率 |
+|------|-----------|---------------|-------|
+| IPC レイテンシ | ベースライン | -35% | 35% 改善 |
+| メモリ安全性バグ | 過去に複数の CVE | 0 件（2026 年 4 月時点） | -- |
+
+### Android のメモリ安全性全体への影響
+
+2025 年 11 月の Google Security Blog の報告によれば、
+Android 全体のメモリ安全性バグは **20% 以下** にまで減少した。
+これは Rust の採用拡大が大きく貢献している。
+
+<Steps>
+1. **2022 年**: Android が Rust でのカーネルモジュール開発を開始
+2. **2024 年**: ashmem の Rust 書き換えプロジェクト開始
+3. **2025 年**: Android 16 (kernel 6.12) で ashmem Rust 版を本番投入
+4. **2026 年**: 数億台のデバイスで稼働中、インシデント報告なし
+</Steps>
+
+---
+
+{/* ================================================================ */}
+{/* 9. DRM サブシステム Rust 方針                                    */}
+{/* ================================================================ */}
+
+## DRM サブシステム Rust 方針
+
+### Dave Airlie の宣言
+
+DRM（Direct Rendering Manager）サブシステムのメンテナである **Dave Airlie** 氏は、
+2025 年の Kernel Maintainers Summit において、DRM サブシステムは
+**約 1 年以内に Rust を必須化**し、
+**新しい GPU ドライバを C で書くことを禁止する**方針を示した。
+
+これは Linux カーネルのサブシステムとして初めて、
+特定のプログラミング言語を「必須」とする方針を打ち出したものであり、
+カーネルコミュニティに大きな反響を呼んだ。
+
+### drm-rust 開発ツリー
+
+この方針を実現するため、DRM サブシステムには専用の
+**`drm-rust-next`** 開発ツリーが作成された。
+現在開発中の Rust GPU ドライバ（Nova、Tyr、RVKMS など）は
+このツリーで集約的に開発・統合されている。
+
+```
+DRM 開発ツリーの構造
+
+  drm-next  (メインの DRM ツリー)
+    |
+    +-- drm-rust-next  (Rust ドライバ専用ツリー)
+    |     |
+    |     +-- Nova GPU
+    |     +-- Tyr GPU
+    |     +-- RVKMS (Virtual KMS Rust 版)
+    |     +-- DRM Rust 抽象化
+    |
+    +-- drm-misc-next (その他のドライバ)
+```
+
+### 共存モデル
+
+DRM の Rust 方針は「**強制移行なし**」の共存モデルを採用している。
+
+| 対象 | 方針 |
+|------|------|
+| **新規 GPU ドライバ** | Rust で書くことを要求（約 1 年後に施行） |
+| **既存 C ドライバ** | C のまま継続メンテナンス。強制的な Rust 移行は行わない |
+| **既存ドライバの新機能** | C または Rust のいずれかで実装可能 |
+| **DRM コア抽象化** | Rust バインディングを段階的に充実 |
+
+<Aside type="tip" title="なぜ GPU ドライバが先なのか">
+  GPU ドライバは Linux カーネルの中で最もコード量が多く、
+  最もバグが多いサブシステムの一つである。
+  メモリ安全性の問題が特に深刻であり、Rust の恩恵が最も大きい領域と考えられている。
+  また、Nova や Tyr の成功により、Rust GPU ドライバの実現可能性が実証されたことも
+  方針転換の背景にある。
+</Aside>
+
+---
+
+{/* ================================================================ */}
+{/* 10. サブシステム成熟度テーブル                                    */}
+{/* ================================================================ */}
+
+## サブシステム別 Rust 対応状況 — 2026 年 4 月
+
+以下のテーブルは、Linux カーネルの主要サブシステムにおける
+Rust 対応の成熟度を示す。
+
+| サブシステム | 状況 | カーネル版 | 備考 |
+|------------|------|-----------|------|
+| GPU (DRM/KMS) | ✅ upstream | 6.12+ | Nova, Tyr, DRM Panic QR, RVKMS。drm-rust-next ツリーで活発に開発中 |
+| blk-mq (ブロック層) | ✅ upstream | 6.11+ | rnull ドライバがマージ済み。blk-mq の Rust 抽象化が利用可能 |
+| PHY (ネットワーク物理層) | ✅ upstream | 6.8+ | AX88796B (6.8), QT2025 (6.12)。PHY サブシステムの抽象化が最も成熟 |
+| Platform / misc / PCI | ✅ upstream | 7.0 | dev_printk 全デバイス対応、PCI 列挙、platform_driver 登録 |
+| mm (VMA) | ⚠️ limited | 6.16+ | `mm_struct`, `vm_area_struct`, `mmap` の Rust 抽象化がマージ。限定的 |
+| USB | ⚠️ experimental | 6.18 | Andreas Hindborg によるUSB 抽象化パッチ。デフォルト無効 |
+| HID | 📋 RFC | 未マージ | 2025 年 3 月に RFC パッチ投稿。Apple Studio Display 等のモニタ制御を含む |
+| NIC / net_device | ❌ 未対応 | -- | ネットワークデバイスドライバの抽象化は未着手 |
+| VFS / ファイルシステム | ❌ 停滞 | -- | 一時期議論されたが進展なし |
+| Scheduler | ❌ 未対応 | -- | sched_ext + Rust の可能性は議論されているが具体的な作業なし |
+| LSM (セキュリティ) | ❌ 未対応 | -- | Linux Security Module の Rust 対応は未着手 |
+| ALSA (オーディオ) | ❌ 未対応 | -- | オーディオサブシステムの Rust 抽象化は未着手 |
+
+### 成熟度の凡例
+
+- ✅ **upstream**: mainline にドライバまたは抽象化がマージ済み
+- ⚠️ **limited / experimental**: マージ済みだが機能限定またはデフォルト無効
+- 📋 **RFC**: パッチが投稿されたが未マージ
+- ❌ **未対応**: 具体的な作業が行われていない
+
+<Aside type="caution" title="サブシステムごとの温度差">
+  Rust 対応の進捗はサブシステムによって大きく異なる。
+  GPU (DRM) と PHY は非常に活発だが、VFS やスケジューラなど
+  カーネルのコア部分はまだ手つかずの状態が多い。
+  これは、各サブシステムのメンテナの意向と、
+  Rust 抽象化の難易度が異なるためである。
+</Aside>
+
+---
+
+{/* ================================================================ */}
+{/* 11. Rust 2026 プロジェクトゴール                                  */}
+{/* ================================================================ */}
+
+## Rust 2026 プロジェクトゴール
+
+Rust 言語プロジェクトと Rust-for-Linux は、カーネル開発のニーズに対応するため
+密接に連携している。2026 年のプロジェクトゴールは以下のとおりである。
+
+### 最優先目標: Stable Rust でのカーネルビルド
+
+最も重要な目標は、**feature gate（`#![feature(...)]`）をすべて排除**し、
+stable Rust のみでカーネルがビルドできるようにすることである。
+
+```rust
+// 目標: これらの宣言がすべて不要になる
+#![feature(arbitrary_self_types)]      // 安定化済み (1.85)
+#![feature(derive_coerce_pointee)]     // 安定化済み (1.84)
+#![feature(new_uninit)]                // 安定化作業中
+#![feature(offset_of_nested)]          // 安定化作業中
+```
+
+### 主要な安定化項目
+
+#### Arbitrary Self Types（安定化済み）
+
+Rust 1.85 で安定化された `arbitrary_self_types` により、
+カーネル内のスマートポインタ型（`Arc<T>`, `Box<T>` など）で
+`self` メソッドを自然に定義できるようになった。
+
+```rust
+// arbitrary_self_types により可能になった構文
+impl MyDriver {
+    fn probe(self: &Arc<Self>) -> Result {
+        // Arc<Self> を self として受け取れる
+        Ok(())
+    }
+}
+```
+
+#### Derive CoercePointee（安定化済み）
+
+Rust 1.84 で安定化された `derive(CoercePointee)` は、
+カーネルが使用する侵入型リンクリストのスマートポインタの実装に不可欠である。
+このマクロにより、`Unsize`, `CoerceUnsized`, `DispatchFromDyn` トレイトの
+ボイラープレートコードが大幅に削減された。
+
+#### プラットフォームサポートの拡大
+
+Linux カーネルがサポートするすべてのアーキテクチャで
+Rust がビルドできることを目指している。
+現在、x86_64, aarch64, riscv64 は安定してサポートされているが、
+一部のアーキテクチャではまだ制約がある。
+
+### 隔週同期ミーティング
+
+Rust 言語プロジェクトと Rust-for-Linux の間で、
+**隔週の同期ミーティング**が定期的に開催されている。
+このミーティングでは以下の議題が扱われる。
+
+- 未安定 feature の安定化タイムライン
+- カーネル開発で発見された Rust コンパイラのバグ
+- 新しい言語機能のカーネルでの活用方法
+- ツールチェイン（bindgen, clippy 等）の改善
+
+---
+
+{/* ================================================================ */}
+{/* 12. Initcall レベル                                              */}
+{/* ================================================================ */}
+
+## Initcall レベル — Rust モジュールの初期化順序制御
+
+### 背景
+
+従来、Rust の `module!` マクロで定義されたモジュールは
+すべて **initcall レベル 6（`device_initcall`）** に配置されていた。
+これは多くのデバイスドライバには適切だが、
+サブシステムの初期化やコアインフラの初期化を行うモジュールには不十分であった。
+
+### 2026 年 2 月のパッチ
+
+2026 年 2 月 26 日、Matthew Wood 氏が投稿したパッチシリーズにより、
+`module!` マクロに **`initcall` フィールド**が追加された。
+これにより、8 段階の initcall レベルを明示的に指定できるようになった。
+
+### 構文
+
+```rust
+module! {
+    type: MySubsystem,
+    name: "my_subsystem",
+    author: "...",
+    description: "...",
+    license: "GPL",
+    initcall: subsys,  // initcall レベルを指定
+}
+```
+
+### 8 つの Initcall レベル
+
+| レベル | 名前 | 値 | ELF セクション | 用途 |
+|--------|------|-----|--------------|------|
+| 0 | `pure` | 0 | `.initcall0.init` | 純粋な初期化（副作用なし） |
+| 1 | `core` | 1 | `.initcall1.init` | コアカーネルインフラ |
+| 2 | `postcore` | 2 | `.initcall2.init` | コア後の初期化 |
+| 3 | `arch` | 3 | `.initcall3.init` | アーキテクチャ固有の初期化 |
+| 4 | `subsys` | 4 | `.initcall4.init` | サブシステムの初期化 |
+| 5 | `fs` | 5 | `.initcall5.init` | ファイルシステムの初期化 |
+| 6 | `device` | 6 | `.initcall6.init` | デバイスドライバ（**デフォルト**） |
+| 7 | `late` | 7 | `.initcall7.init` | 遅延初期化 |
+
+<Aside type="note" title="ロード可能モジュールへの影響はない">
+  initcall レベルは**ビルトインモジュール**にのみ影響する。
+  ロード可能モジュール（`.ko` ファイル）は常に `init_module()` を通じて
+  初期化されるため、`initcall` フィールドの値は無視される。
+</Aside>
+
+---
+
+{/* ================================================================ */}
+{/* 13. コミュニティイベント                                          */}
+{/* ================================================================ */}
+
+## コミュニティイベント — RfL 関連のカンファレンスとワークショップ
+
+Rust-for-Linux コミュニティは活発なイベント活動を行っている。
+以下に主要なイベントをまとめる。
+
+### Kangrejos ワークショップ
+
+**Kangrejos** は、Rust-for-Linux に関わる開発者が
+Linux Plumbers Conference (LPC) の前に集まる小規模な招待制ワークショップである。
+参加者は約 30 名に限定され、非公式かつ集中的な議論が行われる。
+
+| 回 | 開催年 | 開催地 | 主要議題 |
+|----|--------|--------|---------|
+| 1st | 2023 | スペイン | 初期の Rust 抽象化設計 |
+| 2nd | 2024 | オーストリア | DRM Rust バインディング、PHY ドライバ |
+| 3rd | 2025 | 東京 | Binder, Tyr, コンパイラ安定化 |
+
+### Linux Plumbers Conference (LPC) — Rust Microconference
+
+LPC の **Rust Microconference (MC)** は、カーネル Rust とそれ以外の
+Rust トピックの両方をカバーする。
+
+| 年 | 開催地 | 主要発表 |
+|----|--------|---------|
+| 2022 | ダブリン | Rust-for-Linux の初期設計 |
+| 2023 | リッチモンド | PHY ドライバ、ブロック層抽象化 |
+| 2024 | ウィーン | Nova GPU 設計、DRM Rust 方針 |
+| 2025 | 東京 | Binder マージ報告、Tyr デモ（SuperTuxKart）、Rust 正式採用宣言 |
+
+### Kernel Recipes 2025
+
+2025 年の **Kernel Recipes** では、Maira Canal 氏による
+「**A Rusty Odyssey: A Timeline of Rust in the DRM subsystem**」が発表された。
+DRM サブシステムにおける Rust の導入経緯と主要マイルストーンが時系列で紹介され、
+Apple Silicon 対応の frustration から始まった経緯や、
+Nova・Tyr・RVKMS の開発状況が報告された。
+
+### FOSDEM 2026
+
+2026 年 2 月に開催された **FOSDEM 2026** では、
+Rust トラックとカーネルトラックの両方で RfL 関連の発表が行われた。
+
+注目の発表として、Collabora チームによる
+「**Tyr: a new Rust GPU driver for the Linux Kernel**」があった。
+Tyr の設計思想、Mali CSF ハードウェアの概要、
+downstream プロトタイプでの成果が紹介された。
+
+### Rust Global: Tokyo
+
+**Rust Global: Tokyo** は、Open Source Summit Japan と同時開催される
+Rust Foundation 主催のイベントである。
+2025 年の東京開催では、Kernel Maintainers Summit での Rust 正式採用宣言と時期が重なり、
+カーネル開発者と Rust コミュニティの交流の場となった。
+
+---
+
+{/* ================================================================ */}
+{/* 14. 全体タイムライン                                              */}
+{/* ================================================================ */}
+
+## 包括的タイムライン — 2024 年末〜2026 年 4 月
+
+以下は、Rust-for-Linux に関する主要イベントを時系列でまとめたものである。
+
+| 日付 | カーネル版 | イベント |
+|------|-----------|---------|
+| 2024 年 3 月 | v6.8 | ASIX AX88796B PHY ドライバがマージ |
+| 2024 年 9 月 | v6.11 | rnull（null block ドライバ）がマージ |
+| 2024 年 11 月 | v6.12 | DRM Panic QR コードジェネレータがマージ |
+| 2024 年 11 月 | v6.12 | AMCC QT2025 PHY ドライバがマージ |
+| 2025 年 2 月 | -- | FOSDEM 2025 で RfL の現状報告 |
+| 2025 年 5 月 | v6.15 | **Nova GPU ドライバ**が mainline マージ |
+| 2025 年 8 月 | -- | Collabora「Writing a Rust GPU kernel driver」ブログ公開 |
+| 2025 年 8 月 | -- | Debian Trixie リリース（Rust 1.85, bindgen 0.71.1 搭載） |
+| 2025 年 9 月 | v6.16 | mm（VMA）の Rust 抽象化がマージ |
+| 2025 年 10 月 | -- | Kernel Recipes 2025「A Rusty Odyssey」発表 |
+| 2025 年 11 月 | v6.18-rc1 | **Android Binder** が mainline マージ（11 月 30 日） |
+| 2025 年 11 月 | v6.18 | **Tyr GPU** 初期スケルトンが mainline マージ |
+| 2025 年 11 月 | -- | Google Security Blog: Android メモリ安全性バグ 20% 以下に |
+| 2025 年 12 月 | -- | **Tokyo Kernel Maintainers Summit**: Rust 正式採用を宣言 |
+| 2025 年 12 月 | -- | Rust Global: Tokyo 開催 |
+| 2025 年 12 月 | -- | LPC 2025（東京）: Rust Microconference |
+| 2025 年 12 月 | -- | CVE-2025-68260（Binder レースコンディション）が報告 |
+| 2026 年 1 月 | -- | CVE-2025-68260 が 6.18.1 で修正 |
+| 2026 年 2 月 | -- | FOSDEM 2026: Tyr GPU ドライバの発表 |
+| 2026 年 2 月 | -- | Initcall レベル対応パッチ投稿（Matthew Wood） |
+| 2026 年 4 月 12 日 | **v7.0** | **Linux 7.0 リリース**: Rust の EXPERIMENTAL フラグ削除 |
+| 2026 年 4 月 23 日 | -- | Ubuntu 26.04 LTS リリース（カーネル 7.0 搭載） |
+
+---
+
+{/* ================================================================ */}
+{/* 15. 数字で見る RfL                                               */}
+{/* ================================================================ */}
+
+## 数字で見る Rust-for-Linux（2026 年 4 月）
+
+| 指標 | 数値 |
+|------|------|
+| Mainline Rust ドライバ数 | **7** |
+| Rust 正式採用カーネル | **7.0**（2026 年 4 月 12 日） |
+| Rust-for-Linux 関連 `MAINTAINERS` エントリ数 | 10+ |
+| Android 本番デバイス（Rust カーネルコード稼働） | **数億台** |
+| Rust コンパイラ最小バージョン | **1.85.0** |
+| bindgen 最小バージョン | **0.71.1** |
+| feature gate 残存数 | 約 2〜3（段階的に解消中） |
+| CVE（Rust コード起因） | **1**（CVE-2025-68260） |
+| 隔週ミーティング | Rust プロジェクト <-> RfL |
+
+---
+
+{/* ================================================================ */}
+{/* 16. 今後の展望                                                   */}
+{/* ================================================================ */}
+
+## 今後の展望
+
+### 短期（2026 年後半）
+
+- **Linux 7.1**: Rust 1.85.0 最小要件の適用、Nova GPU の機能拡充
+- **DRM Rust 必須化**: Dave Airlie の方針に基づき、新規 GPU ドライバの C 提出を段階的に制限
+- **Tyr upstream 拡充**: MCU 対応、電力管理コードの upstream マージ
+- **Initcall パッチ**: レビュー完了後にマージ予定
+
+### 中期（2027 年）
+
+- **Stable Rust ビルド**: すべての feature gate の排除完了を目指す
+- **USB / HID ドライバ**: experimental から stable への昇格
+- **ファイルシステム**: VFS の Rust 抽象化の再始動の可能性
+- **Nova GPU**: エンドユーザ向けの基本機能（ディスプレイ出力）の実装
+
+### 長期的な課題
+
+- **ネットワークデバイス**: NIC ドライバの Rust 抽象化は大きな課題
+- **スケジューラ**: sched_ext と Rust の統合の可能性
+- **LSM / ALSA**: セキュリティモジュールとオーディオの Rust 対応
+- **全アーキテクチャ対応**: Linux がサポートするすべての CPU アーキテクチャで Rust ビルド可能に
+
+---
+
+{/* ================================================================ */}
+{/* 17. まとめ                                                       */}
+{/* ================================================================ */}
+
+## まとめ
+
+2026 年 4 月は、Rust-for-Linux にとって画期的な節目である。
+
+1. **Linux 7.0 で Rust が正式採用**された。実験は終わり、Rust はカーネルの永続的な一部となった。
+2. **7 つのドライバが mainline にマージ**され、GPU（Nova, Tyr）、IPC（Binder）、
+   ブロック層（rnull）、ネットワーク PHY（AX88796B, QT2025）、
+   パニックハンドラ（DRM Panic QR）と幅広いサブシステムをカバーしている。
+3. **Android 16 で数億台のデバイス**に Rust カーネルコードが本番デプロイされ、
+   35% のレイテンシ改善という実績を残した。
+4. **DRM サブシステムは約 1 年以内に Rust を必須化**する方針を示し、
+   GPU ドライバの未来は Rust で書かれることが確定的となった。
+5. **CVE-2025-68260** は mainline Rust コード初の CVE となったが、
+   DoS にとどまり任意コード実行には至らず、Rust の安全性保証の効果が確認された。
+
+Linux カーネルという世界最大級のオープンソースプロジェクトにおいて、
+Rust は「試されている言語」から「選ばれた言語」へと確実に歩みを進めている。
+
+---
+
+## 参考リンク
+
+- [Rust for Linux 公式サイト](https://rust-for-linux.com/)
+- [Linux カーネル Rust ドキュメント](https://docs.kernel.org/rust/index.html)
+- [Rust Project Goals: Rust for Linux](https://rust-lang.github.io/rust-project-goals/2026/roadmap-rust-for-linux.html)
+- [Phoronix: Linux 7.0 Officially Concluding The Rust Experiment](https://www.phoronix.com/news/Linux-7.0-Rust)
+- [Collabora: Kernel 6.18 - Tyr advances Rust in Linux](https://www.collabora.com/news-and-blog/news-and-events/kernel-618-tyr-advances-rust-in-linux.html)
+- [Collabora: Racing karts on a Rust GPU kernel driver](https://www.collabora.com/news-and-blog/news-and-events/racing-karts-on-a-rust-gpu-kernel-driver.html)
+- [CVE-2025-68260 Deep Dive](https://www.penligent.ai/hackinglabs/cve-2025-68260-deep-dive-linux-kernels-first-rust-cve-isnt-rust-failing-its-concurrency-semantics-failing/)
+- [Google Security Blog: Rust in Android](https://security.googleblog.com/2025/11/rust-in-android-move-fast-fix-things.html)
+- [Kernel Recipes 2025: A Rusty Odyssey](https://kernel-recipes.org/en/2025/schedule/a-rusty-odyssey-a-timeline-of-rust-in-the-drm-subsystem/)
+- [FOSDEM 2026: Tyr GPU Driver](https://fosdem.org/2026/schedule/event/LJWCJQ-tyr_a_new_rust_gpu_driver_for_the_linux_kernel/)
+- [Nova GPU Driver (Rust for Linux)](https://rust-for-linux.com/nova-gpu-driver)
+- [Android Binder Driver (Rust for Linux)](https://rust-for-linux.com/android-binder-driver)
+- [Rust Version Policy (Rust for Linux)](https://rust-for-linux.com/rust-version-policy)

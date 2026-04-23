@@ -1,0 +1,1563 @@
+---
+title: "Namespaces と cgroups"
+description: "8 種類の namespace, nsproxy, clone/unshare/setns, capable vs ns_capable, cgroups v2 統一階層, PSI — コンテナ技術を支えるカーネル機構を深く理解する"
+---
+
+## この章で学ぶこと
+
+- Linux namespace の全 8 種類 (pid, net, mnt, user, uts, ipc, cgroup, time) の役割を理解する
+- `struct nsproxy` がどのように namespace 参照を保持するかを把握する
+- `clone()`, `unshare()`, `setns()` による namespace 操作を実践的に理解する
+- `capable()` と `ns_capable()` の決定的な違いを把握し、誤用による CVE を防ぐ
+- User namespace の UID/GID マッピングとセキュリティ上の意味を説明できる
+- cgroups v2 の統一階層、コントローラ、インターフェースファイルを理解する
+- PSI (Pressure Stall Information) によるリソース監視を知る
+- Docker/Podman がこれらを組み合わせてコンテナを実現する仕組みを理解する
+- Rust カーネルモジュール開発者にとっての実践的な影響を把握する
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::cred` (プロセスの credential/UID/GID アクセス)
+❌ **未実装**: `nsproxy`, 個別 namespace 型, cgroups コントローラの Rust バインディング
+:::
+
+---
+
+Linux カーネルの namespace と cgroups は、Docker や Podman といったコンテナ技術の**基盤**である。
+namespace はプロセスが見える「世界」を分離し、cgroups はプロセスが使える「資源」を制限する。
+この二つを組み合わせることで、カーネルは一つのホスト上に複数の隔離された環境を作り出す。
+
+カーネルモジュール開発者にとって、これらの機構を理解することは必須である。
+モジュールのコードはすべての namespace から呼ばれる可能性があり、
+権限チェックを誤ればコンテナの隔離を破壊する脆弱性 (CVE) を作り込むことになる。
+この章では、カーネルソースコードに基づいて namespace と cgroups v2 を詳細に解説する。
+
+---
+
+## Namespace: プロセスの「見える世界」を分離する
+
+### なぜ namespace が必要か
+
+従来の UNIX では、PID 空間、ネットワークスタック、ファイルシステムのマウントポイントは
+**システム全体で一つ** だった。
+すべてのプロセスが同じ PID 空間を共有し、同じネットワークインターフェースを見て、
+同じホスト名を持つ。
+
+この設計ではプロセス間の隔離が困難である。
+あるプロセスが別のプロセスの PID を知ることができ、ネットワーク設定を変更すれば全プロセスに影響する。
+
+namespace はこの問題を解決する。
+各 namespace タイプはカーネルリソースの特定の側面を**インスタンスごとに分離**する。
+namespace 内のプロセスからは、自分が属する namespace のリソースだけが見える。
+
+```
+従来の Linux:
+┌──────────────────────────────────────────────────────┐
+│                  単一のカーネル                        │
+│  PID: 1,2,3,4,5,6,...                                │
+│  NET: eth0, lo                                       │
+│  MNT: /, /home, /tmp                                 │
+│  HOST: myserver                                      │
+│  ┌──────┐ ┌──────┐ ┌──────┐ ┌──────┐                │
+│  │Proc A│ │Proc B│ │Proc C│ │Proc D│  全員が全部見える │
+│  └──────┘ └──────┘ └──────┘ └──────┘                │
+└──────────────────────────────────────────────────────┘
+
+namespace による分離:
+┌──────────────────────────────────────────────────────┐
+│                  単一のカーネル                        │
+│                                                      │
+│  ┌────────────────────┐  ┌────────────────────┐      │
+│  │ Namespace A         │  │ Namespace B         │      │
+│  │ PID: 1, 2           │  │ PID: 1, 2, 3        │      │
+│  │ NET: veth0, lo      │  │ NET: veth1, lo      │      │
+│  │ MNT: /, /app        │  │ MNT: /, /data       │      │
+│  │ HOST: container-a   │  │ HOST: container-b   │      │
+│  │ ┌──────┐ ┌──────┐  │  │ ┌──────┐ ┌──────┐  │      │
+│  │ │Proc A│ │Proc B│  │  │ │Proc C│ │Proc D│  │      │
+│  │ └──────┘ └──────┘  │  │ └──────┘ └──────┘  │      │
+│  └────────────────────┘  └────────────────────┘      │
+└──────────────────────────────────────────────────────┘
+```
+
+### 8 種類の namespace
+
+Linux カーネルは現在 8 種類の namespace を提供している。
+それぞれが `clone()` のフラグ、対応するカーネル構造体、分離するリソースを持つ。
+
+| # | namespace | clone フラグ | カーネル構造体 | 分離するリソース | 導入バージョン |
+|---|---|---|---|---|---|
+| 1 | Mount | `CLONE_NEWNS` | `struct mnt_namespace` | マウントポイント | 2.4.19 |
+| 2 | UTS | `CLONE_NEWUTS` | `struct uts_namespace` | ホスト名、ドメイン名 | 2.6.19 |
+| 3 | IPC | `CLONE_NEWIPC` | `struct ipc_namespace` | System V IPC, POSIX メッセージキュー | 2.6.19 |
+| 4 | PID | `CLONE_NEWPID` | `struct pid_namespace` | プロセス ID | 2.6.24 |
+| 5 | Network | `CLONE_NEWNET` | `struct net` | ネットワークスタック全体 | 2.6.29 |
+| 6 | User | `CLONE_NEWUSER` | `struct user_namespace` | UID/GID マッピング, capabilities | 3.8 |
+| 7 | Cgroup | `CLONE_NEWCGROUP` | `struct cgroup_namespace` | cgroup のルートディレクトリビュー | 4.6 |
+| 8 | Time | `CLONE_NEWTIME` | `struct time_namespace` | `CLOCK_MONOTONIC`, `CLOCK_BOOTTIME` | 5.6 |
+
+以下、各 namespace を詳しく見ていく。
+
+---
+
+### 1. Mount namespace (`CLONE_NEWNS`)
+
+最初に実装された namespace であり、フラグ名が `CLONE_NEWNS` と汎用的なのはそのためである。
+(当時は namespace が一種類しかなかった。)
+
+```c
+/* fs/namespace.c */
+struct mnt_namespace {
+    struct ns_common    ns;
+    struct mount       *root;       /* この namespace のルートマウント */
+    struct rb_root      mounts;     /* マウントの赤黒木 */
+    unsigned int        nr_mounts;  /* マウント数 */
+    unsigned int        pending_mounts;
+    /* ... */
+};
+```
+
+Mount namespace はプロセスが見るマウントポイントの集合を分離する。
+ある namespace 内で `mount` や `umount` を行っても、他の namespace には影響しない。
+コンテナが独自のルートファイルシステムを持てるのは、この namespace のおかげである。
+
+```bash
+# 新しい mount namespace で bash を起動
+unshare --mount /bin/bash
+
+# この中で /tmp に tmpfs をマウントしても、ホスト側には見えない
+mount -t tmpfs tmpfs /tmp
+```
+
+### 2. UTS namespace (`CLONE_NEWUTS`)
+
+UTS は "UNIX Time-sharing System" に由来する。
+ホスト名 (`hostname`) とドメイン名 (`domainname`) を分離する。
+
+```c
+/* include/linux/utsname.h */
+struct uts_namespace {
+    struct new_utsname name;   /* ホスト名, ドメイン名等 */
+    struct user_namespace *user_ns;
+    struct ucounts *ucounts;
+    struct ns_common ns;
+};
+
+struct new_utsname {
+    char sysname[__NEW_UTS_LEN + 1];     /* "Linux" */
+    char nodename[__NEW_UTS_LEN + 1];    /* ホスト名 */
+    char release[__NEW_UTS_LEN + 1];     /* "6.12.0" */
+    char version[__NEW_UTS_LEN + 1];     /* "#1 SMP ..." */
+    char machine[__NEW_UTS_LEN + 1];     /* "x86_64" */
+    char domainname[__NEW_UTS_LEN + 1];  /* NIS ドメイン名 */
+};
+```
+
+コンテナはこの namespace により、ホスト側と異なるホスト名を持つことができる。
+
+```bash
+# 新しい UTS namespace でホスト名を変更
+unshare --uts /bin/bash
+hostname my-container
+hostname  # "my-container" と表示される
+# ホスト側のホスト名は変わらない
+```
+
+### 3. IPC namespace (`CLONE_NEWIPC`)
+
+System V IPC オブジェクト (共有メモリ、セマフォ、メッセージキュー) と POSIX メッセージキューを分離する。
+
+```c
+/* include/linux/ipc_namespace.h */
+struct ipc_namespace {
+    struct ipc_ids  ids[3];  /* sem, msg, shm */
+    /* POSIX message queue 用 */
+    unsigned int    mq_queues_count;
+    unsigned int    mq_queues_max;
+    unsigned int    mq_msg_max;
+    unsigned int    mq_msgsize_max;
+    unsigned int    mq_msg_default;
+    unsigned int    mq_msgsize_default;
+    struct ctl_table_set mq_set;
+    struct user_namespace *user_ns;
+    struct ucounts *ucounts;
+    struct ns_common ns;
+};
+```
+
+コンテナ間で IPC オブジェクトが干渉しないようにするために必要である。
+PostgreSQL などの System V 共有メモリを使うアプリケーションを
+複数コンテナで動かす際に特に重要になる。
+
+### 4. PID namespace (`CLONE_NEWPID`)
+
+PID namespace はプロセス ID の空間を分離する。
+namespace 内の最初のプロセスは PID 1 になり、その namespace の **init プロセス** として機能する。
+
+```c
+/* include/linux/pid_namespace.h */
+struct pid_namespace {
+    struct idr             idr;         /* PID の割り当て管理 */
+    struct rcu_head        rcu;
+    unsigned int           pid_allocated;
+    struct task_struct    *child_reaper; /* namespace 内の init (PID 1) */
+    struct kmem_cache     *pid_cachep;
+    unsigned int           level;       /* ネストの深さ (init_pid_ns = 0) */
+    struct pid_namespace  *parent;      /* 親 namespace */
+    /* ... */
+    struct user_namespace *user_ns;
+    struct ucounts        *ucounts;
+    struct ns_common       ns;
+};
+```
+
+PID namespace の重要な特徴は**ネスト**できることである。
+子 namespace 内のプロセスには「namespace 内の PID」と「親 namespace から見た PID」の
+両方が存在する。
+
+```
+ホスト (PID namespace level 0)
+│
+├── PID 1 (systemd)
+├── PID 1234 (dockerd)
+│
+├── コンテナ A の PID namespace (level 1)
+│   ├── PID 1 (コンテナ内 init) ── ホストから見ると PID 5678
+│   ├── PID 2 (nginx)           ── ホストから見ると PID 5679
+│   └── PID 3 (worker)          ── ホストから見ると PID 5680
+│
+└── コンテナ B の PID namespace (level 1)
+    ├── PID 1 (コンテナ内 init) ── ホストから見ると PID 7890
+    └── PID 2 (redis)           ── ホストから見ると PID 7891
+```
+
+namespace 内の PID 1 (child_reaper) は特別な役割を持つ。
+- 孤児プロセスの親になる (reparenting)
+- この PID 1 が死ぬと、namespace 内の全プロセスが SIGKILL で終了する
+- シグナル処理で特別扱いされる (SIGKILL/SIGSTOP 以外を無視できる)
+
+```bash
+# PID namespace を作成して、内部で ps を実行
+unshare --pid --fork --mount-proc /bin/bash
+ps aux
+# PID 1 が bash、PID 2 以降が ps 自身として表示される
+```
+
+### 5. Network namespace (`CLONE_NEWNET`)
+
+Network namespace はネットワークスタック全体を分離する。
+各 namespace は独自のネットワークデバイス、IP アドレス、ルーティングテーブル、
+ファイアウォールルール (netfilter)、ソケットを持つ。
+
+```c
+/* include/net/net_namespace.h */
+struct net {
+    refcount_t          passive;
+    spinlock_t          rules_mod_lock;
+    unsigned int        dev_base_seq;
+    u32                 ifindex;
+
+    struct list_head    dev_base_head;   /* ネットワークデバイスリスト */
+    struct hlist_head  *dev_name_head;   /* デバイス名ハッシュ */
+    struct hlist_head  *dev_index_head;  /* デバイスインデックスハッシュ */
+
+    /* ルーティング */
+    struct netns_ipv4   ipv4;
+    struct netns_ipv6   ipv6;
+
+    /* netfilter */
+    struct netns_nf     nf;
+    struct netns_xt     xt;
+    struct netns_nftables nft;
+
+    struct net_device  *loopback_dev;    /* lo デバイス */
+    struct user_namespace *user_ns;
+    struct ns_common    ns;
+    /* ... 多数のフィールド ... */
+};
+```
+
+Network namespace 内には必ず独自の **lo (ループバック) デバイス** が存在する。
+namespace 間の通信には **veth (Virtual Ethernet) ペア** が使われる。
+
+```
+┌────────────────────────┐    ┌────────────────────────┐
+│ ホスト Net NS           │    │ コンテナ Net NS         │
+│                        │    │                        │
+│  eth0 (物理 NIC)       │    │  eth0 (veth ペアの片方) │
+│  172.17.0.1            │    │  172.17.0.2             │
+│  ┌──────┐              │    │  ┌──────┐              │
+│  │ lo   │              │    │  │ lo   │              │
+│  │127.0.│              │    │  │127.0.│              │
+│  │0.1   │              │    │  │0.1   │              │
+│  └──────┘              │    │  └──────┘              │
+│                        │    │                        │
+│  docker0 (ブリッジ)    │    │                        │
+│  ┌──────────────┐      │    │                        │
+│  │veth-host-end │◄────────────►│ (veth ペア)          │
+│  └──────────────┘      │    │                        │
+│                        │    │  iptables (独自ルール)  │
+│  iptables (ホスト)     │    │  ルーティングテーブル    │
+│  ルーティングテーブル   │    │  (独自)                │
+└────────────────────────┘    └────────────────────────┘
+```
+
+各 Network namespace が持つリソースを以下にまとめる。
+
+- ネットワークデバイス (eth0, lo, veth, bridge, ...)
+- IPv4/IPv6 アドレスとルーティングテーブル
+- netfilter ルール (iptables/nftables)
+- ソケット (`/proc/net/tcp` 等)
+- `/proc/sys/net/` 以下のパラメータ
+
+```bash
+# 新しい network namespace を作成
+ip netns add test_ns
+
+# namespace 内でコマンドを実行
+ip netns exec test_ns ip link show
+# lo のみが表示される (DOWN 状態)
+
+# veth ペアを作成して namespace に接続
+ip link add veth-host type veth peer name veth-ns
+ip link set veth-ns netns test_ns
+ip addr add 10.0.0.1/24 dev veth-host
+ip netns exec test_ns ip addr add 10.0.0.2/24 dev veth-ns
+ip link set veth-host up
+ip netns exec test_ns ip link set veth-ns up
+ip netns exec test_ns ip link set lo up
+
+# namespace 内から ping
+ip netns exec test_ns ping 10.0.0.1
+```
+
+### 6. User namespace (`CLONE_NEWUSER`)
+
+User namespace は UID/GID の空間を分離する。
+これは**唯一、非特権ユーザが作成できる namespace** であり、
+コンテナのセキュリティモデルの根幹を成す。
+
+```c
+/* include/linux/user_namespace.h */
+struct user_namespace {
+    struct uid_gid_map  uid_map;      /* UID マッピング */
+    struct uid_gid_map  gid_map;      /* GID マッピング */
+    struct uid_gid_map  projid_map;   /* Project ID マッピング */
+    struct user_namespace *parent;     /* 親 namespace */
+    int                 level;         /* ネストの深さ */
+    kuid_t              owner;         /* namespace を作成した UID */
+    kgid_t              group;         /* namespace を作成した GID */
+    unsigned int        flags;
+    /* capabilities: この namespace 内で有効な capability セット */
+    struct ns_common    ns;
+    /* ... */
+};
+```
+
+User namespace の核心は **UID/GID マッピング** である。
+namespace 内の UID 0 (root) がホスト側では一般ユーザ (例: UID 100000) にマッピングされる。
+これにより、コンテナ内では root 権限を持つように見えるが、
+ホスト側では非特権ユーザとして扱われる。
+
+```
+┌─────────────────────────────────────────────────┐
+│ UID マッピングの仕組み                            │
+│                                                 │
+│  ホスト側            コンテナ内                   │
+│  UID 100000   ◄───►  UID 0 (root)               │
+│  UID 100001   ◄───►  UID 1                      │
+│  UID 100002   ◄───►  UID 2                      │
+│  ...                 ...                         │
+│  UID 165535   ◄───►  UID 65535                   │
+│                                                 │
+│  /proc/<pid>/uid_map の内容:                      │
+│  "0 100000 65536"                                │
+│  ↑  ↑      ↑                                    │
+│  │  │      └── 範囲 (65536 個の UID をマッピング)  │
+│  │  └── ホスト側の開始 UID                        │
+│  └── namespace 内の開始 UID                       │
+└─────────────────────────────────────────────────┘
+```
+
+User namespace のセキュリティ上の重要な性質を以下に示す。
+
+- **capability の付与**: 新しい user namespace を作成したプロセスは、
+  その namespace 内で**全 capability** を持つ。ただし、これはその namespace 内のリソースに対してのみ有効である。
+- **nested namespace の制御**: 子 namespace の capability は
+  親 namespace の capability を超えられない。
+- **ファイルアクセス**: ファイルの owner は UID マッピングを通じて解決される。
+  マッピングされていない UID を持つファイルは `nobody` / `nogroup` として表示される。
+
+```bash
+# 非特権ユーザで user namespace を作成
+unshare --user --map-root-user /bin/bash
+id
+# uid=0(root) gid=0(root) と表示されるが、ホスト側では元のユーザのまま
+
+# UID マッピングを確認
+cat /proc/self/uid_map
+```
+
+### 7. Cgroup namespace (`CLONE_NEWCGROUP`)
+
+Cgroup namespace は、プロセスが見る cgroup 階層のルートを仮想化する。
+コンテナ内のプロセスが `/proc/self/cgroup` を読むと、
+コンテナの cgroup をルート (`/`) として表示する。
+
+```c
+/* include/linux/cgroup.h */
+struct cgroup_namespace {
+    struct ns_common    ns;
+    struct user_namespace *user_ns;
+    struct ucounts      *ucounts;
+    struct css_set      *root_cset;  /* この namespace のルート cgroup セット */
+};
+```
+
+```bash
+# ホストから見た cgroup パス
+cat /proc/self/cgroup
+# 0::/user.slice/user-1000.slice/session-1.scope
+
+# コンテナ内から見た cgroup パス (cgroup namespace により仮想化)
+# 0::/
+# コンテナは自分の cgroup をルートとして認識する
+```
+
+### 8. Time namespace (`CLONE_NEWTIME`)
+
+Linux 5.6 で導入された最も新しい namespace である。
+`CLOCK_MONOTONIC` と `CLOCK_BOOTTIME` のオフセットを分離する。
+
+```c
+/* include/linux/time_namespace.h */
+struct time_namespace {
+    struct user_namespace *user_ns;
+    struct ucounts        *ucounts;
+    struct ns_common       ns;
+    struct timens_offsets  offsets;  /* monotonic, boottime のオフセット */
+    struct page           *vvar_page;
+    /* ... */
+};
+```
+
+主な用途はコンテナのライブマイグレーションである。
+コンテナをホスト A からホスト B に移動したとき、
+`CLOCK_MONOTONIC` の値が不連続になるのを防ぐ。
+オフセットを設定することで、コンテナ内のプロセスから見た単調時計の連続性を保証する。
+
+`CLOCK_REALTIME` は Time namespace の影響を**受けない**ことに注意すること。
+壁時計時刻はシステム全体で一貫している必要があるためである。
+
+---
+
+## struct nsproxy: namespace 参照のハブ
+
+カーネルは各プロセスの namespace 所属情報を `struct nsproxy` で管理する。
+`task_struct` から `nsproxy` を経由して、各 namespace にアクセスする。
+
+```c
+/* include/linux/nsproxy.h */
+struct nsproxy {
+    refcount_t count;
+    struct uts_namespace  *uts_ns;
+    struct ipc_namespace  *ipc_ns;
+    struct mnt_namespace  *mnt_ns;
+    struct pid_namespace  *pid_ns_for_children;
+    struct net            *net_ns;
+    struct time_namespace *time_ns;
+    struct time_namespace *time_ns_for_children;
+    struct cgroup_namespace *cgroup_ns;
+};
+```
+
+`task_struct` と `nsproxy` の関係を図示する。
+
+```
+struct task_struct (current)
+│
+├── pid              (プロセス ID)
+├── cred             (セキュリティクレデンシャル)
+│   └── user_ns ───► struct user_namespace
+│
+└── nsproxy ────────► struct nsproxy
+                      │
+                      ├── uts_ns ──────► struct uts_namespace
+                      │                  (ホスト名, ドメイン名)
+                      │
+                      ├── ipc_ns ──────► struct ipc_namespace
+                      │                  (SysV IPC, POSIX mqueue)
+                      │
+                      ├── mnt_ns ──────► struct mnt_namespace
+                      │                  (マウントポイント)
+                      │
+                      ├── pid_ns_for_children
+                      │         ────────► struct pid_namespace
+                      │                  (子プロセスの PID 空間)
+                      │
+                      ├── net_ns ──────► struct net
+                      │                  (ネットワークスタック)
+                      │
+                      ├── time_ns ─────► struct time_namespace
+                      │                  (単調時計オフセット)
+                      │
+                      └── cgroup_ns ──► struct cgroup_namespace
+                                        (cgroup ルートビュー)
+```
+
+注意すべき点がいくつかある。
+
+**User namespace は `nsproxy` に含まれない**。
+User namespace は `task_struct->cred->user_ns` に格納される。
+これは capabilities のチェックが `cred` 構造体を通じて行われるためである。
+
+**`pid_ns_for_children`** というフィールド名は、PID namespace が `unshare()` で即座に変更されず、
+**次に `fork()` する子プロセス** から有効になることを意味する。
+実行中のプロセス自身の PID は変わらない。
+
+**参照カウント (`refcount_t count`)** により、`nsproxy` は複数のタスクから共有される。
+同じ namespace セットを持つプロセス群は同一の `nsproxy` を指す。
+namespace の一つを変更すると `copy_nsproxy()` で新しい `nsproxy` が作られ、
+変更したプロセスだけが新しい方を指すようになる。
+
+---
+
+## namespace 操作のシステムコール
+
+namespace の作成と操作は 3 つのシステムコールで行う。
+
+### clone(): 新しい namespace でプロセスを作成
+
+`clone()` は `fork()` の拡張版であり、フラグで namespace の作成を指定する。
+
+```c
+#define _GNU_SOURCE
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/wait.h>
+
+#define STACK_SIZE (1024 * 1024)
+
+static int child_fn(void *arg)
+{
+    /* この子プロセスは新しい PID namespace と UTS namespace に属する */
+    sethostname("container", 9);
+
+    printf("Child: PID=%d, hostname=container\n", getpid());
+    /* PID namespace 内なので PID=1 と表示される */
+
+    execl("/bin/bash", "bash", NULL);
+    return 0;
+}
+
+int main(void)
+{
+    char *stack = malloc(STACK_SIZE);
+    if (!stack) return 1;
+
+    pid_t pid = clone(child_fn,
+                      stack + STACK_SIZE,       /* スタックトップ */
+                      CLONE_NEWPID |            /* 新しい PID namespace */
+                      CLONE_NEWUTS |            /* 新しい UTS namespace */
+                      CLONE_NEWNS  |            /* 新しい mount namespace */
+                      SIGCHLD,                  /* 子終了時にシグナル送信 */
+                      NULL);
+
+    if (pid == -1) {
+        perror("clone");
+        return 1;
+    }
+
+    printf("Parent: child's PID in our namespace = %d\n", pid);
+    waitpid(pid, NULL, 0);
+    free(stack);
+    return 0;
+}
+```
+
+### unshare(): 現在のプロセスを新しい namespace に移動
+
+`unshare()` は `clone()` と異なり、新しいプロセスを作成せずに
+**呼び出したプロセス自身** を新しい namespace に移動する。
+
+```c
+#define _GNU_SOURCE
+#include <sched.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(void)
+{
+    /* 新しい UTS namespace と mount namespace を作成して自分自身を移動 */
+    if (unshare(CLONE_NEWUTS | CLONE_NEWNS) == -1) {
+        perror("unshare");
+        return 1;
+    }
+
+    /* 以降、ホスト名やマウントの変更はこのプロセスだけに影響する */
+    sethostname("isolated", 8);
+
+    char hostname[256];
+    gethostname(hostname, sizeof(hostname));
+    printf("New hostname: %s\n", hostname);  /* "isolated" */
+
+    return 0;
+}
+```
+
+PID namespace は例外で、`unshare(CLONE_NEWPID)` は
+呼び出したプロセス自身の PID を変えず、**次に fork する子プロセス** が新しい PID namespace に入る。
+
+### setns(): 既存の namespace に参加
+
+`setns()` は `/proc/<pid>/ns/<type>` のファイルディスクリプタを使って、
+既存の namespace にプロセスを参加させる。
+
+```c
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <sched.h>
+#include <stdio.h>
+#include <unistd.h>
+
+int main(int argc, char *argv[])
+{
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <pid>\n", argv[0]);
+        return 1;
+    }
+
+    char ns_path[256];
+
+    /* 対象プロセスの network namespace に参加 */
+    snprintf(ns_path, sizeof(ns_path), "/proc/%s/ns/net", argv[1]);
+    int fd = open(ns_path, O_RDONLY);
+    if (fd == -1) {
+        perror("open");
+        return 1;
+    }
+
+    if (setns(fd, CLONE_NEWNET) == -1) {
+        perror("setns");
+        close(fd);
+        return 1;
+    }
+    close(fd);
+
+    /* この時点で対象プロセスと同じ network namespace に入っている */
+    printf("Joined network namespace of PID %s\n", argv[1]);
+
+    /* この namespace 内でシェルを起動 */
+    execl("/bin/bash", "bash", NULL);
+    return 1;
+}
+```
+
+`docker exec` や `nsenter` コマンドは内部で `setns()` を使って
+既存のコンテナの namespace に参加している。
+
+```bash
+# nsenter でコンテナの全 namespace に参加する例
+nsenter --target <container-pid> --mount --uts --ipc --net --pid /bin/bash
+```
+
+### 3 つのシステムコールの比較
+
+| システムコール | 新プロセス作成 | 新 namespace 作成 | 既存 namespace 参加 |
+|---|---|---|---|
+| `clone()` | する | する | しない |
+| `unshare()` | しない | する | しない |
+| `setns()` | しない | しない | する |
+
+---
+
+## capable() vs ns_capable(): CVE を生む決定的な違い
+
+これはカーネルモジュール開発者にとって**最も重要なセキュリティ上の区別**である。
+この違いを理解していないと、コンテナの隔離を破壊する脆弱性を作り込む。
+
+### capable(): init namespace での権限チェック
+
+```c
+/* include/linux/capability.h */
+
+/**
+ * capable - init namespace でのケーパビリティチェック
+ * @cap: チェックする capability
+ *
+ * 呼び出し元が init user namespace で @cap を持っているかチェックする。
+ * ホストの「真の root」権限を確認する。
+ */
+bool capable(int cap);
+```
+
+`capable()` は常に **init user namespace** (つまりホストの root) での
+capability をチェックする。コンテナ内のプロセスが user namespace 内で
+root であっても、`capable()` は `false` を返す。
+
+### ns_capable(): 指定した namespace での権限チェック
+
+```c
+/* include/linux/capability.h */
+
+/**
+ * ns_capable - 指定した user namespace でのケーパビリティチェック
+ * @ns: チェック対象の user namespace
+ * @cap: チェックする capability
+ *
+ * 呼び出し元が @ns で @cap を持っているかチェックする。
+ * コンテナ内の root に制限された権限を許可する場合に使う。
+ */
+bool ns_capable(struct user_namespace *ns, int cap);
+```
+
+`ns_capable()` は指定した user namespace 内での capability をチェックする。
+コンテナ内の root がコンテナ内のリソースに対して操作を行うことを許可する場合に使う。
+
+### なぜ使い分けが CVE を防ぐのか
+
+以下のシナリオを考える。
+
+```
+┌───────────────────────────────────────────────────────┐
+│                                                       │
+│  シナリオ: カーネルモジュールが ioctl を提供            │
+│                                                       │
+│  コンテナ内の root (UID=0 in user namespace)           │
+│  が ioctl を呼ぶ。                                    │
+│                                                       │
+│  ┌─────────────────────────────────────┐              │
+│  │ もし capable() を使った場合:         │              │
+│  │                                     │              │
+│  │ if (!capable(CAP_SYS_ADMIN))        │              │
+│  │     return -EPERM;                  │              │
+│  │                                     │              │
+│  │ → コンテナ root は拒否される (安全)  │              │
+│  │ → ただしコンテナ内のリソース操作も   │              │
+│  │   不必要に拒否される可能性がある     │              │
+│  └─────────────────────────────────────┘              │
+│                                                       │
+│  ┌─────────────────────────────────────┐              │
+│  │ もし ns_capable() を使った場合:      │              │
+│  │                                     │              │
+│  │ if (!ns_capable(current_user_ns(),  │              │
+│  │                 CAP_SYS_ADMIN))     │              │
+│  │     return -EPERM;                  │              │
+│  │                                     │              │
+│  │ → コンテナ root は許可される         │              │
+│  │ → コンテナ内のリソースに対する操作   │              │
+│  │   なら適切                          │              │
+│  │ → ホスト全体に影響する操作なら       │              │
+│  │   セキュリティホール!               │              │
+│  └─────────────────────────────────────┘              │
+│                                                       │
+└───────────────────────────────────────────────────────┘
+```
+
+### 判断基準
+
+```c
+/*
+ * 判断基準:
+ *
+ * 操作がホスト全体に影響するか?
+ *   → capable() を使う
+ *   例: カーネルモジュールのロード、物理デバイスの設定
+ *
+ * 操作が namespace 内のリソースにのみ影響するか?
+ *   → ns_capable() を使う
+ *   例: namespace 内のネットワーク設定、IPC オブジェクトの管理
+ */
+
+/* 例 1: 物理デバイスへの直接アクセス — capable() を使う */
+static long hw_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    switch (cmd) {
+    case HW_RESET_DEVICE:
+        /*
+         * 物理ハードウェアのリセットはホスト全体に影響する。
+         * コンテナ内 root には絶対に許可してはならない。
+         * capable() で init namespace の権限を確認する。
+         */
+        if (!capable(CAP_SYS_ADMIN))
+            return -EPERM;
+        return do_hw_reset();
+
+    case HW_READ_STATUS:
+        /* 読み取りのみなら権限不要 */
+        return do_read_status(arg);
+    }
+    return -ENOTTY;
+}
+
+/* 例 2: namespace 内のネットワーク設定 — ns_capable() を使う */
+static int net_cmd_handler(struct sk_buff *skb, struct genl_info *info)
+{
+    struct net *net = genl_info_net(info);
+
+    /*
+     * ネットワーク設定の変更は namespace 内に閉じる。
+     * コンテナ内 root が自分のネットワークを設定することを許可する。
+     * ns_capable() で呼び出し元の user namespace の権限を確認する。
+     */
+    if (!ns_capable(net->user_ns, CAP_NET_ADMIN))
+        return -EPERM;
+
+    return do_net_config(net, info);
+}
+```
+
+### 実際の CVE: 誤用が脆弱性を生んだ例
+
+**CVE-2017-7184 (xfrm)**: IPsec の xfrm サブシステムで `capable()` を使うべきところで
+権限チェックが不十分だった。攻撃者はユーザ namespace 内から IPsec ポリシーを操作し、
+ホストのネットワークスタックに影響を与えることができた。
+
+**CVE-2023-32233 (nf_tables)**: Netfilter の nf_tables で
+namespace を考慮した権限チェックの不備があり、
+非特権ユーザが user namespace を通じてローカル権限昇格が可能だった。
+
+これらの例が示すように、`capable()` と `ns_capable()` の使い分けは
+単なるコーディングスタイルの問題ではなく、**セキュリティクリティカルな設計判断**である。
+
+### モジュール開発者のためのチェックリスト
+
+1. **操作が物理ハードウェアに影響する** → `capable()` を使う
+2. **操作がホスト全体のカーネル状態に影響する** → `capable()` を使う
+3. **操作が namespace 内のリソースのみに影響する** → `ns_capable()` を使う
+4. **迷ったら `capable()` を使う** — 制限が厳しすぎることはセキュリティホールにならないが、
+   緩すぎることは CVE になる
+5. **`ns_capable()` を使う場合は、操作が本当に namespace 内に閉じることを証明する**
+
+---
+
+## cgroups v2: プロセスの「使えるリソース」を制限する
+
+### cgroups v1 から v2 への進化
+
+cgroups (control groups) はプロセスのリソース使用量を制限・計測・制御する機構である。
+
+cgroups v1 は各コントローラ (cpu, memory, blkio 等) が**独立した階層**を持っていた。
+これにより設定が複雑になり、コントローラ間の整合性を保つのが困難だった。
+
+cgroups v2 は Linux 4.5 で導入され、5.x 系で成熟した。
+最大の変更は **統一階層 (unified hierarchy)** である。
+すべてのコントローラが単一の階層を共有する。
+
+```
+cgroups v1 (複数の独立した階層):
+
+  cpu 階層:                memory 階層:           blkio 階層:
+  /                        /                       /
+  ├── group_a              ├── group_a              ├── group_x
+  │   └── task1            │   └── task1            │   └── task1
+  └── group_b              └── group_c              └── task2
+      └── task2                └── task2
+
+  → 各階層でグループ分けが異なりうる (混乱の元)
+
+cgroups v2 (統一階層):
+
+  / (ルート cgroup)
+  ├── system.slice/
+  │   ├── ssh.service/
+  │   │   └── task1, task2
+  │   └── nginx.service/
+  │       └── task3, task4
+  ├── user.slice/
+  │   └── user-1000.slice/
+  │       └── task5
+  └── containers/
+      ├── container-a/
+      │   └── task6, task7
+      └── container-b/
+          └── task8
+
+  → 全コントローラが同じ階層を共有 (一貫性)
+```
+
+### cgroups v2 のマウントと基本構造
+
+```bash
+# cgroups v2 は通常 /sys/fs/cgroup にマウントされている
+mount | grep cgroup2
+# cgroup2 on /sys/fs/cgroup type cgroup2 (rw,nosuid,nodev,noexec,relatime)
+
+# 利用可能なコントローラの確認
+cat /sys/fs/cgroup/cgroup.controllers
+# cpu io memory pids
+
+# 現在のプロセスの cgroup を確認
+cat /proc/self/cgroup
+# 0::/user.slice/user-1000.slice/session-1.scope
+```
+
+### コントローラの種類
+
+cgroups v2 の主要なコントローラを以下に示す。
+
+| コントローラ | 制御対象 | 主要なインターフェースファイル |
+|---|---|---|
+| `cpu` | CPU 時間 | `cpu.max`, `cpu.weight` |
+| `memory` | メモリ使用量 | `memory.max`, `memory.high`, `memory.current` |
+| `io` | ブロック I/O | `io.max`, `io.weight` |
+| `pids` | プロセス数上限 | `pids.max`, `pids.current` |
+| `cpuset` | CPU/メモリノードのピニング | `cpuset.cpus`, `cpuset.mems` |
+| `rdma` | RDMA リソース | `rdma.max`, `rdma.current` |
+| `hugetlb` | HugeTLB ページ | `hugetlb.<size>.max` |
+| `misc` | その他のスカラリソース | `misc.max`, `misc.current` |
+
+### subtree_control: コントローラの有効化
+
+cgroups v2 では、コントローラはデフォルトで無効であり、
+親 cgroup の `cgroup.subtree_control` に書き込むことで子 cgroup に対して有効化する。
+
+```bash
+# ルート cgroup で利用可能なコントローラを確認
+cat /sys/fs/cgroup/cgroup.controllers
+# cpu io memory pids
+
+# 子 cgroup に対して cpu と memory コントローラを有効化
+echo "+cpu +memory" > /sys/fs/cgroup/cgroup.subtree_control
+
+# 子 cgroup を作成
+mkdir /sys/fs/cgroup/my_group
+
+# 子 cgroup でさらに孫に対してコントローラを有効化
+echo "+cpu +memory" > /sys/fs/cgroup/my_group/cgroup.subtree_control
+
+# 孫 cgroup を作成してプロセスを配置
+mkdir /sys/fs/cgroup/my_group/task_a
+echo $$ > /sys/fs/cgroup/my_group/task_a/cgroup.procs
+```
+
+### "No Internal Processes" ルール
+
+cgroups v2 の重要なルールとして **"no internal processes"** がある。
+これは「コントローラが有効になっている cgroup は、
+リーフ cgroup (子を持たない cgroup) にのみプロセスを配置できる」というルールである。
+
+```
+正しい構成:                        間違った構成:
+
+  /my_group/                         /my_group/
+  ├── subtree_control: +cpu +memory  ├── subtree_control: +cpu +memory
+  │   (プロセスなし)                  │   ← プロセスがここにいると NG!
+  ├── task_a/                        ├── task_a/
+  │   └── PID 1234                   │   └── PID 1234
+  └── task_b/                        └── task_b/
+      └── PID 5678                       └── PID 5678
+```
+
+このルールが存在する理由は明確である。
+もし親 cgroup にプロセスがいて、子 cgroup にもプロセスがいた場合、
+親に配分されたリソースのうちどれだけを「親のプロセス」に、
+どれだけを「子 cgroup」に配分すべきか曖昧になる。
+
+この問題を避けるため、コントローラが有効な中間ノードにはプロセスを配置できない。
+ルート cgroup はこのルールの例外である。
+
+---
+
+### 主要なインターフェースファイルの詳細
+
+#### memory.max: メモリのハード上限
+
+```bash
+# メモリ上限を 512 MB に設定
+echo "536870912" > /sys/fs/cgroup/my_group/task_a/memory.max
+
+# "max" はデフォルト値 (制限なし) を意味する
+cat /sys/fs/cgroup/my_group/task_a/memory.max
+# max
+```
+
+`memory.max` を超えようとすると、カーネルは OOM killer を発動してグループ内のプロセスを
+強制終了する。
+
+#### memory.high: メモリのソフト上限
+
+```bash
+# ソフト上限を 256 MB に設定
+echo "268435456" > /sys/fs/cgroup/my_group/task_a/memory.high
+```
+
+`memory.high` を超えると、カーネルはそのグループのメモリ回収 (reclaim) を積極的に行い、
+プロセスをスロットリングする。即座に OOM にはならないが、性能が低下する。
+`memory.max` と組み合わせて使うのが一般的である。
+
+```
+メモリ使用量の推移とcgroupの動作:
+
+  memory.max (ハード上限) ─────────────────────── 512MB
+                                               ↑ OOM kill
+  memory.high (ソフト上限) ─────────────────── 256MB
+                                 ↑ reclaim 強化, スロットリング
+                         ┌──────┘
+                    ┌────┘
+               ┌────┘
+  0 ──────┴─────────────────────────────────── 時間 →
+```
+
+#### cpu.max: CPU 帯域幅制限
+
+```bash
+# 100ms 周期中に最大 50ms の CPU 時間を許可 (50% 制限)
+echo "50000 100000" > /sys/fs/cgroup/my_group/task_a/cpu.max
+#     ↑ quota  ↑ period (マイクロ秒単位)
+
+# CPU 制限なし (デフォルト)
+echo "max 100000" > /sys/fs/cgroup/my_group/task_a/cpu.max
+```
+
+`cpu.max` は CFS Bandwidth Control を使い、period あたり quota マイクロ秒まで CPU を使える。
+マルチコアシステムでは quota > period にすることで複数コアの使用を許可できる。
+例えば 2 コア分なら `"200000 100000"` と設定する。
+
+#### io.max: ブロック I/O 帯域幅制限
+
+```bash
+# デバイス 8:0 に対して読み取り 10MB/s, 書き込み 5MB/s に制限
+echo "8:0 rbps=10485760 wbps=5242880" > /sys/fs/cgroup/my_group/task_a/io.max
+
+# IOPS 制限も可能
+echo "8:0 riops=1000 wiops=500" > /sys/fs/cgroup/my_group/task_a/io.max
+```
+
+`io.max` はデバイス単位 (major:minor) で指定する。
+帯域幅 (bps) と IOPS の両方を同時に制限できる。
+
+#### pids.max: プロセス数上限
+
+```bash
+# cgroup 内のプロセス数を最大 100 に制限
+echo "100" > /sys/fs/cgroup/my_group/task_a/pids.max
+
+# 現在のプロセス数を確認
+cat /sys/fs/cgroup/my_group/task_a/pids.current
+```
+
+`pids.max` は fork bomb 攻撃に対する防御として重要である。
+コンテナ内で無限に `fork()` されてもホスト全体の PID 枯渇を防ぐ。
+
+---
+
+## PSI: Pressure Stall Information
+
+PSI は Linux 4.20 で導入されたリソース圧迫度の計測機構である。
+cgroup 単位で「CPU、メモリ、I/O のどれがボトルネックになっているか」を定量的に把握できる。
+
+### PSI のメトリクス
+
+```bash
+# システム全体の PSI
+cat /proc/pressure/cpu
+# some avg10=2.50 avg60=1.80 avg300=1.20 total=456789
+
+cat /proc/pressure/memory
+# some avg10=0.00 avg60=0.00 avg300=0.00 total=0
+# full avg10=0.00 avg60=0.00 avg300=0.00 total=0
+
+cat /proc/pressure/io
+# some avg10=5.30 avg60=3.20 avg300=2.10 total=789012
+# full avg10=1.20 avg60=0.80 avg300=0.50 total=234567
+```
+
+| メトリクス | 意味 |
+|---|---|
+| `some` | **一部**のタスクがリソース待ちで停止している時間の割合 |
+| `full` | **すべて**のタスクがリソース待ちで停止している時間の割合 (CPU には存在しない) |
+| `avg10` | 直近 10 秒間の平均 (%) |
+| `avg60` | 直近 60 秒間の平均 (%) |
+| `avg300` | 直近 300 秒間の平均 (%) |
+| `total` | 累計ストール時間 (マイクロ秒) |
+
+### cgroup 単位の PSI
+
+```bash
+# 特定の cgroup の PSI
+cat /sys/fs/cgroup/my_group/task_a/cpu.pressure
+cat /sys/fs/cgroup/my_group/task_a/memory.pressure
+cat /sys/fs/cgroup/my_group/task_a/io.pressure
+```
+
+### PSI トリガー
+
+PSI はポーリングだけでなく、閾値ベースの**トリガー**も提供する。
+リソース圧迫が閾値を超えたときに通知を受け取れる。
+
+```c
+/* PSI トリガーの設定例 (ユーザ空間) */
+#include <fcntl.h>
+#include <poll.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+
+int main(void)
+{
+    int fd = open("/proc/pressure/memory", O_RDWR | O_NONBLOCK);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    /*
+     * "some 150000 1000000" は:
+     * 「1秒間 (1000000us) のうち 150ms (150000us) 以上
+     *   メモリ圧迫がある場合に通知」を意味する
+     */
+    const char *trigger = "some 150000 1000000";
+    if (write(fd, trigger, strlen(trigger)) < 0) {
+        perror("write trigger");
+        close(fd);
+        return 1;
+    }
+
+    struct pollfd fds = { .fd = fd, .events = POLLPRI };
+
+    printf("Waiting for memory pressure...\n");
+    while (1) {
+        int ret = poll(&fds, 1, -1);
+        if (ret > 0 && (fds.revents & POLLPRI)) {
+            printf("Memory pressure threshold exceeded!\n");
+            /* ここでメモリ節約処理やアラートを行う */
+        }
+    }
+
+    close(fd);
+    return 0;
+}
+```
+
+PSI は systemd-oomd や Meta の oomd などの OOM 対策デーモンでも活用されている。
+`memory.pressure` の `full` が継続的に高い場合、OOM kill の前に
+優先度の低いサービスを事前に停止するといった判断に使われる。
+
+---
+
+## Docker/Podman のコンテナアーキテクチャ
+
+Docker や Podman は namespace と cgroups を組み合わせてコンテナを実現する。
+ここではコンテナ作成時にカーネルレベルで何が起きるかを解説する。
+
+### コンテナ作成の全体像
+
+```
+docker run -it --name myapp --memory 512m --cpus 1.5 ubuntu /bin/bash
+
+┌─────────────────────────────────────────────────────────────────┐
+│                    コンテナ作成の流れ                              │
+│                                                                 │
+│  1. イメージの展開                                               │
+│     └── overlay2 ファイルシステムを構築                           │
+│                                                                 │
+│  2. Namespace の作成 (clone/unshare)                             │
+│     ├── PID namespace     → コンテナ内 PID 1 を作成              │
+│     ├── Network namespace → veth ペア + ブリッジ接続             │
+│     ├── Mount namespace   → overlay2 をルートとしてマウント       │
+│     ├── UTS namespace     → コンテナ固有のホスト名を設定          │
+│     ├── IPC namespace     → SysV IPC の隔離                     │
+│     ├── User namespace    → UID/GID マッピング (rootless 時)     │
+│     ├── Cgroup namespace  → cgroup ビューの仮想化                │
+│     └── Time namespace    → (通常は未使用)                       │
+│                                                                 │
+│  3. Cgroup の設定                                                │
+│     ├── /sys/fs/cgroup/.../memory.max = 536870912 (512MB)       │
+│     ├── /sys/fs/cgroup/.../cpu.max = "150000 100000" (1.5 CPU)  │
+│     ├── /sys/fs/cgroup/.../pids.max = 4096                      │
+│     └── プロセスを cgroup.procs に登録                            │
+│                                                                 │
+│  4. セキュリティ設定                                             │
+│     ├── seccomp フィルタを適用 (不要なシステムコールを禁止)        │
+│     ├── capability を制限 (最小限の権限セットのみ付与)            │
+│     ├── AppArmor/SELinux プロファイルを適用                      │
+│     └── /proc, /sys の一部を read-only でマウント                │
+│                                                                 │
+│  5. プロセス起動                                                 │
+│     └── pivot_root + exec でコンテナのエントリーポイントを実行    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### アーキテクチャ図
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ ホスト (Linux カーネル)                                          │
+│                                                                 │
+│ ┌───────────────────────────────┐                               │
+│ │ containerd / Podman           │                               │
+│ │ (コンテナランタイム)           │                               │
+│ │                               │                               │
+│ │    ┌──────────────────┐       │                               │
+│ │    │ runc / crun      │       │                               │
+│ │    │ (OCI ランタイム)  │       │                               │
+│ │    │                  │       │                               │
+│ │    │ clone() で各種   │       │                               │
+│ │    │ namespace 作成   │       │                               │
+│ │    │ cgroup 設定      │       │                               │
+│ │    │ seccomp 適用     │       │                               │
+│ │    └──────┬───────────┘       │                               │
+│ │           │                   │                               │
+│ └───────────┼───────────────────┘                               │
+│             │                                                   │
+│  ┌──────────▼──────────┐  ┌──────────────────────┐             │
+│  │ コンテナ A           │  │ コンテナ B           │             │
+│  │                      │  │                      │             │
+│  │  PID NS  ┌────────┐ │  │  PID NS  ┌────────┐ │             │
+│  │  ┌─┐     │/bin/app│ │  │  ┌─┐     │/bin/db │ │             │
+│  │  │1│────►│        │ │  │  │1│────►│        │ │             │
+│  │  └─┘     └────────┘ │  │  └─┘     └────────┘ │             │
+│  │                      │  │                      │             │
+│  │  NET NS             │  │  NET NS              │             │
+│  │  eth0: 172.17.0.2   │  │  eth0: 172.17.0.3    │             │
+│  │        │             │  │        │             │             │
+│  │  MNT NS │            │  │  MNT NS │            │             │
+│  │  /: overlay2         │  │  /: overlay2         │             │
+│  │                      │  │                      │             │
+│  │  cgroup:             │  │  cgroup:             │             │
+│  │  mem=512MB           │  │  mem=1GB             │             │
+│  │  cpu=1.5             │  │  cpu=2.0             │             │
+│  │  pids=4096           │  │  pids=2048           │             │
+│  └──────────────────────┘  └──────────────────────┘             │
+│             │                        │                          │
+│       ┌─────┘                  ┌─────┘                          │
+│       ▼                        ▼                                │
+│  ┌──────────────────────────────────────┐                       │
+│  │ docker0 ブリッジ (172.17.0.1)        │                       │
+│  │   veth-a ◄──────► veth-b            │                       │
+│  └──────────────────┬───────────────────┘                       │
+│                     │                                           │
+│                     ▼                                           │
+│              eth0 (物理 NIC)                                    │
+│              iptables NAT                                       │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Docker vs Podman: root と rootless
+
+Docker は従来、`dockerd` デーモンが root 権限で動作していた。
+Podman はデーモンレスであり、rootless (非特権) での動作を前提に設計されている。
+
+```
+Docker (rootful):                    Podman (rootless):
+                                    
+  dockerd (root)                     podman (一般ユーザ)
+    └── containerd (root)              └── conmon
+         └── runc (root)                    └── crun
+              └── clone() +                      └── clone(CLONE_NEWUSER) +
+                  CLONE_NEWPID +                     CLONE_NEWPID +
+                  CLONE_NEWNET + ...                  CLONE_NEWNET + ...
+                                    
+  capable() = true                   user namespace 内:
+  (真の root 権限)                     ns_capable() = true
+                                       capable() = false
+                                       (ホストに対しては非特権)
+```
+
+Rootless コンテナでは User namespace が鍵となる。
+コンテナ内では root に見えるが、ホスト側では一般ユーザの UID にマッピングされている。
+これにより、コンテナが侵害されてもホスト全体への影響を大幅に軽減できる。
+
+---
+
+## モジュール開発者への実践的な影響
+
+### リソース制限がメモリアロケーションに与える影響
+
+カーネルモジュールのコードは、cgroup のメモリ制限の影響を受ける場合がある。
+ユーザプロセスのコンテキストで `kmalloc()` を呼ぶとき、
+そのプロセスが属する cgroup のメモリ制限に達していると、
+メモリ回収やスロットリングが発生する可能性がある。
+
+```c
+/*
+ * cgroup メモリ制限下でのアロケーション
+ *
+ * GFP_KERNEL_ACCOUNT フラグを使うと、アロケーションが
+ * プロセスの cgroup のメモリ使用量に計上される。
+ * カーネルが代わりにアカウンティングを行うオブジェクト
+ * (例: ページテーブル、一部の slab オブジェクト) は
+ * 自動的にアカウントされる。
+ */
+static int my_open(struct inode *inode, struct file *file)
+{
+    struct my_data *data;
+
+    /*
+     * GFP_KERNEL: 通常のアロケーション。
+     * cgroup のメモリ制限には影響されない場合がある。
+     */
+    data = kmalloc(sizeof(*data), GFP_KERNEL);
+
+    /*
+     * GFP_KERNEL_ACCOUNT: cgroup のメモリに計上される。
+     * ユーザの操作に応じて割り当てるメモリに使うべき。
+     * cgroup の memory.max に達していると失敗しやすくなる。
+     */
+    data->user_buf = kvmalloc(user_requested_size, GFP_KERNEL_ACCOUNT);
+    if (!data->user_buf) {
+        kfree(data);
+        return -ENOMEM;
+    }
+
+    file->private_data = data;
+    return 0;
+}
+```
+
+### namespace を意識した /proc, /sys エントリ
+
+カーネルモジュールが `/proc` や `/sys` にエントリを作成する場合、
+namespace の影響を考慮する必要がある。
+
+```c
+/*
+ * /proc エントリの namespace 対応
+ *
+ * proc_create() で作成したエントリは全 PID namespace から見える。
+ * しかしその内容は namespace によって異なるべき場合がある。
+ *
+ * 例: ネットワーク関連の /proc エントリ
+ * /proc/net/ 以下のエントリは、プロセスの network namespace に
+ * 応じて異なる内容を返す。これは proc_net_fops_create() が
+ * 自動的に処理する。
+ */
+
+/* 良い例: network namespace を考慮した proc エントリ */
+static int my_proc_show(struct seq_file *m, void *v)
+{
+    struct net *net = seq_file_net(m);
+    /* net は読み取りプロセスの network namespace */
+
+    /* この namespace 内のデバイスだけを表示 */
+    struct net_device *dev;
+    for_each_netdev(net, dev) {
+        seq_printf(m, "%s: ...\n", dev->name);
+    }
+    return 0;
+}
+
+/* 悪い例: namespace を考慮しない proc エントリ */
+static int bad_proc_show(struct seq_file *m, void *v)
+{
+    /* init_net を直接参照 — 全プロセスにホストの情報が見える */
+    struct net_device *dev;
+    for_each_netdev(&init_net, dev) {  /* バグ: init_net 固定 */
+        seq_printf(m, "%s: ...\n", dev->name);
+    }
+    return 0;
+}
+```
+
+### pids.max による fork 制限の影響
+
+`pids.max` による制限は、カーネルモジュールが `kthread_create()` で
+カーネルスレッドを作成する場合にも影響しうる。
+ただし、カーネルスレッドは通常 init cgroup (ルート cgroup) に属するため、
+コンテナの `pids.max` の影響は受けない。
+
+ユーザプロセスのコンテキストで `fork()` が失敗する可能性があることを意識すべきである。
+例えば `call_usermodehelper()` でユーザ空間のヘルパープログラムを起動する場合、
+cgroup の `pids.max` に達していると失敗する可能性がある。
+
+### ioctl の権限チェックにおける namespace 考慮
+
+```c
+/*
+ * ioctl ハンドラでの namespace 対応権限チェック
+ */
+static long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    switch (cmd) {
+    case MY_IOCTL_GLOBAL_CONFIG:
+        /*
+         * システム全体の設定を変更する。
+         * ホストの root のみ許可。コンテナ root は拒否。
+         */
+        if (!capable(CAP_SYS_ADMIN))
+            return -EPERM;
+        return do_global_config(arg);
+
+    case MY_IOCTL_NS_CONFIG:
+        /*
+         * namespace 内のリソースのみ影響する設定。
+         * コンテナ root にも許可。
+         */
+        if (!ns_capable(current_user_ns(), CAP_SYS_ADMIN))
+            return -EPERM;
+        return do_ns_config(current, arg);
+
+    case MY_IOCTL_READ_STATS:
+        /* 読み取りのみ — 権限不要 */
+        return do_read_stats(arg);
+    }
+
+    return -ENOTTY;
+}
+```
+
+---
+
+## Rust カーネルバインディングの現状
+
+2026 年 4 月時点で、namespace と cgroups に関連する Rust バインディングの状況を
+正確に把握しておくことが重要である。
+
+### 存在するバインディング
+
+**`kernel::cred`** — クレデンシャル構造体の Rust 抽象が存在する。
+`current_cred()` で現在のプロセスのクレデンシャルにアクセスし、
+UID、GID、capability を取得できる。
+
+```rust
+// kernel::cred の使用例 (概念的)
+use kernel::cred::Credential;
+use kernel::task::Task;
+
+fn check_permission() -> Result<()> {
+    let task = Task::current();
+    let cred = task.cred();
+
+    // UID の取得
+    let uid = cred.euid();
+
+    // capability のチェック (ただし capable() のラッパーは限定的)
+    // ...
+
+    Ok(())
+}
+```
+
+### 存在しないバインディング
+
+以下の重要な構造体とAPI については、Rust バインディングが**まだ存在しない**。
+
+| カーネル API | Rust バインディング | 状況 |
+|---|---|---|
+| `struct nsproxy` | 未実装 | namespace 参照にアクセスできない |
+| `struct pid_namespace` | 未実装 | PID namespace 操作が不可 |
+| `struct net` (完全版) | 部分的 | ネットワーク namespace の完全な操作は不可 |
+| `struct user_namespace` | 未実装 | User namespace 操作が不可 |
+| `struct cgroup` | 未実装 | cgroup 操作が不可 |
+| `capable()` | ラッパー存在 | 基本的な capability チェックは可能 |
+| `ns_capable()` | 未実装 | namespace 対応 capability チェックが不可 |
+| PSI インターフェース | 未実装 | Rust からの直接利用は不可 |
+
+### なぜバインディングが遅れているか
+
+namespace と cgroups のバインディングが未実装である理由はいくつかある。
+
+1. **複雑な参照関係**: `nsproxy` は複数の namespace 構造体を参照し、
+   各 namespace は相互に参照し合う。Rust の所有権モデルでこれを安全に表現するのは難題である。
+
+2. **RCU の多用**: namespace 構造体へのアクセスは RCU (Read-Copy-Update) で保護されている。
+   Rust の RCU 抽象はまだ初期段階であり、namespace のラッパーの前提条件が整っていない。
+
+3. **優先度**: ドライバ開発 (ファイルシステム、ネットワーク、ブロックデバイス) が
+   Rust for Linux の主要なユースケースであり、namespace/cgroups の直接操作は
+   ドライバからは通常必要ない。
+
+4. **C FFI で代替可能**: 現時点では、必要に応じて `unsafe` ブロックから
+   C の関数を直接呼び出すことで対応できる。
+
+### Rust モジュールでの現実的なアプローチ
+
+現時点で Rust カーネルモジュールから namespace/cgroups を扱う必要がある場合、
+C のヘルパー関数を経由して FFI で呼び出すアプローチが現実的である。
+
+```rust
+// Rust モジュールから capable() を使う例
+// kernel crate に capable() のラッパーがある場合
+
+use kernel::prelude::*;
+
+fn my_ioctl_handler(cmd: u32) -> Result<()> {
+    match cmd {
+        // capable() は kernel crate でラップされている
+        CMD_GLOBAL => {
+            // capable(CAP_SYS_ADMIN) に相当するチェック
+            // 具体的な API は kernel crate のバージョンに依存
+            // ...
+            Ok(())
+        }
+        _ => Err(ENOTTY),
+    }
+}
+
+// ns_capable() は Rust ラッパーがないため、
+// 必要なら C ヘルパーを定義して FFI で呼び出す
+
+// helpers.c (C 側)
+// bool rust_helper_ns_capable(struct user_namespace *ns, int cap)
+// {
+//     return ns_capable(ns, cap);
+// }
+
+// Rust 側
+// extern "C" {
+//     fn rust_helper_ns_capable(ns: *mut bindings::user_namespace,
+//                                cap: core::ffi::c_int) -> bool;
+// }
+```
+
+この状況は Rust for Linux エコシステムの成熟に伴い改善される見込みである。
+特に namespace 対応の capability チェックは、安全なモジュール開発に不可欠であるため、
+将来的にはファーストクラスの Rust API が提供されると期待される。
+
+---
+
+## まとめ
+
+この章で学んだ内容を振り返る。
+
+- **Namespace** はカーネルリソースの可視性を分離する。
+  8 種類 (mount, UTS, IPC, PID, network, user, cgroup, time) が存在し、
+  それぞれ異なるリソースを隔離する。
+
+- **`struct nsproxy`** が各 namespace への参照を保持し、
+  `task_struct` から辿れる。User namespace だけは `cred` 構造体に格納される。
+
+- **`clone()`, `unshare()`, `setns()`** の 3 つのシステムコールで
+  namespace の作成と参加を行う。
+
+- **`capable()` vs `ns_capable()`** は CVE を防ぐための最重要の判断である。
+  ホスト全体に影響する操作には `capable()`、
+  namespace 内に閉じる操作には `ns_capable()` を使う。
+
+- **cgroups v2** は統一階層により、CPU、メモリ、I/O、プロセス数などの
+  リソースを一貫して制限する。"no internal processes" ルールに注意。
+
+- **PSI** はリソース圧迫度を定量的に計測し、
+  閾値ベースのトリガーでプロアクティブな対応を可能にする。
+
+- **Docker/Podman** は namespace (隔離) + cgroups (制限) + seccomp/LSM (セキュリティ) の
+  組み合わせでコンテナを実現する。
+
+- **Rust バインディング** は `kernel::cred` が存在するが、
+  `nsproxy`、namespace 構造体、cgroups の完全なバインディングは未実装である。
+  現時点では C FFI 経由で対応する。
+
+カーネルモジュール開発者として最も重要なのは、自分のモジュールのコードが
+コンテナ環境から呼ばれる可能性を常に意識し、
+権限チェックを正しく行うことである。
+`capable()` と `ns_capable()` を適切に使い分けることが、
+安全なカーネルモジュールの第一条件である。
+
+---
+
+## 参考文献
+
+- `man 7 namespaces` — namespace の概要
+- `man 7 cgroups` — cgroups の概要
+- `man 7 user_namespaces` — User namespace の詳細
+- `man 2 clone` — clone() システムコール
+- `man 2 unshare` — unshare() システムコール
+- `man 2 setns` — setns() システムコール
+- カーネルドキュメント: `Documentation/admin-guide/cgroup-v2.rst`
+- カーネルドキュメント: `Documentation/accounting/psi.rst`
+- `include/linux/nsproxy.h` — nsproxy 構造体の定義
+- `include/linux/capability.h` — capable(), ns_capable() の定義
+- LWN: "Namespaces in operation" シリーズ
+- LWN: "Control groups, pair 2: cgroups v2"

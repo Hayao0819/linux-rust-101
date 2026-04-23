@@ -1,0 +1,1433 @@
+---
+title: "システムコールの内部構造"
+description: "SYSCALL命令, entry_SYSCALL_64, syscallテーブル, KPTI, vDSO, seccomp-BPF — モジュール開発者のためのsyscall入門"
+---
+
+## この章で学ぶこと
+
+- x86_64 における SYSCALL 命令の動作原理を理解する
+- `entry_SYSCALL_64` からカーネル関数が呼ばれるまでの全経路を追跡できる
+- SWAPGS と KPTI (CR3 切り替え) によるユーザ/カーネルモード遷移の仕組みを把握する
+- `sys_call_table[]` の構造と、システムコール番号からハンドラへの対応付けを理解する
+- vDSO と vsyscall によるカーネル遷移なしのシステムコール最適化を説明できる
+- seccomp-BPF によるシステムコールフィルタリングの仕組みと設定方法を学ぶ
+- `file_operations` コールバックとシステムコールの関係を正確に理解する
+- strace / ftrace / eBPF を使ったシステムコールのトレース手法を実践できる
+---
+
+ユーザ空間のプログラムが `read()` や `write()` を呼ぶとき、
+実際にはCPUの特権レベルが切り替わり、カーネルコードが実行され、
+最終的に私たちが書いたカーネルモジュールの `file_operations` コールバックに到達する。
+
+この一連の経路を正確に理解することは、カーネルモジュール開発者にとって不可欠である。
+パフォーマンスの問題を調査するとき、セキュリティの脅威を評価するとき、
+あるいはデバッグで oops のスタックトレースを読むとき、
+システムコールの内部構造を知っていることが直接的な助けになる。
+
+この章では、ユーザ空間の `syscall()` 呼び出しから、CPU のモード遷移、
+カーネルのエントリコード、システムコールテーブルのディスパッチ、
+そして最終的にドライバのコールバック関数に到達するまでの全経路を詳細に追跡する。
+
+## 全体像: システムコールの経路
+
+まず、ユーザ空間の `read(fd, buf, len)` が呼ばれてから
+カーネルモジュールの `file_operations.read` に到達するまでの全体像を示す。
+
+```
+  ユーザ空間                            カーネル空間
+ ┌──────────────────┐
+ │ read(fd, buf, n) │    libc ラッパー関数
+ └────────┬─────────┘
+          │
+          ▼
+ ┌──────────────────┐
+ │ レジスタ設定:     │    rax=0 (NR_read), rdi=fd, rsi=buf, rdx=n
+ │ SYSCALL 命令      │    ← CPU が Ring 3 → Ring 0 に遷移
+ └────────┬─────────┘
+          │
+ ═════════╪═══════════════════════  CPU 特権レベル境界 (Ring 3 → Ring 0)
+          │
+          ▼
+ ┌──────────────────────────────────────────────────────────────────┐
+ │ entry_SYSCALL_64 (arch/x86/entry/entry_64.S)                    │
+ │   1. SWAPGS            ── GS ベースをカーネル用に切り替え        │
+ │   2. CR3 切り替え       ── KPTI: ユーザ用ページテーブル →         │
+ │                            カーネル用ページテーブル                │
+ │   3. RSP 切り替え       ── カーネルスタックに変更                  │
+ │   4. pt_regs を PUSH   ── ユーザレジスタを保存                    │
+ └────────┬─────────────────────────────────────────────────────────┘
+          │
+          ▼
+ ┌──────────────────────────────────────────────────────────────────┐
+ │ do_syscall_64(regs, nr)  (arch/x86/entry/common.c)              │
+ │   1. nr = regs->orig_rax                                        │
+ │   2. sys_call_table[nr](regs) を呼び出す                         │
+ └────────┬─────────────────────────────────────────────────────────┘
+          │
+          ▼
+ ┌──────────────────────────────────────────────────────────────────┐
+ │ __x64_sys_read(regs)    (fs/read_write.c)                       │
+ │   → ksys_read(fd, buf, count)                                   │
+ │     → vfs_read(file, buf, count, &pos)                          │
+ │       → file->f_op->read_iter(kio, iter)                        │
+ │         → ★ あなたのモジュールの read コールバック ★               │
+ └──────────────────────────────────────────────────────────────────┘
+```
+
+この経路の各段階を順に詳しく見ていこう。
+
+## x86_64 の SYSCALL 命令
+
+### 歴史的背景: int 0x80 から SYSCALL へ
+
+x86 における旧来のシステムコール呼び出し方法は `int 0x80` ソフトウェア割り込みであった。
+しかし `int 0x80` は IDT (Interrupt Descriptor Table) の参照、特権レベルチェック、
+スタック切り替えなど、多くのマイクロアーキテクチャ上のオーバーヘッドを伴う。
+
+AMD が導入した `SYSCALL` / `SYSRET` 命令ペアはこのオーバーヘッドを大幅に削減する。
+`SYSCALL` 命令は以下の動作を **1命令** で行う:
+
+1. `RCX` に戻りアドレス (`RIP`) を保存する
+2. `R11` に `RFLAGS` を保存する
+3. `MSR_LSTAR` (Model Specific Register `0xC0000082`) に格納されたアドレスに `RIP` を設定する
+4. `MSR_STAR` の上位 32 ビットからカーネルの CS/SS セレクタをロードする
+5. `MSR_SFMASK` の値で `RFLAGS` をマスクする (割り込みフラグ IF を無効化)
+
+### MSR の設定
+
+カーネルの起動時に `syscall_init()` で MSR が設定される:
+
+```c
+/* arch/x86/kernel/cpu/common.c */
+void syscall_init(void)
+{
+    wrmsr(MSR_STAR, 0, (__USER32_CS << 16) | __KERNEL_CS);
+    wrmsrl(MSR_LSTAR, (unsigned long)entry_SYSCALL_64);
+    wrmsrl(MSR_CSTAR, (unsigned long)ignore_sysret);  /* 32-bit compat */
+    wrmsrl(MSR_SYSCALL_MASK,
+           X86_EFLAGS_TF | X86_EFLAGS_DF | X86_EFLAGS_IF |
+           X86_EFLAGS_IOPL | X86_EFLAGS_AC | X86_EFLAGS_NT);
+}
+```
+
+ここで重要なのは `MSR_LSTAR` に `entry_SYSCALL_64` のアドレスが書き込まれることである。
+ユーザ空間で `SYSCALL` 命令が実行されると、CPU は直接この関数にジャンプする。
+
+### レジスタの規約
+
+x86_64 Linux のシステムコール ABI では、引数は以下のレジスタで渡される:
+
+| レジスタ | 用途 |
+|---|---|
+| `rax` | **システムコール番号** (入力) / **戻り値** (出力) |
+| `rdi` | 第 1 引数 |
+| `rsi` | 第 2 引数 |
+| `rdx` | 第 3 引数 |
+| `r10` | 第 4 引数 |
+| `r8` | 第 5 引数 |
+| `r9` | 第 6 引数 |
+
+**重要: 第 4 引数は `rcx` ではなく `r10` である。**
+
+これは、`SYSCALL` 命令が戻りアドレスの保存に `rcx` を使用するためである。
+通常の C 関数呼び出し規約 (System V AMD64 ABI) では第 4 引数に `rcx` を使うが、
+システムコール ABI では `r10` に変更されている。libc のラッパー関数がこの変換を行う:
+
+```c
+/* glibc の syscall ラッパー (簡略化) */
+/* 通常の関数呼び出しで rcx に入っている第4引数を r10 にコピーする */
+long syscall(long nr, long a1, long a2, long a3, long a4, long a5, long a6)
+{
+    long ret;
+    asm volatile (
+        "movq %[a4], %%r10\n\t"   /* rcx の代わりに r10 を使う */
+        "syscall"
+        : "=a" (ret)
+        : "a" (nr), "D" (a1), "S" (a2), "d" (a3),
+          [a4] "r" (a4), "r" (r8), "r" (r9)  /* 簡略化 */
+        : "rcx", "r11", "memory"
+    );
+    return ret;
+}
+```
+
+`"rcx"` と `"r11"` が clobber リストに入っている点に注目してほしい。
+`SYSCALL` 命令がこれらのレジスタを上書きするからである。
+
+### 戻り値の規約
+
+システムコールの戻り値は `rax` レジスタで返される。
+成功時は 0 以上の値、失敗時は `-errno` (例: `-ENOENT` = -2) が返される。
+
+libc のラッパーはこの負の戻り値を検出し、グローバル変数 `errno` に変換してから `-1` を返す:
+
+```c
+/* libc の擬似コード */
+long ret = raw_syscall(NR_read, fd, buf, count);
+if (ret < 0 && ret >= -4095) {
+    errno = -ret;
+    return -1;
+}
+return ret;
+```
+
+## entry_SYSCALL_64: カーネルへの入口
+
+`SYSCALL` 命令により CPU は Ring 0 に遷移し、`entry_SYSCALL_64` にジャンプする。
+このエントリポイントは `arch/x86/entry/entry_64.S` にアセンブリで書かれている。
+
+### SWAPGS
+
+`entry_SYSCALL_64` で最初に実行されるのが `SWAPGS` 命令である。
+
+```
+  SYSCALL 命令実行直後の状態:
+  ┌─────────────────────────────────────────────┐
+  │ CPL = 0 (Ring 0)                            │
+  │ RIP = entry_SYSCALL_64                      │
+  │ RSP = ユーザ空間のスタックのまま (危険!)      │
+  │ GS base = ユーザ空間の値のまま               │
+  │ RCX = ユーザ空間の戻りアドレス               │
+  │ R11 = ユーザ空間の RFLAGS                    │
+  └─────────────────────────────────────────────┘
+```
+
+`SWAPGS` 命令は、`GS` セグメントレジスタのベースアドレスを
+`MSR_GS_BASE` と `MSR_KERNEL_GS_BASE` の間で交換する。
+
+```
+  SWAPGS 前:
+    GS base   = ユーザ空間の TLS (Thread Local Storage)
+    MSR_KERNEL_GS_BASE = カーネルの per-CPU データのベース
+
+  SWAPGS 後:
+    GS base   = カーネルの per-CPU データのベース  ← current マクロ等で必要
+    MSR_KERNEL_GS_BASE = ユーザ空間の TLS          ← SYSRET 時に戻す
+```
+
+これにより、カーネルコードは `%gs:offset` で per-CPU データにアクセスできるようになる。
+`current` マクロ (`get_current()`) も per-CPU 変数 `current_task` を `%gs` 経由で参照している。
+
+### カーネルスタックへの切り替え
+
+`SYSCALL` 命令は **スタックの切り替えを行わない**。
+これは `int 0x80` (TSS を参照してスタックを切り替える) との大きな違いである。
+そのため、エントリコードはユーザ空間のスタック上で動作する危険な状態にあり、
+直ちにカーネルスタックに切り替える必要がある。
+
+```asm
+/* arch/x86/entry/entry_64.S (簡略化) */
+SYM_CODE_START(entry_SYSCALL_64)
+    UNWIND_HINT_ENTRY
+
+    swapgs
+
+    /* ユーザ RSP を per-CPU 変数に一時退避し、カーネル RSP をロード */
+    movq    %rsp, PER_CPU_VAR(cpu_tss_rw + TSS_sp2)
+    SWITCH_TO_KERNEL_CR3 scratch_reg=%rsp     /* KPTI: ページテーブル切り替え */
+    movq    PER_CPU_VAR(pcpu_hot + X86_top_of_stack), %rsp
+
+    /* pt_regs 構造体をスタック上に構築 */
+    pushq   $__USER_DS           /* ss */
+    pushq   PER_CPU_VAR(cpu_tss_rw + TSS_sp2)  /* rsp (退避したユーザRSP) */
+    pushq   %r11                 /* rflags */
+    pushq   $__USER_CS           /* cs */
+    pushq   %rcx                 /* rip (戻りアドレス) */
+    pushq   %rax                 /* orig_rax (システムコール番号) */
+
+    /* 汎用レジスタを PUSH して pt_regs を完成させる */
+    PUSH_AND_CLEAR_REGS rax=%rax
+    /* ... */
+SYM_CODE_END(entry_SYSCALL_64)
+```
+
+### pt_regs: ユーザ空間レジスタの保存
+
+スタック上に構築される `pt_regs` 構造体は、ユーザ空間の全レジスタ状態を保持する:
+
+```c
+/* arch/x86/include/asm/ptrace.h */
+struct pt_regs {
+    /* 汎用レジスタ (PUSH_AND_CLEAR_REGS で保存) */
+    unsigned long r15, r14, r13, r12;
+    unsigned long bp, bx;
+    unsigned long r11, r10, r9, r8;
+    unsigned long ax, cx, dx, si, di;
+
+    /* システムコール番号 */
+    unsigned long orig_ax;
+
+    /* SYSCALL 命令が暗黙的に設定 */
+    unsigned long ip;       /* ユーザ空間の戻りアドレス (rcx から) */
+    unsigned long cs;
+    unsigned long flags;    /* ユーザ空間の RFLAGS (r11 から) */
+    unsigned long sp;       /* ユーザ空間の RSP */
+    unsigned long ss;
+};
+```
+
+`pt_regs` は oops のスタックトレースに表示されるレジスタ値そのものであり、
+`strace` がシステムコールの引数を取得する際にも参照される。
+
+## KPTI: Kernel Page Table Isolation
+
+### Meltdown 脆弱性と対策
+
+2018年に公表された Meltdown 脆弱性 (CVE-2017-5754) は、
+投機的実行を利用してユーザ空間からカーネルメモリを読み取れるという深刻な問題であった。
+
+KPTI (Kernel Page Table Isolation、別名 KAISER) は、
+ユーザ空間とカーネル空間で **別々のページテーブル** を使用することで Meltdown を緩和する。
+
+```
+  KPTI 無効時 (従来):
+  ┌─────────────────────────────────────┐
+  │ 単一のページテーブル (PGD)            │
+  │   ユーザ空間 (0x0000...)     → R/W  │
+  │   カーネル空間 (0xffff...)   → R/W  │  ← 投機的実行で読める!
+  └─────────────────────────────────────┘
+
+  KPTI 有効時:
+  ┌──────────────────────────┐  ┌──────────────────────────┐
+  │ ユーザ用 PGD              │  │ カーネル用 PGD            │
+  │   ユーザ空間  → R/W      │  │   ユーザ空間  → R/W      │
+  │   カーネル空間 → 最小限   │  │   カーネル空間 → R/W     │
+  │   (entry/exit コードのみ) │  │   (全カーネルメモリ)      │
+  └──────────────────────────┘  └──────────────────────────┘
+       ↑ ユーザモード時に使用         ↑ カーネルモード時に使用
+       CR3 の bit 12 で切り替え
+```
+
+### CR3 切り替えの仕組み
+
+KPTI では、`CR3` レジスタ (ページテーブルの物理アドレス) の特定ビットを
+フリップするだけでページテーブルを切り替える:
+
+```c
+/* arch/x86/include/asm/pti.h */
+#define PTI_USER_PGTABLE_BIT    PAGE_SHIFT       /* bit 12 */
+#define PTI_USER_PGTABLE_MASK   (1 << PTI_USER_PGTABLE_BIT)
+
+/*
+ * カーネル PGD とユーザ PGD は物理メモリ上で連続して配置される。
+ * カーネル PGD のアドレスの bit 12 をセットするとユーザ PGD になる。
+ *
+ * カーネル PGD: 0x1000_0000 (例)
+ * ユーザ  PGD: 0x1000_1000 (bit 12 をセット)
+ */
+```
+
+エントリコードでは以下のマクロで切り替えを行う:
+
+```asm
+/* カーネル進入時: ユーザ用 PGD → カーネル用 PGD */
+.macro SWITCH_TO_KERNEL_CR3 scratch_reg:req
+    mov     %cr3, \scratch_reg
+    andq    $(~PTI_USER_PGTABLE_MASK), \scratch_reg  /* bit 12 をクリア */
+    mov     \scratch_reg, %cr3
+.endm
+
+/* カーネル退出時: カーネル用 PGD → ユーザ用 PGD */
+.macro SWITCH_TO_USER_CR3_NOSTACK scratch_reg:req
+    mov     %cr3, \scratch_reg
+    orq     $(PTI_USER_PGTABLE_MASK), \scratch_reg   /* bit 12 をセット */
+    mov     \scratch_reg, %cr3
+.endm
+```
+
+### KPTI のパフォーマンス影響
+
+CR3 の切り替えは TLB (Translation Lookaside Buffer) のフラッシュを伴うため、
+パフォーマンスに大きな影響がある。
+PCID (Process Context Identifier) を使用することで TLB 全体のフラッシュを避け、
+影響を軽減している。
+
+```
+  KPTI エントリ/イグジットのコスト:
+  ┌──────────────────────────────────────────────┐
+  │ 操作                   │ 追加コスト (概算)    │
+  ├──────────────────────────────────────────────┤
+  │ CR3 書き込み           │ ~100 ns             │
+  │ TLB ミス (PCID あり)   │ 軽減される           │
+  │ TLB ミス (PCID なし)   │ 全フラッシュ         │
+  │ 全体的なオーバーヘッド  │ ワークロードにより   │
+  │                        │ 1-30% の性能低下     │
+  └──────────────────────────────────────────────┘
+```
+
+PCID 対応の CPU では、TLB エントリに PCID タグが付与されるため、
+CR3 切り替え時に `INVPCID` 命令を使って選択的にフラッシュできる。
+
+## do_syscall_64: システムコールのディスパッチ
+
+`entry_SYSCALL_64` でレジスタの保存と環境設定が完了すると、
+C 関数 `do_syscall_64()` が呼ばれる。
+
+```c
+/* arch/x86/entry/common.c (Linux 6.x, 簡略化) */
+__visible noinstr void do_syscall_64(struct pt_regs *regs, int nr)
+{
+    add_random_kstack_offset();
+    nr = syscall_enter_from_user_mode(regs, nr);
+
+    instrumentation_begin();
+
+    if (!do_syscall_x64(regs, nr) && !do_syscall_x32(regs, nr)) {
+        nr = array_index_nospec(nr, IA32_NR_syscalls);
+        regs->ax = ia32_sys_call_table[nr](regs);
+    }
+
+    instrumentation_end();
+    syscall_exit_to_user_mode(regs);
+}
+
+static __always_inline bool do_syscall_x64(struct pt_regs *regs, int nr)
+{
+    if (likely(nr < NR_syscalls)) {
+        nr = array_index_nospec(nr, NR_syscalls);
+        regs->ax = x64_sys_call(regs, nr);
+        return true;
+    }
+    return false;
+}
+```
+
+ここでいくつかの重要な防御機構が働いている:
+
+1. **`add_random_kstack_offset()`** — スタックのオフセットをランダム化し、
+   カーネルスタック上のデータ配置を予測不能にする (スタックバッファオーバーフロー対策)。
+
+2. **`syscall_enter_from_user_mode()`** — seccomp フィルタ、ptrace、audit などの
+   フックが実行される。seccomp-BPF はここでチェックされる。
+
+3. **`array_index_nospec()`** — Spectre v1 (bounds check bypass) 対策。
+   投機的実行による配列境界外アクセスを防止する。
+
+## システムコールテーブル
+
+### テーブルの定義
+
+x86_64 のシステムコール番号からハンドラ関数への対応付けは、
+`arch/x86/entry/syscalls/syscall_64.tbl` に定義されている:
+
+```
+# arch/x86/entry/syscalls/syscall_64.tbl (抜粋)
+#
+# <number> <abi>  <name>          <entry point>
+#
+0          common read             sys_read
+1          common write            sys_write
+2          common open             sys_open
+3          common close            sys_close
+4          common stat             sys_newstat
+5          common fstat            sys_newfstat
+...
+56         common clone            sys_clone
+57         common fork             sys_fork
+59         common execve           sys_execve
+...
+62         common kill             sys_kill
+...
+257        common openat           sys_openat
+...
+435        common clone3           sys_clone3
+```
+
+このテーブルファイルからビルド時にヘッダファイルが自動生成される。
+
+### ハンドラ関数の定義: SYSCALL_DEFINE マクロ
+
+システムコールのハンドラ関数は `SYSCALL_DEFINEn` マクロで定義される。
+このマクロは型安全性と pt_regs からの引数取り出しを自動化する:
+
+```c
+/* include/linux/syscalls.h (簡略化) */
+#define SYSCALL_DEFINE3(name, ...) \
+    SYSCALL_METADATA(name, 3, __VA_ARGS__)      \
+    __SYSCALL_DEFINEx(3, _##name, __VA_ARGS__)
+
+/* 展開例: sys_read の定義 */
+/* fs/read_write.c */
+SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+{
+    return ksys_read(fd, buf, count);
+}
+
+/*
+ * 上記の SYSCALL_DEFINE3(read, ...) は概念的に以下のように展開される:
+ *
+ * long __x64_sys_read(const struct pt_regs *regs)
+ * {
+ *     return __se_sys_read(
+ *         (unsigned int)regs->di,          // fd
+ *         (char __user *)regs->si,         // buf
+ *         (size_t)regs->dx                 // count
+ *     );
+ * }
+ *
+ * static long __se_sys_read(unsigned int fd, char __user *buf, size_t count)
+ * {
+ *     return __do_sys_read(fd, buf, count);
+ * }
+ *
+ * static long __do_sys_read(unsigned int fd, char __user *buf, size_t count)
+ * {
+ *     return ksys_read(fd, buf, count);
+ * }
+ */
+```
+
+`__x64_sys_read` は `pt_regs` 構造体からレジスタ値を取り出して型変換する
+ラッパーであり、実際のロジックは `__do_sys_read` (ないし `ksys_read`) に委譲される。
+
+### 主要システムコールとその番号
+
+以下は x86_64 で頻出するシステムコール番号の一覧である:
+
+| 番号 | 名前 | ハンドラ | 用途 |
+|---|---|---|---|
+| 0 | read | `__x64_sys_read` | ファイルからの読み取り |
+| 1 | write | `__x64_sys_write` | ファイルへの書き込み |
+| 2 | open | `__x64_sys_open` | ファイルを開く |
+| 3 | close | `__x64_sys_close` | ファイルを閉じる |
+| 8 | lseek | `__x64_sys_lseek` | ファイル位置の変更 |
+| 9 | mmap | `__x64_sys_mmap` | メモリマッピング |
+| 16 | ioctl | `__x64_sys_ioctl` | デバイス制御 |
+| 56 | clone | `__x64_sys_clone` | プロセス/スレッド作成 |
+| 57 | fork | `__x64_sys_fork` | プロセス複製 |
+| 59 | execve | `__x64_sys_execve` | プログラム実行 |
+| 60 | exit | `__x64_sys_exit` | プロセス終了 |
+| 62 | kill | `__x64_sys_kill` | シグナル送信 |
+| 217 | getdents64 | `__x64_sys_getdents64` | ディレクトリエントリ取得 |
+| 257 | openat | `__x64_sys_openat` | ディレクトリ相対でファイルを開く |
+
+## file_operations とシステムコールの関係
+
+カーネルモジュール開発者にとって最も重要なのは、ユーザ空間のシステムコールが
+どのように自分のドライバの `file_operations` コールバックに到達するかを理解することである。
+
+### VFS レイヤの介在
+
+ユーザ空間のシステムコールとドライバのコールバックの間には、
+VFS (Virtual File System) レイヤが介在している。
+VFS は権限チェック、ロック管理、ファイル位置の更新などの共通処理を行ったあと、
+ファイルシステムやデバイスドライバの `file_operations` コールバックを呼び出す。
+
+```
+  ユーザ空間        VFS レイヤ               ドライバ
+
+  read(fd, ...)
+       │
+       ▼
+  __x64_sys_read
+       │
+       ▼
+  ksys_read(fd, buf, count)
+       │
+       ├─ fdget(fd)               ← fd からfile構造体を取得
+       │
+       ▼
+  vfs_read(file, buf, count, pos)
+       │
+       ├─ rw_verify_area()        ← セキュリティチェック (LSM)
+       ├─ f_op->read_iter ?       ← file_operations を確認
+       │       │
+       │       ▼
+       │  call_read_iter(file, kiocb, iter)
+       │       │
+       │       ▼
+       │  file->f_op->read_iter(kiocb, iter)  ← ★ドライバのコールバック★
+       │
+       └─ __pos_update()          ← ファイル位置の更新
+```
+
+### システムコールと file_operations の対応表
+
+以下は主要なシステムコールと、それに対応する `file_operations` コールバックの対応表である:
+
+| システムコール | VFS 関数 | file_operations コールバック | 備考 |
+|---|---|---|---|
+| `open()` / `openat()` | `vfs_open()` | `f_op->open` | ファイルを開く |
+| `close()` | — | `f_op->release` | 最後の参照が閉じられた時 |
+| `read()` | `vfs_read()` | `f_op->read` or `f_op->read_iter` | `read_iter` が優先 |
+| `write()` | `vfs_write()` | `f_op->write` or `f_op->write_iter` | `write_iter` が優先 |
+| `lseek()` | `vfs_llseek()` | `f_op->llseek` | ファイル位置変更 |
+| `ioctl()` | `vfs_ioctl()` | `f_op->unlocked_ioctl` | デバイス制御 |
+| `mmap()` | — | `f_op->mmap` | メモリマッピング |
+| `poll()` / `select()` / `epoll()` | `vfs_poll()` | `f_op->poll` | I/O 多重化 |
+| `fsync()` | `vfs_fsync()` | `f_op->fsync` | 同期書き出し |
+| `splice()` | — | `f_op->splice_read` / `splice_write` | ゼロコピー転送 |
+
+### read() の詳細な経路
+
+`read()` システムコールの経路をカーネルソースに即して追跡する:
+
+```c
+/* fs/read_write.c */
+SYSCALL_DEFINE3(read, unsigned int, fd, char __user *, buf, size_t, count)
+{
+    return ksys_read(fd, buf, count);
+}
+
+ssize_t ksys_read(unsigned int fd, char __user *buf, size_t count)
+{
+    struct fd f = fdget_pos(fd);       /* fd → struct file */
+    ssize_t ret = -EBADF;
+
+    if (f.file) {
+        loff_t pos, *ppos = file_ppos(f.file);
+        if (ppos) {
+            pos = *ppos;
+            ppos = &pos;
+        }
+        ret = vfs_read(f.file, buf, count, ppos);
+        if (ret >= 0 && ppos)
+            f.file->f_pos = pos;
+        fdput_pos(f);
+    }
+    return ret;
+}
+
+ssize_t vfs_read(struct file *file, char __user *buf,
+                 size_t count, loff_t *pos)
+{
+    ssize_t ret;
+
+    /* セキュリティチェック (SELinux, AppArmor 等の LSM) */
+    ret = rw_verify_area(READ, file, pos, count);
+    if (ret)
+        return ret;
+
+    if (file->f_op->read)
+        ret = file->f_op->read(file, buf, count, pos);
+    else if (file->f_op->read_iter)
+        ret = new_sync_read(file, buf, count, pos);
+    else
+        ret = -EINVAL;
+
+    return ret;
+}
+```
+
+### open() の経路: dentry → inode → file_operations
+
+`open()` の経路はより複雑である。パス名を解決して `inode` を取得し、
+その `inode` に関連付けられた `file_operations` を `struct file` に設定する:
+
+```
+  openat(dirfd, "path", flags)
+       │
+       ▼
+  do_sys_openat2(dirfd, filename, open_how)
+       │
+       ▼
+  do_filp_open(dfd, pathname, op)
+       │
+       ├─ path_openat()            ← パス名解決 (VFS lookup)
+       │    ├─ link_path_walk()    ← "/" 区切りで各コンポーネントを解決
+       │    ├─ lookup_last()       ← 最終コンポーネントの dentry 取得
+       │    └─ do_open()           ← dentry から inode を取得
+       │         │
+       │         ▼
+       │    vfs_open(path, file)
+       │         │
+       │         ▼
+       │    do_dentry_open(file, inode, open)
+       │         │
+       │         ├─ file->f_op = fops_get(inode->i_fop);
+       │         │   ↑ inode の file_operations をコピー
+       │         │
+       │         └─ file->f_op->open(inode, file)
+       │              ↑ ★ ドライバの open コールバック
+       │
+       ▼
+  fd_install(fd, file)             ← ファイルテーブルに登録
+```
+
+文字デバイスの場合、`inode->i_fop` は最初 `def_chr_fops` (文字デバイスの汎用 fops) を指し、
+`chrdev_open()` の中でデバイスのメジャー/マイナー番号に基づいて
+ドライバ固有の `file_operations` に差し替えられる:
+
+```c
+/* fs/char_dev.c (概念的な流れ) */
+static int chrdev_open(struct inode *inode, struct file *filp)
+{
+    /* メジャー/マイナー番号から cdev を検索 */
+    struct cdev *p = inode->i_cdev;
+    if (!p) {
+        struct kobject *kobj = kobj_lookup(cdev_map, inode->i_rdev, ...);
+        p = container_of(kobj, struct cdev, kobj);
+        inode->i_cdev = p;
+    }
+
+    /* ★ file_operations をドライバ固有のものに差し替え */
+    filp->f_op = fops_get(p->ops);
+
+    /* ドライバの open を呼ぶ */
+    if (filp->f_op->open)
+        ret = filp->f_op->open(inode, filp);
+
+    return ret;
+}
+```
+
+## vDSO: カーネル遷移なしのシステムコール
+
+### vDSO とは
+
+vDSO (Virtual Dynamic Shared Object) は、カーネルがユーザ空間のプロセスに
+自動的にマッピングする共有ライブラリである。
+頻繁に呼ばれるが、カーネルモード遷移のコストに見合わないシステムコールを
+ユーザ空間で直接実行することで、パフォーマンスを大幅に改善する。
+
+```bash
+# プロセスのメモリマップで vDSO を確認
+$ cat /proc/self/maps | grep vdso
+7fff1234a000-7fff1234c000 r-xp 00000000 00:00 0  [vdso]
+
+# vDSO が提供する関数を確認
+$ objdump -T /usr/lib/x86_64-linux-gnu/vdso/vdso64.so 2>/dev/null || \
+  dd if=/proc/self/mem bs=1 skip=$((0x7fff1234a000)) count=8192 2>/dev/null | \
+  objdump -T /dev/stdin
+
+# 別の方法: auxval で VDSO のアドレスを取得
+$ LD_SHOW_AUXV=1 /bin/true | grep VDSO
+AT_SYSINFO_EHDR: 0x7fff1234a000
+```
+
+### vDSO が提供する関数
+
+vDSO は以下の関数を提供する:
+
+| vDSO 関数 | 対応するシステムコール | 説明 |
+|---|---|---|
+| `__vdso_clock_gettime` | `clock_gettime()` | 高精度時刻取得 |
+| `__vdso_gettimeofday` | `gettimeofday()` | 時刻取得 |
+| `__vdso_time` | `time()` | 秒単位の時刻取得 |
+| `__vdso_getcpu` | `getcpu()` | 現在の CPU/NUMA ノード取得 |
+| `__vdso_clock_getres` | `clock_getres()` | クロック分解能取得 |
+
+### vDSO の仕組み
+
+vDSO のカーネル側は、共有メモリページ (vvar) に時刻情報を定期的に書き込む。
+vDSO のユーザ空間コードは、このページを直接読み取って時刻を返す。
+システムコール呼び出しが発生しないため、オーバーヘッドは極めて小さい。
+
+```
+  ┌──────────────────────────────────────────────────────┐
+  │ カーネル空間                                          │
+  │                                                      │
+  │  タイマ割り込み                                       │
+  │       │                                              │
+  │       ▼                                              │
+  │  update_vsyscall()                                   │
+  │       │                                              │
+  │       ▼                                              │
+  │  vvar ページに書き込み:                               │
+  │    ├─ wall_time_sec                                  │
+  │    ├─ wall_time_nsec                                 │
+  │    ├─ monotonic_time_sec                             │
+  │    ├─ monotonic_time_nsec                            │
+  │    ├─ realtime_coarse_sec                            │
+  │    └─ seq (シーケンスカウンタ / seqlock)              │
+  │                                                      │
+  └────────┬─────────────────────────────────────────────┘
+           │ メモリマッピング (読み取り専用でユーザに公開)
+           ▼
+  ┌──────────────────────────────────────────────────────┐
+  │ ユーザ空間                                            │
+  │                                                      │
+  │  clock_gettime(CLOCK_MONOTONIC, &ts)                 │
+  │       │                                              │
+  │       ▼  (libc が vDSO 関数を呼ぶ)                   │
+  │  __vdso_clock_gettime:                               │
+  │       │                                              │
+  │       ├─ do {                                        │
+  │       │      seq = vvar->seq;           // seqlock   │
+  │       │      sec = vvar->monotonic_sec;              │
+  │       │      nsec = vvar->monotonic_nsec;            │
+  │       │      nsec += rdtsc() * mult;   // TSC 補正   │
+  │       │  } while (seq != vvar->seq);   // retry      │
+  │       │                                              │
+  │       └─ ts->tv_sec = sec;                           │
+  │          ts->tv_nsec = nsec;                         │
+  │          return 0;                 ← SYSCALL なし!   │
+  └──────────────────────────────────────────────────────┘
+```
+
+### vDSO のフォールバック
+
+TSC が信頼できない場合やクロックソースが変更された場合、
+vDSO は通常のシステムコールにフォールバックする:
+
+```c
+/* arch/x86/entry/vdso/vclock_gettime.c (概念) */
+notrace int __vdso_clock_gettime(clockid_t clock, struct timespec *ts)
+{
+    /* vvar ページからデータ取得を試みる */
+    if (vvar->vclock_mode == VDSO_CLOCKMODE_NONE) {
+        /* フォールバック: 通常のシステムコールを発行 */
+        return syscall(__NR_clock_gettime, clock, ts);
+    }
+    /* ... vDSO での高速パス ... */
+}
+```
+
+### パフォーマンス比較
+
+vDSO と通常のシステムコールのパフォーマンス差は劇的である:
+
+```
+  clock_gettime() のレイテンシ比較:
+  ┌────────────────────────────────────┐
+  │ 方式              │ レイテンシ     │
+  ├────────────────────────────────────┤
+  │ vDSO (TSC)        │ ~20 ns        │
+  │ 通常の syscall    │ ~200-300 ns   │
+  │ KPTI 有効 syscall │ ~400-800 ns   │
+  └────────────────────────────────────┘
+  ※ ハードウェアとカーネル設定により異なる
+```
+
+`clock_gettime()` はログ出力やプロファイリングで頻繁に呼ばれるため、
+vDSO による最適化の効果は極めて大きい。
+
+## vsyscall: レガシーな高速パス
+
+### vsyscall とは
+
+vsyscall (Virtual System Call) は vDSO の前身である。
+固定アドレス `0xFFFFFFFFFF600000` にマッピングされた領域に、
+`gettimeofday`、`time`、`getcpu` の 3 つの関数が配置されていた。
+
+```
+  vsyscall ページのメモリレイアウト:
+  ┌──────────────────────────────────────────────────┐
+  │ 0xFFFFFFFFFF600000  __vsyscall_page_gettimeofday │
+  │ 0xFFFFFFFFFF600400  __vsyscall_page_time         │
+  │ 0xFFFFFFFFFF600800  __vsyscall_page_getcpu        │
+  └──────────────────────────────────────────────────┘
+  ※ 各エントリは 0x400 (1024) バイト間隔で配置
+```
+
+### vsyscall の問題点
+
+vsyscall には深刻なセキュリティ上の問題がある:
+
+1. **固定アドレス** — ASLR が効かないため、ROP (Return-Oriented Programming)
+   攻撃のガジェットとして悪用される。
+2. **全プロセスで同一アドレス** — 攻撃者がアドレスを予測可能。
+
+### 現在の vsyscall エミュレーション
+
+現代のカーネルでは vsyscall はデフォルトで **エミュレーション** モードで動作する。
+vsyscall ページへのアクセスは実行不可能 (NX) に設定されており、
+アクセスすると `#PF` (ページフォルト) が発生する。
+ページフォルトハンドラが vsyscall アドレスを検出し、対応するシステムコールを実行する:
+
+```c
+/* arch/x86/entry/vsyscall/vsyscall_64.c (概念的な流れ) */
+bool emulate_vsyscall(unsigned long error_code, struct pt_regs *regs,
+                      unsigned long address)
+{
+    int vsyscall_nr;
+
+    /* アドレスから vsyscall 番号を特定 */
+    vsyscall_nr = (address - VSYSCALL_ADDR) / 0x400;
+
+    switch (vsyscall_nr) {
+    case 0: /* gettimeofday */
+        ret = __x64_sys_gettimeofday(regs);
+        break;
+    case 1: /* time */
+        ret = __x64_sys_time(regs);
+        break;
+    case 2: /* getcpu */
+        ret = __x64_sys_getcpu(regs);
+        break;
+    }
+
+    regs->ax = ret;
+    regs->ip += 2;  /* "syscall" 命令の長さ分進める */
+    return true;
+}
+```
+
+カーネルの起動パラメータで vsyscall の動作を制御できる:
+
+```bash
+# エミュレーションモード (デフォルト)
+vsyscall=emulate
+
+# vsyscall を完全に無効化 (最もセキュア)
+vsyscall=none
+
+# ネイティブ実行 (非推奨、セキュリティリスク)
+vsyscall=native
+```
+
+## seccomp-BPF: システムコールフィルタリング
+
+### seccomp とは
+
+seccomp (Secure Computing Mode) は、プロセスが使用できるシステムコールを制限する
+カーネル機能である。元々は `read()`, `write()`, `exit()`, `sigreturn()` の 4 つしか
+許可しない厳格なモード (strict mode) のみであったが、
+Linux 3.5 で BPF プログラムによる柔軟なフィルタリング (seccomp-BPF) が導入された。
+
+コンテナランタイム (Docker, Podman)、ブラウザのサンドボックス (Chromium)、
+systemd のサービス隔離など、現代の Linux セキュリティの中核をなす機能である。
+
+### seccomp-BPF の仕組み
+
+seccomp-BPF フィルタは `syscall_enter_from_user_mode()` の中で、
+システムコールハンドラが呼ばれる **前** に実行される:
+
+```
+  do_syscall_64
+       │
+       ▼
+  syscall_enter_from_user_mode(regs, nr)
+       │
+       ├─ __secure_computing(sd)    ← seccomp フィルタ実行
+       │       │
+       │       ▼
+       │   seccomp_run_filters()
+       │       │
+       │       ├─ SECCOMP_RET_ALLOW  → syscall 実行を許可
+       │       ├─ SECCOMP_RET_KILL   → SIGSYS で即座に kill
+       │       ├─ SECCOMP_RET_ERRNO  → 指定した errno を返す
+       │       ├─ SECCOMP_RET_TRAP   → SIGSYS を送信 (ハンドル可能)
+       │       ├─ SECCOMP_RET_TRACE  → ptrace に通知
+       │       ├─ SECCOMP_RET_LOG    → ログ記録して許可
+       │       └─ SECCOMP_RET_USER_NOTIF → ユーザ空間に通知
+       │
+       ▼
+  sys_call_table[nr](regs)   ← ALLOW の場合のみ到達
+```
+
+### seccomp-BPF フィルタの設定
+
+```c
+#include <linux/seccomp.h>
+#include <linux/filter.h>
+#include <linux/audit.h>
+#include <sys/prctl.h>
+#include <stddef.h>
+
+/*
+ * seccomp BPF フィルタの例:
+ * write() と exit_group() のみを許可し、それ以外は KILL する。
+ */
+static void install_seccomp_filter(void)
+{
+    struct sock_filter filter[] = {
+        /* アーキテクチャを検証 (x86_64 であることを確認) */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, arch)),
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, AUDIT_ARCH_X86_64,
+                 1, 0),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
+
+        /* システムコール番号を取得 */
+        BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+                 offsetof(struct seccomp_data, nr)),
+
+        /* write (nr=1) を許可 */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_write, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+        /* exit_group (nr=231) を許可 */
+        BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_exit_group, 0, 1),
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+        /* それ以外は全て KILL */
+        BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_KILL),
+    };
+
+    struct sock_fprog prog = {
+        .len = sizeof(filter) / sizeof(filter[0]),
+        .filter = filter,
+    };
+
+    /* PR_SET_NO_NEW_PRIVS を設定 (seccomp の前提条件) */
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+
+    /* フィルタをインストール */
+    prctl(PR_SET_SECCOMP, SECCOMP_MODE_FILTER, &prog);
+}
+```
+
+### seccomp_data 構造体
+
+BPF フィルタがアクセスできるデータは `seccomp_data` 構造体で定義されている:
+
+```c
+/* include/uapi/linux/seccomp.h */
+struct seccomp_data {
+    int   nr;                  /* システムコール番号 */
+    __u32 arch;                /* AUDIT_ARCH_* 値 */
+    __u64 instruction_pointer; /* SYSCALL 命令のアドレス */
+    __u64 args[6];             /* システムコールの引数 (rdi, rsi, ...) */
+};
+```
+
+引数の値に基づいたフィルタリングも可能である。
+例えば「`write()` は stdout/stderr にのみ許可する」といったルールを記述できる:
+
+```c
+/* write() の第1引数 (fd) が 1 (stdout) または 2 (stderr) の場合のみ許可 */
+struct sock_filter filter[] = {
+    /* アーキテクチャ検証 (省略) ... */
+
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+             offsetof(struct seccomp_data, nr)),
+
+    /* write でなければ次のチェックへ */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, __NR_write, 0, 5),
+
+    /* write の第1引数 (fd) を取得 */
+    BPF_STMT(BPF_LD | BPF_W | BPF_ABS,
+             offsetof(struct seccomp_data, args[0])),
+
+    /* fd == 1 (stdout) なら ALLOW */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 1, 1, 0),
+
+    /* fd == 2 (stderr) なら ALLOW */
+    BPF_JUMP(BPF_JMP | BPF_JEQ | BPF_K, 2, 0, 1),
+
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ALLOW),
+
+    /* fd が 1 でも 2 でもない write は ERRNO(EACCES) */
+    BPF_STMT(BPF_RET | BPF_K, SECCOMP_RET_ERRNO | (EACCES & SECCOMP_RET_DATA)),
+
+    /* ... 他のシステムコールの処理 ... */
+};
+```
+
+### seccomp-BPF の戻り値
+
+| 戻り値 | 動作 |
+|---|---|
+| `SECCOMP_RET_KILL_PROCESS` | プロセス全体を SIGSYS で終了 |
+| `SECCOMP_RET_KILL_THREAD` | 呼び出しスレッドのみ終了 |
+| `SECCOMP_RET_TRAP` | SIGSYS を送信 (シグナルハンドラで処理可能) |
+| `SECCOMP_RET_ERRNO` | 指定した errno を返す (システムコールは実行されない) |
+| `SECCOMP_RET_USER_NOTIF` | ユーザ空間の監視プロセスに通知 |
+| `SECCOMP_RET_TRACE` | ptrace に通知 |
+| `SECCOMP_RET_LOG` | ログに記録して許可 |
+| `SECCOMP_RET_ALLOW` | システムコールの実行を許可 |
+
+優先順位は上から高い順である。複数のフィルタがインストールされている場合、
+最も制限的な結果が採用される。
+
+### Docker の seccomp プロファイル
+
+Docker はデフォルトで seccomp プロファイルを適用し、
+危険なシステムコール (例: `mount`, `reboot`, `kexec_load`, `ptrace`) をブロックする:
+
+```bash
+# Docker コンテナ内で seccomp のステータスを確認
+$ grep Seccomp /proc/self/status
+Seccomp:        2                    # 2 = SECCOMP_MODE_FILTER
+Seccomp_filters: 1
+
+# 制限されたシステムコールを呼ぶと EPERM が返る
+$ unshare --mount /bin/sh
+unshare: unshare failed: Operation not permitted
+```
+
+## システムコールのトレース
+
+### strace: ユーザ空間からのトレース
+
+`strace` は ptrace を使ってプロセスのシステムコールをトレースする最も手軽なツールである:
+
+```bash
+# 基本的な使い方
+$ strace ls /tmp
+
+# 特定のシステムコールのみトレース
+$ strace -e trace=read,write,openat cat /etc/hostname
+
+# 出力例:
+openat(AT_FDCWD, "/etc/hostname", O_RDONLY) = 3
+read(3, "myhost\n", 131072)            = 7
+write(1, "myhost\n", 7)                = 7
+read(3, "", 131072)                    = 0
+close(3)                               = 0
+
+# 各システムコールの所要時間を表示
+$ strace -T -e trace=read cat /dev/null
+read(3, "", 131072)                    = 0 <0.000008>
+
+# システムコールの統計
+$ strace -c ls /tmp
+% time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 25.00    0.000050          10         5           mmap
+ 20.00    0.000040           8         5           openat
+ 15.00    0.000030           6         5           close
+ 10.00    0.000020           4         5           fstat
+ 10.00    0.000020           4         5           read
+ ...
+```
+
+strace はデバッグの第一歩として非常に有用だが、ptrace ベースであるため
+パフォーマンスオーバーヘッドが大きい (対象プロセスの実行速度が 10-100 倍遅くなる)。
+
+### ftrace: カーネル内部からのトレース
+
+ftrace はカーネル内蔵のトレーシングフレームワークであり、
+debugfs (`/sys/kernel/debug/tracing/`) または tracefs (`/sys/kernel/tracing/`)
+経由で制御する:
+
+```bash
+# tracefs の場所 (カーネルにより異なる)
+TRACEFS=/sys/kernel/tracing
+
+# 利用可能なトレーサーを確認
+$ cat $TRACEFS/available_tracers
+hwlat blk function_graph function nop
+
+# システムコールイベントをトレース
+$ echo 1 > $TRACEFS/events/syscalls/sys_enter_read/enable
+$ echo 1 > $TRACEFS/events/syscalls/sys_exit_read/enable
+$ echo 1 > $TRACEFS/tracing_on
+
+# トレース結果を表示
+$ cat $TRACEFS/trace
+# tracer: nop
+#
+#                    TASK-PID     CPU#  ||||   TIMESTAMP  FUNCTION
+#                       | |         |  ||||      |         |
+              cat-12345  [001] .... 12345.678: sys_read(fd: 3, buf: 0x...)
+              cat-12345  [001] .... 12345.679: sys_read -> 0x1000
+
+# 全てのシステムコールをトレース
+$ echo 1 > $TRACEFS/events/syscalls/enable
+
+# トレースを停止してクリーンアップ
+$ echo 0 > $TRACEFS/tracing_on
+$ echo 0 > $TRACEFS/events/syscalls/enable
+```
+
+`function_graph` トレーサーを使うと、システムコールからドライバまでの
+関数呼び出し階層を視覚的に確認できる:
+
+```bash
+$ echo function_graph > $TRACEFS/current_tracer
+$ echo do_syscall_64 > $TRACEFS/set_graph_function
+$ echo 1 > $TRACEFS/tracing_on
+$ cat /dev/mydevice  # トレース対象の操作を実行
+$ echo 0 > $TRACEFS/tracing_on
+$ cat $TRACEFS/trace
+
+#   CPU  DURATION                  FUNCTION CALLS
+#    |     |   |                   |   |   |   |
+  1)               |  do_syscall_64() {
+  1)               |    __x64_sys_read() {
+  1)               |      ksys_read() {
+  1)               |        vfs_read() {
+  1)               |          new_sync_read() {
+  1)               |            mydevice_read_iter() {   ← ★あなたのドライバ★
+  1)   0.234 us    |              copy_to_user();
+  1)   1.567 us    |            }
+  1)   2.345 us    |          }
+  1)   3.456 us    |        }
+  1)   4.567 us    |      }
+  1)   5.678 us    |    }
+  1)   6.789 us    |  }
+```
+
+### eBPF によるシステムコールトレース
+
+eBPF は最も柔軟で高性能なトレーシング手法である。
+`bpftrace` を使えばワンライナーでシステムコールの解析が可能:
+
+```bash
+# read() システムコールの頻度をプロセス別に集計
+$ bpftrace -e 'tracepoint:syscalls:sys_enter_read {
+    @[comm] = count();
+}'
+
+# write() のレイテンシをヒストグラムで表示
+$ bpftrace -e '
+tracepoint:syscalls:sys_enter_write {
+    @start[tid] = nsecs;
+}
+tracepoint:syscalls:sys_exit_write /@start[tid]/ {
+    @latency = hist(nsecs - @start[tid]);
+    delete(@start[tid]);
+}'
+
+# 特定のデバイスファイルへの read/write を監視
+$ bpftrace -e '
+tracepoint:syscalls:sys_enter_read /comm == "myapp"/ {
+    printf("read(fd=%d, count=%d)\n", args->fd, args->count);
+}
+tracepoint:syscalls:sys_exit_read /comm == "myapp"/ {
+    printf("  → returned %d\n", args->ret);
+}'
+```
+
+kprobe を使えば VFS レイヤの内部関数もトレースできる:
+
+```bash
+# vfs_read から file_operations のコールバックまでの経路を追跡
+$ bpftrace -e '
+kprobe:vfs_read {
+    printf("vfs_read: file=%p, count=%d\n", arg0, arg2);
+}
+kprobe:new_sync_read {
+    printf("  new_sync_read: file=%p\n", arg0);
+}'
+```
+
+### トレース手法の比較
+
+| 手法 | オーバーヘッド | 柔軟性 | 前提条件 | 主な用途 |
+|---|---|---|---|---|
+| strace | 高い (ptrace) | 低い | なし | 開発・デバッグ |
+| ftrace | 低い | 中程度 | debugfs/tracefs | カーネル開発・性能解析 |
+| eBPF/bpftrace | 極めて低い | 高い | BTF, bpftrace | 本番環境の解析 |
+| perf | 低い | 高い | perf_event | 性能プロファイリング |
+
+## モジュール開発者がこの知識を必要とする理由
+
+ここまで解説してきたシステムコールの内部構造は、
+カーネルモジュール開発者にとって抽象的な知識ではなく、日常的に必要な実践的知識である。
+
+### 1. oops のスタックトレースを読む
+
+モジュールがクラッシュしたとき、スタックトレースにはシステムコールの経路が表示される:
+
+```
+BUG: unable to handle page fault for address: 0000000000000000
+RIP: 0010:my_driver_read+0x42/0x100 [my_module]
+
+Call Trace:
+ <TASK>
+ new_sync_read+0x12e/0x1c0         ← VFS レイヤ
+ vfs_read+0x16d/0x340
+ ksys_read+0x6d/0xf0
+ do_syscall_64+0x82/0x170          ← syscall ディスパッチ
+ entry_SYSCALL_64_after_hwframe+0x76/0x7e
+ </TASK>
+```
+
+この経路を知っていれば、`my_driver_read` が `read()` システムコール経由で
+呼ばれたことが一目で分かり、`pt_regs` のレジスタ値からユーザ空間の引数も推測できる。
+
+### 2. パフォーマンスの理解
+
+モジュールのコールバックが呼ばれるまでに、以下のオーバーヘッドが存在する:
+
+```
+  オーバーヘッドの内訳:
+  ┌────────────────────────────────────────────┐
+  │ 段階                    │ コスト (概算)     │
+  ├────────────────────────────────────────────┤
+  │ SYSCALL 命令            │ ~10 ns           │
+  │ SWAPGS                  │ ~5 ns            │
+  │ CR3 切り替え (KPTI)     │ ~50-100 ns       │
+  │ pt_regs 保存            │ ~10 ns           │
+  │ seccomp チェック        │ ~10-50 ns        │
+  │ VFS パス (vfs_read等)   │ ~20-50 ns        │
+  │ ─────────────────────── │ ─────────────── │
+  │ 合計 (コールバック到達)  │ ~100-250 ns      │
+  └────────────────────────────────────────────┘
+```
+
+高頻度のシステムコール (例: 1秒に10万回の read) では、
+このオーバーヘッドが無視できなくなる。
+`io_uring` のようなバッチングインタフェースや `mmap` によるゼロコピーが
+選択される理由はここにある。
+
+### 3. セキュリティの理解
+
+seccomp-BPF がモジュールの前段で動作することを知っていれば、
+コンテナ環境でモジュールの ioctl が呼べない問題のデバッグが容易になる。
+また、LSM フック (`rw_verify_area` 内) がアクセスを拒否する場合の
+切り分けにも役立つ。
+
+### 4. 正しい戻り値の返し方
+
+システムコールの戻り値規約を知っていれば、
+`file_operations` のコールバックから適切な値を返せる:
+
+```c
+/* 正しい例 */
+static ssize_t my_read(struct file *file, char __user *buf,
+                       size_t count, loff_t *ppos)
+{
+    if (copy_to_user(buf, kbuf, len))
+        return -EFAULT;     /* ← カーネル内では負の errno を返す */
+    return len;             /* ← 成功時は読み取ったバイト数 */
+}
+
+/* 間違いの例 */
+static ssize_t my_read_wrong(struct file *file, char __user *buf,
+                             size_t count, loff_t *ppos)
+{
+    if (error)
+        return EINVAL;   /* ★ 負の符号を忘れている! ユーザには正の値に見える */
+    return 0;
+}
+```
+
+## よくある罠
+
+1. **第 4 引数レジスタを `rcx` と思い込む** — システムコール ABI では `r10` である。
+   `SYSCALL` 命令が `rcx` を戻りアドレスの保存に使うためである。
+   インラインアセンブリで直接システムコールを発行する際に間違えやすい。
+
+2. **`errno` の符号を間違える** — カーネル内では `-EINVAL` のように負の値を返す。
+   libc が正の `errno` に変換する。モジュールのコールバックから正の値を返すと、
+   ユーザ空間では正常な戻り値として扱われてしまう。
+
+3. **vDSO を考慮しない性能測定** — `clock_gettime()` のベンチマークで
+   「システムコールが異常に速い」と誤解するケース。vDSO が使われているだけである。
+
+4. **seccomp 環境での ioctl 失敗を見逃す** — コンテナ内でカスタム ioctl が
+   `EPERM` で失敗する場合、seccomp プロファイルの制限が原因であることが多い。
+   `dmesg` に `audit: seccomp` のログが出ていないか確認すること。
+
+5. **`release` と `close` を混同する** — `close()` システムコールは
+   `f_op->release` を呼ぶが、これは当該ファイルの **最後の参照** が閉じられた時のみである。
+   `dup()` や `fork()` でファイルディスクリプタが複製されている場合、
+   一方の `close()` では `release` は呼ばれない。
+
+6. **KPTI のオーバーヘッドを過小評価する** — Meltdown 対策の CR3 切り替えは
+   特に I/O 集約的なワークロードで顕著な性能低下を引き起こす。
+   `cat /sys/devices/system/cpu/vulnerabilities/meltdown` でステータスを確認できる。
+
+7. **strace で再現しない問題** — strace の ptrace ベースのトレースは
+   タイミングを大きく変えるため、レースコンディションが再現しなくなることがある。
+   そのような場合は ftrace や eBPF を使うべきである。
+
+## 章末演習
+
+### 演習 1: システムコールのレジスタ追跡
+
+以下の C プログラムを書き、`strace -i` (命令ポインタ表示) と組み合わせて
+システムコールの引数がどのレジスタで渡されているか確認せよ。
+
+```c
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/syscall.h>
+
+int main(void)
+{
+    char buf[64];
+
+    /* 直接 syscall() を使って read を呼ぶ */
+    long ret = syscall(SYS_read,   /* rax = 0 */
+                       0,          /* rdi = 0 (stdin) */
+                       buf,        /* rsi = buf */
+                       sizeof(buf) /* rdx = 64 */
+                       );
+    return 0;
+}
+```
+
+`strace -e trace=read -v ./a.out` の出力と、
+`strace -e raw=read ./a.out` の出力を比較し、
+引数がどのように解釈されているか確認せよ。
+
+### 演習 2: vDSO の確認
+
+以下のプログラムで vDSO と通常のシステムコールの速度差を測定せよ:
+
+```c
+#include <stdio.h>
+#include <time.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+
+#define ITERATIONS 1000000
+
+int main(void)
+{
+    struct timespec ts;
+    struct timespec start, end;
+
+    /* vDSO 経由 (libc の clock_gettime) */
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < ITERATIONS; i++)
+        clock_gettime(CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    long vdso_ns = (end.tv_sec - start.tv_sec) * 1000000000L
+                 + (end.tv_nsec - start.tv_nsec);
+    printf("vDSO:    %ld ns/call\n", vdso_ns / ITERATIONS);
+
+    /* 直接 syscall (vDSO をバイパス) */
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    for (int i = 0; i < ITERATIONS; i++)
+        syscall(SYS_clock_gettime, CLOCK_MONOTONIC, &ts);
+    clock_gettime(CLOCK_MONOTONIC, &end);
+
+    long sys_ns = (end.tv_sec - start.tv_sec) * 1000000000L
+                + (end.tv_nsec - start.tv_nsec);
+    printf("syscall: %ld ns/call\n", sys_ns / ITERATIONS);
+    printf("ratio:   %.1fx faster\n", (double)sys_ns / vdso_ns);
+
+    return 0;
+}
+```
+
+期待される出力例:
+
+```
+vDSO:    18 ns/call
+syscall: 210 ns/call
+ratio:   11.7x faster
+```
+
+### 演習 3: seccomp-BPF フィルタの実装
+
+`write()` と `exit_group()` のみを許可する seccomp-BPF フィルタを実装し、
+フィルタ適用後に `read()` を呼んで SIGSYS で kill されることを確認せよ。
+
+```bash
+$ ./seccomp_test
+Hello from sandboxed process!
+Bad system call (core dumped)       ← read() が KILL された
+```
+
+### 演習 4: ftrace でドライバのコールバック経路を追跡
+
+[Ch 8](/part4-device-drivers/11-chardev-c/) で作成した文字デバイスドライバに対して、
+`function_graph` トレーサーを使い、`cat /dev/echo` 実行時のカーネル内関数呼び出し階層を
+可視化せよ。`do_syscall_64` → `vfs_read` → 自分のドライバの read コールバックまでの
+経路が表示されることを確認すること。
+
+### 演習 5: eBPF でシステムコールの統計を取る
+
+`bpftrace` を使って、自分のデバイスドライバに対する `read()` / `write()` / `ioctl()` の
+呼び出し回数とレイテンシを計測するワンライナーを作成せよ。
+以下をヒントにすること:
+
+```bash
+bpftrace -e '
+kprobe:mydriver_read { @read_count = count(); @read_start[tid] = nsecs; }
+kretprobe:mydriver_read /@read_start[tid]/ {
+    @read_latency = hist(nsecs - @read_start[tid]);
+    delete(@read_start[tid]);
+}'
+```
+
+## 参考資料
+
+- [Syscall entry/exit handling (kernel.org)](https://docs.kernel.org/arch/x86/entry_64.html)
+- [Adding a New System Call (kernel.org)](https://docs.kernel.org/process/adding-syscalls.html)
+- [vDSO - overview (man7.org)](https://man7.org/linux/man-pages/man7/vdso.7.html)
+- [seccomp - Secure Computing (kernel.org)](https://docs.kernel.org/userspace-api/seccomp_filter.html)
+- [Kernel Page Table Isolation (kernel.org)](https://docs.kernel.org/arch/x86/pti.html)
+- [entry_64.S ソースコード (GitHub)](https://github.com/torvalds/linux/blob/master/arch/x86/entry/entry_64.S)
+- [syscall_64.tbl (GitHub)](https://github.com/torvalds/linux/blob/master/arch/x86/entry/syscalls/syscall_64.tbl)
+- [Meltdown and Spectre (meltdownattack.com)](https://meltdownattack.com/)
+- Robert Love, "Linux Kernel Development" Ch 5: System Calls
+- Michael Kerrisk, "The Linux Programming Interface" Ch 3: System Calls

@@ -1,0 +1,230 @@
+---
+title: "電力管理とファームウェアロード"
+description: suspend/resume, runtime PM, request_firmware — 実デバイスドライバの必須機能
+---
+
+## この章で学ぶこと
+
+- システムスリープ (suspend/resume) のコールバックを実装できる
+- Runtime PM でデバイスの自動省電力を実現できる
+- request_firmware でファームウェアを安全にロードできる
+
+:::note[Rust API ステータス]
+🟡 **開発中**: `kernel::firmware` (6.18+ — 基本的なファームウェアロード API)
+🟡 **開発中**: Runtime PM (`Devres<T>` の `try_access()` が PM 状態を考慮 — Nova で使用)
+❌ **未実装**: System PM (suspend/resume) コールバックの Rust 定義
+:::
+
+## システム電力管理 (System PM)
+
+### サスペンドの流れ
+
+ユーザ空間が `/sys/power/state` に `"mem"` を書き込むと、PM core が全デバイスの `.suspend()` を依存関係の逆順で呼び出す。全デバイスがサスペンドに成功すると CPU が停止し、復帰時には `.resume()` が依存関係の順で呼ばれる。
+
+```
+ユーザ空間
+  → /sys/power/state に "mem" 書き込み
+  → PM core が全デバイスの .suspend() を呼ぶ (依存関係の逆順)
+  → CPU 停止
+  → 復帰
+  → PM core が全デバイスの .resume() を呼ぶ (依存関係の順)
+```
+
+### dev_pm_ops
+
+`struct dev_pm_ops` にサスペンド/レジュームのコールバックを定義し、ドライバに登録する。
+
+```c
+static int my_suspend(struct device *dev)
+{
+    struct my_data *data = dev_get_drvdata(dev);
+    /* ハードウェアを低電力状態にする */
+    /* 進行中の I/O を完了させる */
+    /* 割り込みを無効化 */
+    return 0;
+}
+
+static int my_resume(struct device *dev)
+{
+    struct my_data *data = dev_get_drvdata(dev);
+    /* ハードウェアを再初期化 */
+    /* 割り込みを再有効化 */
+    return 0;
+}
+
+static DEFINE_SIMPLE_DEV_PM_OPS(my_pm_ops, my_suspend, my_resume);
+
+static struct platform_driver my_driver = {
+    .driver = {
+        .name = "my_device",
+        .pm = pm_sleep_ptr(&my_pm_ops),
+    },
+    /* ... */
+};
+```
+
+`DEFINE_SIMPLE_DEV_PM_OPS` は suspend/resume のペアだけを定義する場合に便利なマクロである。`pm_sleep_ptr()` は `CONFIG_PM_SLEEP` が無効なビルドでポインタを NULL にし、コンパイラにコールバック関数のデッドコード除去を許す。
+
+### suspend/resume の注意点
+
+- `.suspend()` は全デバイスに対して **依存関係の逆順** で呼ばれる（子デバイスが先、親デバイスが後）
+- `.resume()` は **依存関係の順** で呼ばれる（親デバイスが先、子デバイスが後）
+- 割り込みは `.suspend_noirq()` 以降は無効になる
+- `.suspend()` でエラーを返すと、既にサスペンドしたデバイスは `.resume()` で巻き戻される
+
+## Runtime PM
+
+### 概念
+
+Runtime PM はシステム全体のスリープとは独立に、個々のデバイスが使われていないときに自動的に低電力状態にする仕組みである。参照カウントモデルを採用しており、`pm_runtime_get` で活性化（カウント増加）、`pm_runtime_put` で非活性化（カウント減少）する。カウントが 0 になるとデバイスがサスペンドされる。
+
+```c
+#include <linux/pm_runtime.h>
+
+static int my_probe(struct platform_device *pdev)
+{
+    /* ... */
+    pm_runtime_set_active(&pdev->dev);
+    pm_runtime_enable(&pdev->dev);
+    pm_runtime_set_autosuspend_delay(&pdev->dev, 2000);  /* 2秒後に自動サスペンド */
+    pm_runtime_use_autosuspend(&pdev->dev);
+    return 0;
+}
+```
+
+デバイスにアクセスするときは `pm_runtime_get_sync` で起床させ、アクセス終了後に `pm_runtime_put_autosuspend` で解放する。
+
+```c
+/* デバイスを使う前に */
+pm_runtime_get_sync(&pdev->dev);
+/* ... デバイスアクセス ... */
+pm_runtime_mark_last_busy(&pdev->dev);
+pm_runtime_put_autosuspend(&pdev->dev);
+```
+
+`remove` 時には Runtime PM を無効化する。
+
+```c
+/* remove 時 */
+pm_runtime_disable(&pdev->dev);
+```
+
+### Runtime PM コールバック
+
+System PM と Runtime PM のコールバックをまとめて定義する場合は、`SYSTEM_SLEEP_PM_OPS` と `RUNTIME_PM_OPS` マクロを組み合わせる。
+
+```c
+static int my_runtime_suspend(struct device *dev)
+{
+    /* デバイスをスリープ */
+    return 0;
+}
+
+static int my_runtime_resume(struct device *dev)
+{
+    /* デバイスを起床 */
+    return 0;
+}
+
+static const struct dev_pm_ops my_pm_ops = {
+    SYSTEM_SLEEP_PM_OPS(my_suspend, my_resume)
+    RUNTIME_PM_OPS(my_runtime_suspend, my_runtime_resume, NULL)
+};
+```
+
+## ファームウェアロード
+
+### なぜ必要か
+
+WiFi チップ、GPU、USB ペリフェラルなど多くのデバイスは、起動時にファームウェアバイナリをデバイスに転送する必要がある。ファームウェアはカーネルツリー外のバイナリであり、通常 `/lib/firmware/` に配置される。カーネルはこれを読み込んでデバイスのメモリに書き込む。
+
+### request_firmware API
+
+`request_firmware()` は同期的にファームウェアを読み込む。プローブ時に呼ぶのが一般的である。
+
+```c
+#include <linux/firmware.h>
+
+static int my_probe(struct platform_device *pdev)
+{
+    const struct firmware *fw;
+    int ret;
+
+    ret = request_firmware(&fw, "my_device.fw", &pdev->dev);
+    if (ret) {
+        dev_err(&pdev->dev, "firmware load failed: %d\n", ret);
+        return ret;
+    }
+
+    dev_info(&pdev->dev, "firmware loaded: %zu bytes\n", fw->size);
+    /* fw->data にファームウェアデータ、fw->size にサイズ */
+
+    /* デバイスにファームウェアを書き込む */
+    memcpy_toio(dev->regs + FW_LOAD_ADDR, fw->data, fw->size);
+
+    release_firmware(fw);
+    return 0;
+}
+```
+
+### 非同期ロード
+
+プローブをブロックしたくない場合は `request_firmware_nowait()` を使う。ファームウェアの読み込みが完了するとコールバックが呼ばれる。
+
+```c
+static void fw_callback(const struct firmware *fw, void *context)
+{
+    struct my_data *data = context;
+    if (!fw) {
+        dev_err(data->dev, "firmware not found\n");
+        return;
+    }
+    /* ... ファームウェアを処理 ... */
+    release_firmware(fw);
+}
+
+request_firmware_nowait(THIS_MODULE, true, "my_device.fw",
+                        &pdev->dev, GFP_KERNEL, data, fw_callback);
+```
+
+### ファームウェアの配置
+
+```bash
+# ファームウェアファイルの配置先
+/lib/firmware/my_device.fw
+
+# initramfs に含める場合 (カーネルビルド設定)
+# CONFIG_EXTRA_FIRMWARE="my_device.fw"
+```
+
+`CONFIG_EXTRA_FIRMWARE` を指定すると、ファームウェアがカーネルイメージに組み込まれ、ルートファイルシステムがマウントされる前でも利用可能になる。
+
+## Rust 側の状況
+
+Rust バインディングにおける電力管理とファームウェアの対応状況は以下の通りである。
+
+- **Runtime PM**: `Devres<T>` の `try_access()` が Runtime PM の状態を考慮する設計になっている（Nova ドライバで使用されている）
+- **Firmware**: `kernel::firmware` モジュールに基本的な API が存在する (6.18 以降)
+- **完全な PM 抽象**: まだ発展途上であり、System PM のコールバックを Rust から直接定義する公式な仕組みは整備中である
+
+C 側の PM インフラが成熟しているため、当面は C で PM コールバックを書き、Rust 側はデータのやり取りに集中するという構成も現実的な選択肢である。
+
+## よくある罠
+
+1. **suspend で進行中の I/O を完了し忘れる** → resume 後にデータ破壊やカーネルパニックが発生する
+2. **`pm_runtime_get_sync` の戻り値を無視する** → 負の errno を返す場合があり、デバイスが起床していない状態でアクセスしてしまう
+3. **`request_firmware` をプローブ以外のタイミングで呼ぶ** → ユーザ空間ヘルパーが動いていない場合にハングする
+4. **`release_firmware` を忘れる** → カーネルメモリリークが発生する
+5. **Runtime PM の参照カウント不一致** → get/put が釣り合わないとデバイスが起きっぱなし、または寝たまま応答しなくなる
+
+## 章末演習
+
+1. 第16章で作成した platform ドライバに `dev_pm_ops` を追加し、`suspend`/`resume` 時にカーネルログにメッセージを出力せよ
+2. Runtime PM を有効化し、`autosuspend_delay` を 3 秒に設定して、sysfs (`/sys/devices/.../power/`) の値を確認せよ
+3. ダミーのファームウェアファイルを `/lib/firmware/` に配置し、`request_firmware` で読み込んで内容のサイズをログに出力せよ
+
+## 参考資料
+
+- [Power Management — The Linux Kernel documentation](https://docs.kernel.org/driver-api/pm/devices.html)
+- [Runtime Power Management — The Linux Kernel documentation](https://docs.kernel.org/power/runtime_pm.html)
+- [Firmware — The Linux Kernel documentation](https://docs.kernel.org/driver-api/firmware/index.html)

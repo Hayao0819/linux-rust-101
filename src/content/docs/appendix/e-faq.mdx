@@ -1,0 +1,360 @@
+---
+title: "付録 E. トラブルシューティング FAQ"
+description: Rust for Linux 開発でよく遭遇する問題とその解決策
+---
+
+## Q1. `make LLVM=1 rustavailable` が失敗する
+
+**症状**: `Rust is not available` や `rustc version mismatch` と表示される。
+
+**原因と対策**:
+
+カーネルのバージョンごとに要求される `rustc` のバージョンが厳密に決まっている。`scripts/min-tool-version.sh rustc` で必要なバージョンを確認できる。
+
+```bash
+# 必要なバージョンを確認
+scripts/min-tool-version.sh rustc
+
+# rustup でバージョンを合わせる
+rustup override set $(scripts/min-tool-version.sh rustc)
+
+# 必須コンポーネントを追加
+rustup component add rust-src rustfmt clippy
+
+# bindgen-cli のインストール（バージョンも確認すること）
+cargo install --locked bindgen-cli
+```
+
+`LLVM` のバージョンも重要である。カーネルが要求する最低バージョンを `scripts/min-tool-version.sh llvm` で確認し、必要に応じて `LLVM=-18` のようにバージョンを指定する。
+
+---
+
+## Q2. rust-analyzer が型を解決できない
+
+**症状**: エディタで `unresolved import`、`can't find crate` 等のエラーが大量に出る。
+
+**原因と対策**:
+
+rust-analyzer はカーネルビルドシステムが生成する `rust-project.json` を参照する必要がある。
+
+```bash
+# rust-project.json を生成
+make LLVM=1 rust-analyzer
+
+# VSCode の場合、.vscode/settings.json に以下を追加
+# {
+#   "rust-analyzer.linkedProjects": ["rust-project.json"]
+# }
+```
+
+生成後もエラーが残る場合は、一度カーネル全体をビルドしてから rust-analyzer を再起動する。生成コード（バインディング）がビルド済みでないと解決できない型がある。
+
+---
+
+## Q3. GDB でシンボルがずれる（KASLR）
+
+**症状**: ブレークポイントが効かない、変数の値がおかしい。
+
+**原因と対策**:
+
+KASLR (Kernel Address Space Layout Randomization) がカーネルのロードアドレスをランダム化しているため、`vmlinux` のアドレスと実行時アドレスが一致しない。
+
+```bash
+# 方法 1: KASLR を無効にして起動
+qemu-system-x86_64 ... -append "nokaslr console=ttyS0"
+
+# 方法 2: GDB 接続後にオフセットを自動取得
+(gdb) target remote :1234
+(gdb) lx-symbols
+```
+
+QEMU 起動時に `-s` オプション（`-gdb tcp::1234` の短縮形）を付け、`-S` で CPU 起動時に停止させるとブレークポイント設定が確実になる。
+
+---
+
+## Q4. `insmod` で "Invalid module format" エラー
+
+**症状**: `insmod my_module.ko` が `Invalid module format` で失敗する。
+
+**原因と対策**:
+
+以下のいずれかが原因である。
+
+1. **カーネルバージョンの不一致**: モジュールをビルドしたカーネルと実行中のカーネルが異なる
+2. **CONFIG_MODVERSIONS の不一致**: CRC チェックが合わない
+3. **LLVM/GCC の混在**: カーネル本体と異なるコンパイラでモジュールをビルドした
+
+```bash
+# 実行中のカーネルバージョンを確認
+uname -r
+
+# モジュールの vermagic を確認
+modinfo my_module.ko | grep vermagic
+
+# 両者が一致することを確認してから insmod する
+# 不一致の場合はモジュールを再ビルドする
+make LLVM=1 -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+```
+
+それでも解決しない場合は `CONFIG_MODULE_FORCE_LOAD=y` を設定すると強制ロードできるが、本番環境での使用は推奨しない。
+
+---
+
+## Q5. menuconfig で `CONFIG_RUST` が表示されない
+
+**症状**: `make menuconfig` で `RUST` を検索しても見つからない。
+
+**原因と対策**:
+
+`CONFIG_RUST` は依存条件を満たさないと表示されない。以下を順に確認する。
+
+```bash
+# 1. rustavailable を確認（ここが通らないと menuconfig に出ない）
+make LLVM=1 rustavailable
+
+# 2. LLVM=1 を付けて menuconfig を起動しているか確認
+make LLVM=1 menuconfig
+
+# 3. GCC ではなく Clang/LLVM を使う（Rust は LLVM ベースなので必須）
+# GCC では CONFIG_RUST は出現しない
+
+# 4. アーキテクチャが対応しているか確認（x86_64, arm64 等）
+# 全アーキテクチャが Rust に対応しているわけではない
+```
+
+`/ RUST` で検索すると依存関係が表示されるので、満たされていない条件を特定できる。
+
+---
+
+## Q6. virtme-ng (vng) が起動しない
+
+**症状**: `vng` が `kernel image not found` や `qemu not found` で失敗する。
+
+**原因と対策**:
+
+```bash
+# virtme-ng をインストール
+pip install virtme-ng
+
+# QEMU がインストールされているか確認
+which qemu-system-x86_64
+
+# カーネルイメージのパスを明示的に指定
+vng -k arch/x86/boot/bzImage
+
+# カーネルをビルドしていない場合は先にビルド
+make LLVM=1 -j$(nproc)
+vng --build
+```
+
+仮想環境（venv）内で pip install した場合は、PATH にそのディレクトリが含まれていることを確認する。また、`/dev/kvm` が存在しない環境（VM 内等）では `--no-kvm` オプションを追加する。
+
+```bash
+# KVM が使えない環境
+vng --qemu-opts="-no-kvm"
+```
+
+---
+
+## Q7. `KBox::new` で大きな構造体を確保するとスタックオーバーフローする
+
+**症状**: 大きな構造体を `KBox::new(MyLargeStruct { ... }, GFP_KERNEL)?` で確保すると、スタックオーバーフローでカーネルパニックが発生する。
+
+**原因と対策**:
+
+`KBox::new()` は値をまずスタック上に構築してからヒープへコピーするため、構造体が大きいとカーネルスタック（通常 8KB〜16KB）を溢れさせる。
+
+解決策は **in-place 初期化** を使用すること。
+
+```rust
+// NG: スタック上に一時的に巨大構造体を作る
+let b = KBox::new(MyLargeStruct { buf: [0u8; 65536] }, GFP_KERNEL)?;
+
+// OK: in-place 初期化でスタックを使わない
+let b = KBox::pin_init(pin_init!(MyLargeStruct {
+    buf <- Zeroable::init(),
+}), GFP_KERNEL)?;
+```
+
+`pin_init!` マクロと `InPlaceInit` トレイトを使えば、確保と初期化をヒープ上で直接行える。
+
+---
+
+## Q8. `make rusttest` の doctest が実行できない
+
+**症状**: カーネルモジュールの doc コメントに書いたテストを実行したいが、`cargo test` は使えない。
+
+**原因と対策**:
+
+カーネルモジュールの doctest は通常の `cargo test` では実行できない。カーネルビルドシステムの `rusttest` ターゲットを使用する。
+
+```bash
+# カーネル組み込みの doctest を実行
+make LLVM=1 rusttest
+
+# 特定のテストだけ実行する場合は KTESTFLAGS を使う
+make LLVM=1 rusttest KTESTFLAGS="--filter my_test"
+```
+
+なお、`rusttest` はホスト環境で実行される **単体テスト** であり、カーネル空間で動作するテストではない。カーネル空間での動作テストには `insmod` によるロードテストか、kunit フレームワークを使用する。
+
+```bash
+# kunit でテストを実行（QEMU 不要）
+./tools/testing/kunit/kunit.py run --make_options LLVM=1 \
+    --kconfig_add CONFIG_RUST=y
+```
+
+---
+
+## Q9. Rust モジュールのビルドが `CONFIG_MODVERSIONS` 関連で失敗する
+
+**症状**: `modpost` の段階で `undefined symbol` やバージョン不一致エラーが出る。
+
+**原因と対策**:
+
+`CONFIG_MODVERSIONS` はシンボルの ABI 互換性を CRC でチェックする機能である。Rust モジュールは C とは異なるシンボルマングリングを行うため、問題が生じることがある。
+
+```bash
+# 一時的に MODVERSIONS を無効にして確認
+./scripts/config -d MODVERSIONS
+make LLVM=1 olddefconfig
+make LLVM=1 -j$(nproc)
+```
+
+最新のカーネルでは Rust モジュールの `MODVERSIONS` サポートが改善されている。古いカーネルで問題が発生する場合は、カーネルバージョンのアップデートも検討すること。
+
+外部モジュール（out-of-tree）として開発する場合は、カーネル本体と同じ `.config` とソースツリーでビルドすることが重要である。
+
+---
+
+## Q10. WSL2 で `/mnt/c/` 上のカーネルソースをビルドすると極端に遅い
+
+**症状**: ビルドに異常に時間がかかる。`make` が数倍〜数十倍遅い。
+
+**原因と対策**:
+
+WSL2 の `/mnt/c/`（Windows ファイルシステム）は 9P プロトコル経由でアクセスするため、I/O が非常に遅い。カーネルビルドのような大量のファイル操作を伴う作業には不向きである。
+
+```bash
+# WSL2 のネイティブファイルシステムにソースを移動
+cp -r /mnt/c/linux-src ~/linux-src
+cd ~/linux-src
+
+# ext4 上でビルド（劇的に高速化する）
+make LLVM=1 -j$(nproc)
+```
+
+`/home/` 以下（ext4）で作業するだけで 10 倍以上速くなることがある。Git リポジトリも WSL2 側に clone すること。
+
+```bash
+# Windows 側のリポジトリを参照するのではなく、WSL2 側に clone
+cd ~
+git clone https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git
+```
+
+また、WSL2 のメモリ割り当てが不足している場合は `~/.wslconfig` で調整する。
+
+```ini
+# %USERPROFILE%/.wslconfig
+[wsl2]
+memory=8GB
+processors=4
+swap=4GB
+```
+
+---
+
+## Q11. `bindgen` がヘッダファイルを見つけられない
+
+**症状**: ビルド中に `fatal error: 'linux/xxx.h' file not found` と表示される。
+
+**原因と対策**:
+
+`bindgen` が使用する Clang のシステムヘッダパスが正しく設定されていない場合に発生する。
+
+```bash
+# bindgen のバージョンを確認
+bindgen --version
+
+# カーネルが要求するバージョンと一致するか確認
+# Makefile 内の BINDGEN_VERSION_MIN を参照
+
+# Clang のインクルードパスを確認
+clang -v -E - < /dev/null 2>&1 | grep "include"
+
+# 環境変数で明示的にパスを指定
+export BINDGEN_EXTRA_CLANG_ARGS="--sysroot=/usr -I/usr/include"
+```
+
+ディストリビューションによっては `linux-headers` パッケージが必要になる場合もある。
+
+---
+
+## Q12. `kernel::sync::Mutex` のロック順序違反でデッドロックする
+
+**症状**: モジュールが応答しなくなる。`dmesg` に lockdep の警告が出る。
+
+**原因と対策**:
+
+Linux カーネルの lockdep (lock dependency checker) がロック順序の不整合を検出している。複数のロックを取得する場合は、常に同じ順序で取得する必要がある。
+
+```bash
+# lockdep の警告を確認
+dmesg | grep -i "lockdep\|deadlock\|lock order"
+```
+
+```rust
+// NG: 順序が不定（呼び出し箇所によって A→B と B→A が混在）
+fn bad_example(a: &Mutex<DataA>, b: &Mutex<DataB>) {
+    let _ga = a.lock();
+    let _gb = b.lock(); // 別の箇所で b→a の順で取得するとデッドロック
+}
+
+// OK: 常にアドレス順やドキュメントで定めた順序で取得
+// ロックのクラス（lock_class_key）で lockdep に順序を教える
+```
+
+`CONFIG_PROVE_LOCKING=y` を有効にすると、デッドロックが発生する **前に** 潜在的な問題を検出できる。開発中は常に有効にしておくことを推奨する。
+
+---
+
+## 開発時に有効にすべき CONFIG_KERNEL_HACKING オプションは?
+
+`make menuconfig` の "Kernel hacking" メニュー以下に、開発時に有効にすべきデバッグオプションが集約されている。推奨設定:
+
+```bash
+# メモリバグ検出
+scripts/config --enable KASAN
+scripts/config --enable KASAN_GENERIC
+
+# 並行性バグ検出
+scripts/config --enable KCSAN
+
+# 未定義動作検出
+scripts/config --enable UBSAN
+
+# ロック検証
+scripts/config --enable PROVE_LOCKING
+scripts/config --enable DEBUG_LOCK_ALLOC
+
+# sleep 違反検出
+scripts/config --enable DEBUG_ATOMIC_SLEEP
+
+# ハングタスク検出
+scripts/config --enable DETECT_HUNG_TASK
+
+# スタックオーバーフロー検出
+scripts/config --enable VMAP_STACK
+
+# GDB スクリプト
+scripts/config --enable GDB_SCRIPTS
+scripts/config --enable DEBUG_INFO
+
+# BTF (eBPF/bpftrace に必要)
+scripts/config --enable DEBUG_INFO_BTF
+
+# 再構成
+make LLVM=1 olddefconfig
+```
+
+これらを全て有効にするとカーネルのパフォーマンスは大幅に低下するが、開発段階では常に有効にすべきである。本番カーネルではこれらを無効にする。

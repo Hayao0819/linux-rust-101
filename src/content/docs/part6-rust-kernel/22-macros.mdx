@@ -1,0 +1,543 @@
+---
+title: "Ch 22. マクロの読み解き"
+description: "module!, #[vtable], new_mutex!, #[cfg(CONFIG_...)] — カーネル Rust マクロの内部構造"
+---
+
+## この章で学ぶこと
+
+- `module!` マクロが何に展開されるかを読める
+- `#[vtable]` が生成する `HAS_XXX` 連想定数の仕組みを理解する
+- `new_mutex!` / `new_spinlock!` が lockdep 情報をどう埋め込むかを把握する
+- `#[cfg(CONFIG_...)]` による条件コンパイルの使い方を理解する
+- `-Z unpretty=expanded` でマクロ展開を確認できる
+
+:::note[Rust API ステータス]
+🟢 **安定**: `module!` (proc-macro — init_module/cleanup_module 生成)
+🟢 **安定**: `#[vtable]` (HAS_XXX 連想定数の自動生成)
+🟢 **安定**: `#[cfg(CONFIG_...)]` (kbuild が --cfg フラグを自動付与)
+:::
+
+## 前提
+
+- [Ch 6](/part2-first-module/06-kbuild-ffi/) (kbuild と FFI) を完了している
+- [Ch 21](/part6-rust-kernel/21-pin/) (Pin) を完了している
+- Rust のマクロ (宣言的マクロ・手続き的マクロ) の基本概念を知っている
+
+---
+
+## `module!` マクロの展開
+
+### マクロの入力
+
+```rust
+module! {
+    type: MyModule,
+    name: "my_module",
+    author: "Alice",
+    description: "Example module",
+    license: "GPL",
+}
+```
+
+### 展開結果 (概念)
+
+`module!` は手続き的マクロ (proc-macro) であり、以下のようなコードに展開される:
+
+```rust title="module! の展開結果 (概念的・簡略化)"
+// ---- modinfo セクション ----
+// MODULE_LICENSE 相当
+#[link_section = ".modinfo"]
+#[used]
+static __MY_MODULE_LICENSE: [u8; 24] =
+    *b"license=GPL\0";
+
+#[link_section = ".modinfo"]
+#[used]
+static __MY_MODULE_AUTHOR: [u8; 32] =
+    *b"author=Alice\0";
+
+#[link_section = ".modinfo"]
+#[used]
+static __MY_MODULE_DESCRIPTION: [u8; 48] =
+    *b"description=Example module\0";
+
+// ---- __this_module ----
+// C の `THIS_MODULE` に相当するシンボルへの参照
+extern "C" {
+    static __this_module: kernel::types::ThisModule;
+}
+
+// ---- init_module (C ABI エントリポイント) ----
+#[no_mangle]
+pub extern "C" fn init_module() -> core::ffi::c_int {
+    // MyModule::init を呼び、Result を C の int に変換
+    match <MyModule as kernel::Module>::init(
+        unsafe { &*core::ptr::addr_of!(__this_module) }
+    ) {
+        Ok(m) => {
+            // 成功: モジュールインスタンスを static に保存
+            unsafe {
+                __MY_MODULE_INSTANCE
+                    .write(core::mem::MaybeUninit::new(m));
+            }
+            0
+        }
+        Err(e) => e.to_errno(),
+    }
+}
+
+// ---- cleanup_module (C ABI エントリポイント) ----
+#[no_mangle]
+pub extern "C" fn cleanup_module() {
+    // static からインスタンスを取り出して drop する
+    unsafe {
+        core::ptr::drop_in_place(
+            __MY_MODULE_INSTANCE.as_mut_ptr()
+        );
+    }
+}
+
+// モジュールインスタンスの保存場所
+static mut __MY_MODULE_INSTANCE:
+    core::mem::MaybeUninit<MyModule> =
+    core::mem::MaybeUninit::uninit();
+```
+
+### 重要なポイント
+
+1. **`#[no_mangle]`** — `init_module`, `cleanup_module` のシンボル名がそのまま出力される。カーネルのモジュールローダーはこの名前でエントリポイントを探す
+
+2. **`extern "C"`** — C ABI で呼び出し可能。カーネルは C のコードからこれらを呼ぶ
+
+3. **`#[link_section = ".modinfo"]`** — `modinfo` コマンドが読み取るセクションにメタデータを配置する。`modinfo my_module.ko` で確認可能
+
+4. **`__this_module`** — カーネルのモジュールローダーが自動的に作成する `struct module` インスタンスへの参照。`try_module_get()` / `module_put()` で参照カウントを操作する際に使う
+
+5. **`MaybeUninit`** — init 前はモジュールインスタンスが存在しないため、未初期化状態を表現する
+
+### modinfo で確認する
+
+```bash
+$ modinfo my_module.ko
+filename:       /lib/modules/.../my_module.ko
+license:        GPL
+author:         Alice
+description:    Example module
+depends:
+```
+
+この出力は、`.modinfo` セクションに書き込まれたデータをそのまま読み取っている。
+
+---
+
+## `#[vtable]` アトリビュートと `HAS_XXX`
+
+### C カーネルの vtable パターン
+
+C カーネルでは、関数ポインタの構造体で多態性を実現する:
+
+```c title="C の file_operations"
+struct file_operations {
+    struct module *owner;
+    int (*open)(struct inode *, struct file *);
+    int (*release)(struct inode *, struct file *);
+    ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);
+    ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *);
+    // ... 30 以上のフィールド
+};
+```
+
+大半のドライバは全メンバを実装せず、不要なフィールドは `NULL` にする:
+
+```c
+static const struct file_operations my_fops = {
+    .owner = THIS_MODULE,
+    .open = my_open,
+    .release = my_release,
+    .read = my_read,
+    // .write = NULL (暗黙)
+};
+```
+
+### Rust での `#[vtable]`
+
+Rust 側では `#[vtable]` 属性マクロを trait に付与してこのパターンを実現する:
+
+```rust title="trait 定義側"
+#[vtable]
+pub trait FileOperations {
+    fn open(file: &File) -> Result;
+    fn release(file: &File);
+    fn read(file: &File, buf: &mut UserSliceMut, offset: u64) -> Result<usize>;
+    fn write(file: &File, buf: &UserSlice, offset: u64) -> Result<usize> {
+        // デフォルト実装: -EINVAL を返す
+        Err(EINVAL)
+    }
+}
+```
+
+`#[vtable]` マクロは、**デフォルト実装を持つメソッド** に対して `HAS_XXX` 関連定数を自動生成する:
+
+```rust title="#[vtable] が生成するもの (概念)"
+pub trait FileOperations {
+    fn open(file: &File) -> Result;
+    fn release(file: &File);
+    fn read(file: &File, buf: &mut UserSliceMut, offset: u64) -> Result<usize>;
+    fn write(file: &File, buf: &UserSlice, offset: u64) -> Result<usize> {
+        Err(EINVAL)
+    }
+
+    // #[vtable] が自動生成する関連定数
+    const HAS_WRITE: bool = false;
+}
+```
+
+### `HAS_XXX` の役割
+
+実装側でメソッドをオーバーライドすると、対応する `HAS_XXX` が `true` になる:
+
+```rust title="実装側"
+impl FileOperations for MyDevice {
+    fn open(file: &File) -> Result { Ok(()) }
+    fn release(file: &File) {}
+    fn read(file: &File, buf: &mut UserSliceMut, offset: u64) -> Result<usize> {
+        // ...
+        Ok(0)
+    }
+    fn write(file: &File, buf: &UserSlice, offset: u64) -> Result<usize> {
+        // write を実装した → HAS_WRITE = true になる
+        Ok(buf.len())
+    }
+}
+```
+
+C の vtable を構築する際にこの定数を参照する:
+
+```rust title="vtable 構築時 (概念)"
+const VTABLE: bindings::file_operations = bindings::file_operations {
+    owner: core::ptr::null_mut(),
+    open: Some(open_callback::<T>),
+    release: Some(release_callback::<T>),
+    read: Some(read_callback::<T>),
+    // HAS_WRITE が true なら Some、false なら None (= C の NULL)
+    write: if <T as FileOperations>::HAS_WRITE {
+        Some(write_callback::<T>)
+    } else {
+        None
+    },
+    // ...
+};
+```
+
+これにより、C カーネル側が「このドライバは write を実装しているか？」を NULL チェックで判定する既存の仕組みと完全に互換性を持つ。
+
+---
+
+## `new_mutex!` / `new_spinlock!` マクロの展開
+
+[Ch 21](/part6-rust-kernel/21-pin/) で学んだ `pin_init!` と密接に関連するマクロである。
+
+### なぜマクロが必要か
+
+カーネルの mutex や spinlock は、ロックバリデータ (lockdep) のために **初期化時に名前と class 情報を渡す** 必要がある。
+C では以下のようにマクロを使う:
+
+```c
+// C
+DEFINE_MUTEX(my_mutex);
+// ↓ 展開すると
+struct mutex my_mutex = __MUTEX_INITIALIZER(my_mutex);
+// lockdep 用の key 情報が埋め込まれる
+```
+
+Rust 側でもこの lockdep 情報をコンパイル時に埋め込む必要があるため、マクロが使われる。
+
+### `new_mutex!` の展開
+
+```rust title="使用側"
+// pin_init! と組み合わせる
+let lock = KBox::pin_init(new_mutex!(MyData { value: 42 }), GFP_KERNEL)?;
+```
+
+`new_mutex!` は概念的に以下のように展開される:
+
+```rust title="new_mutex! の展開 (概念)"
+// lockdep 用の static key
+{
+    static CLASS: kernel::sync::LockClassKey =
+        kernel::sync::LockClassKey::new();
+
+    // Mutex<MyData> の pin-initializer を返す
+    kernel::sync::Mutex::new(
+        MyData { value: 42 },
+        // lockdep の名前: "my_data.rs:42" のようなファイル名:行番号
+        c_str!(concat!(file!(), ":", line!())),
+        &CLASS,
+    )
+}
+```
+
+ポイント:
+
+1. **`static CLASS`** — 各ロックインスタンスに固有の lockdep class。同じマクロ呼び出し箇所のロックは同じ class を共有する
+2. **ファイル名と行番号** — lockdep が報告するロック名に使用される。デッドロック検知時に「どのロックか」を特定できる
+3. **pin-initializer を返す** — `Mutex` 自体は `Opaque<bindings::mutex>` を内部に持つため、Pin 初期化が必要
+
+`new_spinlock!` も同様の構造である。
+
+---
+
+## `#[cfg(CONFIG_...)]` による条件コンパイル
+
+### カーネルコンフィグと Rust
+
+Linux カーネルは `Kconfig` システムで数千のコンフィグオプションを管理している。C コードでは `#ifdef CONFIG_XXX` で条件コンパイルを行うが、Rust では `#[cfg()]` アトリビュートを使う。
+
+kbuild は `rustc` を呼ぶ際に、有効なカーネルコンフィグを `--cfg` フラグで渡す:
+
+```bash
+rustc --cfg 'CONFIG_SMP' --cfg 'CONFIG_PREEMPT' --cfg 'CONFIG_NET' ...
+```
+
+### 基本的な使い方
+
+```rust
+// CONFIG_NET が有効なときだけコンパイルされる
+#[cfg(CONFIG_NET)]
+mod net_support {
+    pub fn setup_network() -> Result {
+        // ネットワーク初期化コード
+        Ok(())
+    }
+}
+
+// CONFIG_NET が無効なときのフォールバック
+#[cfg(not(CONFIG_NET))]
+mod net_support {
+    pub fn setup_network() -> Result {
+        pr_info!("Network support is disabled\n");
+        Ok(())
+    }
+}
+```
+
+### 関数・構造体フィールドへの適用
+
+```rust
+struct MyDriver {
+    base: DriverBase,
+
+    #[cfg(CONFIG_DEBUG_FS)]
+    debugfs_dir: Option<debugfs::Dir>,
+
+    #[cfg(CONFIG_PM)]
+    saved_state: Option<SavedState>,
+}
+
+impl MyDriver {
+    #[cfg(CONFIG_PM)]
+    fn suspend(&self) -> Result {
+        // サスペンド時の処理
+        Ok(())
+    }
+
+    #[cfg(CONFIG_PM)]
+    fn resume(&self) -> Result {
+        // レジューム時の処理
+        Ok(())
+    }
+}
+```
+
+### `cfg` の論理演算
+
+```rust
+// AND: 両方有効
+#[cfg(all(CONFIG_SMP, CONFIG_PREEMPT))]
+fn smp_preempt_specific() { /* ... */ }
+
+// OR: どちらか有効
+#[cfg(any(CONFIG_X86, CONFIG_ARM64))]
+fn arch_specific() { /* ... */ }
+
+// NOT: 無効な場合
+#[cfg(not(CONFIG_TINY_RCU))]
+fn full_rcu_support() { /* ... */ }
+
+// 組み合わせ
+#[cfg(all(CONFIG_NET, not(CONFIG_NET_NS)))]
+fn net_without_namespace() { /* ... */ }
+```
+
+### `cfg!` マクロ (実行時判定)
+
+`#[cfg()]` はコンパイル時にコードを除外するが、`cfg!()` マクロはコンパイル時に `bool` 値に評価される。コード自体は残るが、コンパイラの最適化で dead code は除去される:
+
+```rust
+fn init_module(&self) -> Result {
+    if cfg!(CONFIG_DEBUG_INFO) {
+        pr_info!("Debug build: extra logging enabled\n");
+    }
+
+    // CONFIG_SMP の有無で処理を分岐
+    let nr_cpus = if cfg!(CONFIG_SMP) {
+        num_online_cpus()
+    } else {
+        1
+    };
+
+    pr_info!("Running on {} CPU(s)\n", nr_cpus);
+    Ok(())
+}
+```
+
+### Kconfig での Rust 依存関係
+
+`Kconfig` ファイルでは `depends on RUST` を指定して、Rust サポートが有効な場合のみオプションを表示する:
+
+```kconfig title="drivers/foo/Kconfig"
+config FOO_DRIVER
+    tristate "Foo driver (Rust)"
+    depends on RUST
+    depends on PCI
+    help
+      A sample PCI driver written in Rust.
+```
+
+`depends on RUST` により、カーネルが Rust サポート付きでビルドされていない場合、このドライバは選択できなくなる。
+
+### C との比較
+
+| C | Rust | 説明 |
+|---|---|---|
+| `#ifdef CONFIG_SMP` | `#[cfg(CONFIG_SMP)]` | 条件コンパイル |
+| `#ifndef CONFIG_SMP` | `#[cfg(not(CONFIG_SMP))]` | 否定条件 |
+| `#if defined(A) && defined(B)` | `#[cfg(all(A, B))]` | AND |
+| `#if defined(A) \|\| defined(B)` | `#[cfg(any(A, B))]` | OR |
+| `IS_ENABLED(CONFIG_SMP)` | `cfg!(CONFIG_SMP)` | bool 値として評価 |
+
+C の `#ifdef` と異なり、Rust の `#[cfg()]` は構文解析後に評価されるため、**構文的に正しくないコードを `#[cfg()]` で隠すことはできない**。条件コンパイルで除外されるコードも構文チェックは通る必要がある。
+
+---
+
+## マクロ展開の確認方法
+
+### `-Z unpretty=expanded`
+
+Rust のマクロ展開結果を確認するには、`rustc` に `-Z unpretty=expanded` を渡す:
+
+```bash
+# ユーザ空間の Rust プロジェクトの場合
+cargo rustc -- -Z unpretty=expanded
+
+# カーネルの場合 (V=1 でコマンドを表示し、手動でフラグを追加)
+make V=1 LLVM=1 drivers/foo/bar.o 2>&1 | grep rustc
+# 表示された rustc コマンドに -Z unpretty=expanded を追加して実行
+```
+
+### 出力例
+
+```bash
+$ cargo rustc -- -Z unpretty=expanded 2>/dev/null
+```
+
+```rust title="展開結果 (抜粋)"
+#![feature(prelude_import)]
+#[prelude_import]
+use std::prelude::rust_2021::*;
+
+// module! の展開結果がすべて見える
+#[no_mangle]
+pub extern "C" fn init_module() -> core::ffi::c_int {
+    // ... 完全な展開コード
+}
+```
+
+### nightly が必要
+
+`-Z unpretty=expanded` は nightly コンパイラでのみ利用可能である:
+
+```bash
+# nightly のインストール
+rustup toolchain install nightly
+
+# nightly で展開
+cargo +nightly rustc -- -Z unpretty=expanded
+```
+
+### `cargo expand` クレート
+
+より便利な方法として `cargo-expand` がある:
+
+```bash
+cargo install cargo-expand
+cargo expand            # 全体の展開
+cargo expand my_module  # 特定モジュールのみ
+```
+
+これは内部的に `-Z unpretty=expanded` を呼んでいるが、出力が整形される。
+
+### カーネルモジュールでの確認
+
+カーネルのビルドシステムにはマクロ展開を直接表示する組み込みオプションはないが、
+以下の手順で確認できる:
+
+```bash
+# 1. ビルドコマンドを表示
+make V=1 LLVM=1 drivers/foo/bar.o 2>&1 | grep rustc
+
+# 2. 表示された rustc コマンドをコピーし、
+#    --emit=obj を --emit=metadata に、
+#    -Z unpretty=expanded を追加して実行
+rustc --edition=2021 \
+    --extern kernel=/path/to/libkernel.rmeta \
+    -Z unpretty=expanded \
+    drivers/foo/bar.rs
+```
+
+---
+
+## よくある罠
+
+1. **lockdep class を関数内の local にする** — `new_mutex!` が生成する `static CLASS` は呼び出し箇所ごとに一意でなければならない。手動でマクロを展開して `CLASS` をループ内 local に置くと、lockdep が正しく動作しない。
+
+2. **`#[vtable]` の `HAS_XXX` を手動で設定する** — `HAS_XXX` はマクロが自動管理する。手動で `const HAS_WRITE: bool = true;` と書くと、実装がないのに `Some(callback)` が設定され、呼び出し時にパニックする。
+
+3. **`#[cfg()]` の typo に気づかない** — `#[cfg(CONFIG_NETX)]` のように誤った名前を書いても、Rust コンパイラは警告を出さない。条件が常に偽となり、コードが静かに除外される。`--check-cfg` フラグ (Rust 1.80+) で検出可能である。
+
+4. **`cfg!()` と `#[cfg()]` を混同する** — `cfg!()` はコードを除外しない (bool 値になるだけ)。`#[cfg()]` で除外されたモジュールの関数を `cfg!()` のブロック内で呼ぶとコンパイルエラーになる。
+
+5. **`module!` の展開を手書きする** — modinfo セクションの書式やシンボル名の規則はカーネルバージョンにより変わりうる。必ず `module!` マクロ経由で生成すること。
+
+---
+
+## 章末演習
+
+1. 以下のコードがコンパイルできない理由を説明せよ:
+   ```rust
+   #[cfg(CONFIG_NET)]
+   use kernel::net::Socket;
+
+   fn init() -> Result {
+       if cfg!(CONFIG_NET) {
+           let _sock = Socket::new()?;  // ← エラー
+       }
+       Ok(())
+   }
+   ```
+
+2. `module!` マクロが生成する `init_module` 関数のシグネチャを `extern "C" fn() -> c_int` と書いた。もしこれが `extern "Rust" fn() -> c_int` だったら何が起きるか、ABI の観点から説明せよ。
+
+3. (発展) `rust-out-of-tree-module` テンプレートをクローンし、`make V=1 LLVM=1` でビルドした際に表示される `rustc` コマンドラインを記録せよ。`--emit=obj` やその他のフラグを確認し、本章で説明した処理フローと照合せよ。
+
+4. (発展) `cargo expand` を使ってユーザ空間のサンプルプログラムのマクロ展開を確認し、`module!` マクロの展開結果と比較せよ。
+
+---
+
+## 参考資料
+
+- [kernel::macros::module (rustdoc)](https://rust.docs.kernel.org/macros/macro.module.html)
+- [kernel::macros::vtable (rustdoc)](https://rust.docs.kernel.org/macros/attr.vtable.html)
+- [Conditional compilation (Rust Reference)](https://doc.rust-lang.org/reference/conditional-compilation.html)
+- [The Rust Reference — Procedural Macros](https://doc.rust-lang.org/reference/procedural-macros.html)
+- [cargo-expand (GitHub)](https://github.com/dtolnay/cargo-expand)

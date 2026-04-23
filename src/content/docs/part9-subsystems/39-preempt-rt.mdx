@@ -1,0 +1,1111 @@
+---
+title: "PREEMPT_RT — リアルタイムカーネル"
+description: "プリエンプションモデル, rt_mutex, 優先度継承, threaded IRQ, raw_spinlock_t, cyclictest — リアルタイム Linux の全貌"
+---
+
+## この章で学ぶこと
+
+- Linux の 4 つのプリエンプションモデルとその違いを説明できる
+- PREEMPT_RT が spinlock_t を rt_mutex に変換する仕組みを理解する
+- 優先度逆転問題と優先度継承プロトコルを説明できる
+- threaded IRQ が PREEMPT_RT でどう機能するかを把握する
+- raw_spinlock_t を使うべき状況を判断できる
+- cyclictest でリアルタイム性能を評価できる
+- PREEMPT_RT 環境で壊れるコードパターンとその修正方法を知る
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::sync::SpinLock<T>` は PREEMPT_RT 環境で透過的に rt_mutex に変換される。Rust モジュール側のコード変更は不要。
+❌ **未実装**: `raw_spinlock_t` の Rust バインディング
+:::
+
+## 前提
+
+- [Ch 9](/part3-kernel-concepts/09-concurrency/) (並行性と同期プリミティブ) を完了している
+- [Ch 18](/part5-hardware/18-irq-timer-wq/) (割り込み・タイマー・workqueue) を完了している
+- spinlock_t と Mutex の選択基準を理解している
+
+---
+
+「リアルタイム」とは「速い」ことではない。
+**決められた時間内に、確実に応答する** ことである。
+
+通常のデスクトップ Linux では、最悪応答時間 (worst-case latency) が数ミリ秒に達することがある。
+Web サーバやデスクトップアプリケーションならこれで十分だが、
+産業用ロボット、医療機器、自動車の制御システムでは、
+「99.9999% の確率で 50 マイクロ秒以内に応答する」ことが求められる場合がある。
+
+**PREEMPT_RT** は、Linux カーネルに決定論的 (deterministic) なレイテンシを実現するための機能セットであり、
+20 年以上にわたる開発を経て **Linux 6.12 (2024 年 10 月)** でついに mainline にマージされた。
+
+この章では、PREEMPT_RT の全貌を体系的に解説する。
+
+---
+
+## 39.1 プリエンプションモデル
+
+Linux カーネルは、カーネルコードがどの程度「中断可能 (preemptible)」であるかを設定できる。
+これを **プリエンプションモデル** と呼ぶ。
+カーネルビルド時に以下の 4 つから選択する。
+
+### 比較表
+
+| モデル | Kconfig | カーネルプリエンプション | 典型的な最悪レイテンシ | 主な用途 |
+|---|---|---|---|---|
+| PREEMPT_NONE | `CONFIG_PREEMPT_NONE=y` | なし | 数十〜数百 ms | サーバ (スループット最優先) |
+| PREEMPT_VOLUNTARY | `CONFIG_PREEMPT_VOLUNTARY=y` | 明示的ポイントのみ | 数 ms | 汎用デスクトップ (旧来) |
+| PREEMPT (Desktop) | `CONFIG_PREEMPT=y` | クリティカルセクション外で常時 | 数百 us〜数 ms | デスクトップ (応答性重視) |
+| PREEMPT_RT | `CONFIG_PREEMPT_RT=y` | ほぼ全コードで可能 | 数十 us 以下 | リアルタイムシステム |
+
+### PREEMPT_NONE
+
+カーネルコードは自発的に CPU を譲らない限りプリエンプトされない。
+スケジューラへの制御移行は以下のタイミングでのみ起こる:
+
+- システムコールからユーザ空間に戻るとき
+- 割り込みハンドラからカーネルコードに戻るとき
+
+カーネル内部のコードパスがどれだけ長くても、途中で中断されることがない。
+これはスループットを最大化するが、応答時間は犠牲になる。
+
+**サーバワークロード** (データベース、ファイルサーバ) では、
+個々のリクエストの応答時間よりも単位時間あたりの処理量が重要であるため、
+このモデルが適している。
+
+### PREEMPT_VOLUNTARY
+
+`might_sleep()` や `cond_resched()` といった **明示的なプリエンプションポイント** でのみ、
+カーネルコードがプリエンプトされる。
+
+```c
+/* カーネルソース内の典型的なパターン */
+void long_running_operation(void)
+{
+    for (i = 0; i < huge_count; i++) {
+        do_work(i);
+        cond_resched();  /* ここでスケジューラに制御を渡す可能性がある */
+    }
+}
+```
+
+`might_sleep()` は「この関数は sleep する可能性がある」ことを宣言するマクロであり、
+`CONFIG_PREEMPT_VOLUNTARY` ではプリエンプションポイントとしても機能する。
+`CONFIG_DEBUG_ATOMIC_SLEEP=y` と組み合わせると、
+atomic コンテキスト (割込コンテキスト、spinlock 保持中) で呼ばれた場合に警告を出す。
+
+PREEMPT_NONE に比べてレイテンシは改善するが、
+プリエンプションポイントが存在しないコードパスでは依然として長いレイテンシが発生する。
+
+:::note
+Linux 6.13 以降、`PREEMPT_VOLUNTARY` は `PREEMPT_NONE` + lazy preemption に統合される方向で議論されている。
+Thomas Gleixner 氏による **PREEMPT_LAZY** パッチセットは、
+voluntary preemption points を不要にし、プリエンプションモデルの簡素化を目指している。
+今後のカーネルバージョンでは `PREEMPT_VOLUNTARY` が廃止される可能性がある。
+:::
+
+### PREEMPT (Desktop)
+
+`CONFIG_PREEMPT=y` を設定すると、**クリティカルセクション (spinlock 保持中、IRQ 無効区間) を除くすべてのカーネルコード** がプリエンプト可能になる。
+
+具体的には、`preempt_count` というカウンタが 0 のとき、
+カーネルコード実行中でもスケジューラが割り込み復帰時にタスク切り替えを行える。
+spinlock を取ると `preempt_count` がインクリメントされ、
+解放するとデクリメントされる。カウンタが 0 に戻った瞬間にプリエンプションが可能になる。
+
+```
+preempt_count = 0:  プリエンプション可能
+preempt_count > 0:  プリエンプション禁止 (spinlock 保持中、IRQ 無効中など)
+```
+
+デスクトップ Linux (Ubuntu, Fedora のデフォルト) はこのモデルを採用している。
+
+### PREEMPT_RT
+
+PREEMPT_RT は上記の「クリティカルセクション」の大部分を**プリエンプト可能にする**。
+
+具体的には:
+
+1. `spinlock_t` を内部的に **rt_mutex** (sleep するロック) に変換する
+2. ほぼすべての割り込みハンドラをカーネルスレッドに変換する (threaded IRQ)
+3. ロックに優先度継承プロトコルを組み込む
+
+結果として、カーネル内でプリエンプション不可能な区間は極めて短くなり、
+最悪応答時間が **数十マイクロ秒以下** に収まる。
+
+---
+
+## 39.2 spinlock_t の変換: rt_mutex
+
+PREEMPT_RT の最も革命的な設計は、**`spinlock_t` を sleep するロックに変える** ことである。
+
+### 通常カーネルの spinlock_t
+
+[Ch 9](/part3-kernel-concepts/09-concurrency/) で学んだ通り、通常のカーネルでは `spinlock_t` はビジーウェイトするロックである。
+
+```c
+spin_lock(&lock);    /* ロックが取れるまで CPU がループする */
+shared_data++;
+spin_unlock(&lock);
+```
+
+ロックが取れない場合、CPU は何もせずループし続ける。
+そのため、保持中は sleep できず、プリエンプションも無効化される。
+
+### PREEMPT_RT での spinlock_t
+
+PREEMPT_RT では、`spinlock_t` の内部実装が `rt_mutex` に差し替わる:
+
+```c
+/* include/linux/spinlock_types.h (PREEMPT_RT 有効時、概念的に) */
+typedef struct {
+    struct rt_mutex_base lock;     /* sleeping lock */
+    /* ... */
+} spinlock_t;
+```
+
+この変換は **透過的** に行われる。ドライバのソースコードを一切変更しなくても、
+既存の `spin_lock()` / `spin_unlock()` 呼び出しが自動的に sleeping lock として動作する。
+
+```c
+/* ドライバのコードは同じ */
+spin_lock(&lock);     /* 通常カーネル: spin, PREEMPT_RT: rt_mutex (sleep) */
+shared_data++;
+spin_unlock(&lock);   /* 通常カーネル: spin 解除, PREEMPT_RT: rt_mutex 解放 */
+```
+
+### なぜこの変換が重要なのか
+
+spinlock が sleep するロックになることで、以下が実現する:
+
+1. **クリティカルセクションがプリエンプト可能になる** -- `spinlock_t` 保持中でも高優先度タスクが割り込める
+2. **優先度継承が機能する** -- ロックを保持するタスクの優先度が動的に引き上げられる (後述)
+3. **デッドロックパターンが変化する** -- sleep するため、通常カーネルでは起きない問題が発生しうる
+
+| 動作 | 通常カーネルの `spinlock_t` | PREEMPT_RT の `spinlock_t` |
+|---|---|---|
+| ロック取得できない時 | ビジーウェイト (spin) | sleep (タスクを休止) |
+| 保持中のプリエンプション | **不可** | **可能** |
+| 保持中の sleep | **不可** | 可能 (rt_mutex なので) |
+| 優先度継承 | なし | **あり** |
+| 割込コンテキストで使用 | **可** | **不可** (sleep するため) |
+
+最後の行が重要である。PREEMPT_RT では `spinlock_t` が sleep する可能性があるため、
+ハード IRQ コンテキストからは使えない。
+この問題は **threaded IRQ** (セクション 39.4) と **raw_spinlock_t** (セクション 39.5) で解決される。
+
+---
+
+## 39.3 優先度逆転と優先度継承
+
+### 優先度逆転問題
+
+**優先度逆転 (priority inversion)** は、リアルタイムシステムで最も危険なバグの一つである。
+
+以下のシナリオを考える:
+
+```
+タスク L (低優先度):   ロック A を保持して処理中
+タスク M (中優先度):   ロックは持たないが、CPU を使いたい
+タスク H (高優先度):   ロック A を取りたいが、L が保持中
+
+実行順序:
+  L がロック A を保持 → H が起床してロック A を要求 → ブロック
+  → M が起床、L より高優先度なので L をプリエンプト
+  → M が長時間実行
+  → L は M に CPU を奪われ、ロック A を解放できない
+  → H はいつまでもロック A を取得できない
+```
+
+**H は最も優先度が高いのに、M に間接的にブロックされている。**
+これが優先度逆転である。M のタスクがいくつも存在すれば、H の待ち時間は無制限に伸びる。
+
+この問題は歴史的にも有名である。1997 年の Mars Pathfinder 探査機では、
+優先度逆転によるシステムリセットが繰り返し発生した (VxWorks RTOS 上)。
+
+### 優先度継承プロトコル
+
+PREEMPT_RT の `rt_mutex` は **優先度継承 (priority inheritance)** を実装している。
+
+ロックを保持しているタスクは、**そのロックを待っている最も優先度の高いタスクの優先度を継承する**。
+
+```
+修正後の実行順序:
+  L がロック A を保持 → H が起床してロック A を要求 → ブロック
+  → L の優先度が H の優先度に引き上げられる (優先度継承)
+  → M が起床するが、L (= H の優先度) の方が高いため、M はプリエンプトできない
+  → L がクリティカルセクションを完了してロック A を解放
+  → L の優先度が元に戻る
+  → H がロック A を取得して実行
+  → M は H と L が完了してから実行
+```
+
+### 推移的な優先度継承
+
+PREEMPT_RT は **推移的 (transitive)** な優先度継承もサポートする。
+ロックのネストにより優先度継承が連鎖する場合に対応する。
+
+```
+タスク A (低優先度):   ロック X を保持
+タスク B (中優先度):   ロック Y を保持、ロック X を待ってブロック
+タスク C (高優先度):   ロック Y を待ってブロック
+
+推移的継承:
+  C → B に優先度継承 (B がロック Y を保持)
+  B → A に優先度継承 (A がロック X を保持)
+  結果: A は C の優先度で実行される
+```
+
+### C でのデモンストレーション
+
+以下のコードは優先度逆転の問題と、PREEMPT_RT による自動的な解決を示す。
+
+```c title="優先度逆転が発生するシナリオ (概念)"
+#include <linux/mutex.h>
+#include <linux/kthread.h>
+#include <linux/sched.h>
+
+static DEFINE_MUTEX(shared_resource);
+
+/*
+ * 通常カーネルの Mutex にも優先度継承はある (CONFIG_DEBUG_MUTEXES)。
+ * しかし spinlock_t には優先度継承がない。
+ *
+ * PREEMPT_RT では spinlock_t も rt_mutex に変換されるため、
+ * spinlock に対しても優先度継承が自動的に機能する。
+ */
+
+/* 低優先度タスク */
+static int low_prio_func(void *data)
+{
+    mutex_lock(&shared_resource);
+    /* 長い処理をシミュレート */
+    /* この間、高優先度タスクがロックを待つと、
+       このタスクの優先度が引き上げられる */
+    do_long_computation();
+    mutex_unlock(&shared_resource);
+    return 0;
+}
+
+/* 高優先度タスク */
+static int high_prio_func(void *data)
+{
+    /* sched_setscheduler で SCHED_FIFO, priority=80 に設定済み */
+    mutex_lock(&shared_resource);
+    /* 優先度継承により、low_prio タスクが先にロックを解放する */
+    do_critical_work();
+    mutex_unlock(&shared_resource);
+    return 0;
+}
+```
+
+PREEMPT_RT 環境では、`spinlock_t` に対しても全く同じ優先度継承が機能する。
+開発者が追加のコードを書く必要はない。
+
+---
+
+## 39.4 Threaded IRQ と PREEMPT_RT
+
+### PREEMPT_RT は割り込みをスレッド化する
+
+[Ch 18](/part5-hardware/18-irq-timer-wq/) で学んだ通り、通常カーネルでは割り込みハンドラは割込コンテキストで実行される。
+PREEMPT_RT は、**ほぼすべての割り込みハンドラを強制的にカーネルスレッドに変換する**。
+
+通常カーネルの場合:
+
+```
+ハードウェア IRQ 発生
+  → CPU が割込コンテキストに移行
+  → 割り込みハンドラが直接実行される (プリエンプション不可)
+  → ハンドラ完了後、中断された処理を再開
+```
+
+PREEMPT_RT の場合:
+
+```
+ハードウェア IRQ 発生
+  → CPU がハード IRQ の最小限の処理 (IRQ 識別・応答) を実行
+  → 対応するカーネルスレッド (irq/<number>-<name>) を起床
+  → スレッドがスケジューラにより優先度に基づいてスケジュールされる
+  → スレッドがプロセスコンテキストで割り込み処理を実行 (プリエンプション可能)
+```
+
+### ps で確認する
+
+PREEMPT_RT カーネルでは、`ps` コマンドで割り込みスレッドが見える:
+
+```bash
+$ ps aux | grep irq/
+root       14  [irq/1-i8042]       # キーボードコントローラ
+root       15  [irq/12-i8042]      # マウスコントローラ
+root       18  [irq/8-rtc0]        # リアルタイムクロック
+root       23  [irq/16-ahci]       # AHCI (SATA コントローラ)
+root       31  [irq/27-enp0s3]     # ネットワークデバイス
+```
+
+各スレッドは独立したカーネルスレッドであり、`chrt` コマンドでリアルタイム優先度を変更できる:
+
+```bash
+# IRQ スレッドの優先度を確認
+$ chrt -p 14
+pid 14's current scheduling policy: SCHED_FIFO
+pid 14's current scheduling priority: 50
+
+# ネットワーク割り込みの優先度を上げる
+$ chrt -f -p 90 31
+```
+
+### IRQF_NO_THREAD: スレッド化の例外
+
+一部の割り込みは、スレッド化すると正常に動作しない。
+`IRQF_NO_THREAD` フラグを指定すると、PREEMPT_RT 環境でも割込コンテキストで直接実行される:
+
+```c
+request_irq(irq, my_handler, IRQF_NO_THREAD, "my_device", dev);
+```
+
+`IRQF_NO_THREAD` が必要なケース:
+
+| ケース | 理由 |
+|---|---|
+| タイマー割り込み | スケジューラ自身を駆動するため、スレッド化できない |
+| IPI (プロセッサ間割り込み) | スケジューラの制御に使われるため |
+| NMI (Non-Maskable Interrupt) | マスク不可能であり、そもそもスレッド化の概念が適用されない |
+
+**一般のデバイスドライバ開発者は `IRQF_NO_THREAD` を使うべきではない。**
+使うべきかどうか迷うなら、使う必要はない。
+
+### threaded IRQ のメリット
+
+| メリット | 説明 |
+|---|---|
+| **プリエンプション可能** | 高優先度のリアルタイムタスクが割り込み処理を中断できる |
+| **スケジュール可能** | 割り込み処理の優先度を `chrt` で制御できる |
+| **sleep 可能** | プロセスコンテキストなので Mutex が使える |
+| **デバッグ容易** | `ps`, `top`, `ftrace` で個別の割り込みスレッドを追跡できる |
+| **CPU アフィニティ** | `taskset` で特定の CPU に割り当てられる |
+
+---
+
+## 39.5 raw_spinlock_t: 真のスピンロック
+
+### なぜ raw_spinlock_t が必要なのか
+
+PREEMPT_RT で `spinlock_t` が rt_mutex に変換されると、sleep する可能性がある。
+しかし、カーネルの一部のコードは **絶対に sleep してはならない** コンテキストで動作する。
+
+**`raw_spinlock_t`** は、PREEMPT_RT 環境でも **真のビジーウェイト** を行うスピンロックである。
+PREEMPT_RT の spinlock 変換の対象外であり、常にハードウェアレベルの spin を行う。
+
+```c
+#include <linux/spinlock.h>
+
+/* 通常の spinlock: PREEMPT_RT では rt_mutex に変換される */
+static DEFINE_SPINLOCK(normal_lock);
+
+/* raw spinlock: PREEMPT_RT でも真の spin を行う */
+static DEFINE_RAW_SPINLOCK(raw_lock);
+
+void normal_function(void)
+{
+    spin_lock(&normal_lock);       /* PREEMPT_RT: sleep 可能 */
+    /* ... */
+    spin_unlock(&normal_lock);
+}
+
+void critical_function(void)
+{
+    unsigned long flags;
+    raw_spin_lock_irqsave(&raw_lock, flags);  /* 常に真の spin + IRQ 無効 */
+    /* ... */
+    raw_spin_unlock_irqrestore(&raw_lock, flags);
+}
+```
+
+### raw_spinlock_t が使われる場所
+
+カーネル内で `raw_spinlock_t` が使われるのは、以下の極めて限定された領域である:
+
+| 領域 | 理由 |
+|---|---|
+| **スケジューラコア** (`runqueue->lock`) | スケジューラ自体が rt_mutex の sleep を処理するため、スケジューラ内部では sleep できない |
+| **割り込みディスクリプタ** (`irq_desc->lock`) | 割り込みの制御構造体は、ハード IRQ コンテキストから操作される |
+| **タイマーインフラ** (`timer_base->lock`) | hrtimer は割込コンテキストから操作される |
+| **RCU 内部** | RCU の grace period 検出はスケジューラと密接に連携する |
+| **printk 内部** | NMI コンテキストからも呼ばれるため |
+
+### 判断基準: spinlock_t vs raw_spinlock_t
+
+**モジュール開発者は `raw_spinlock_t` をほぼ使う必要がない。**
+以下の判断フローに従う:
+
+```
+ロックが必要な状況か?
+  │
+  ├─ ハード IRQ コンテキスト (IRQF_NO_THREAD) で使うか?
+  │   ├─ Yes → raw_spinlock_t
+  │   └─ No  → spinlock_t (PREEMPT_RT で自動変換)
+  │
+  ├─ スケジューラ/タイマー/RCU の内部コードか?
+  │   ├─ Yes → raw_spinlock_t
+  │   └─ No  → spinlock_t
+  │
+  ├─ NMI コンテキストからアクセスされるか?
+  │   ├─ Yes → raw_spinlock_t (または NMI-safe な手法)
+  │   └─ No  → spinlock_t
+  │
+  └─ 保護区間が絶対にプリエンプションされてはならないか?
+      ├─ Yes → raw_spinlock_t
+      └─ No  → spinlock_t  ← ほとんどのケースはここ
+```
+
+`raw_spinlock_t` は**レビュー時に特別な正当化が必要**である。
+upstream への提出時に `raw_spinlock_t` を使うと、
+メンテナから「なぜ `spinlock_t` ではだめなのか」を問われる。
+
+---
+
+## 39.6 PREEMPT_RT で壊れるコードパターン
+
+PREEMPT_RT 環境でモジュールを動作させる場合、
+通常カーネルでは正常に動作するコードが問題を起こすことがある。
+以下に代表的なパターンと修正方法を示す。
+
+### パターン 1: spin_lock() をハード IRQ 内で使用
+
+```c title="壊れるコード"
+static DEFINE_SPINLOCK(my_lock);
+
+/* ハード IRQ ハンドラ (IRQF_NO_THREAD) */
+static irqreturn_t my_handler(int irq, void *dev_id)
+{
+    spin_lock(&my_lock);     /* BUG: PREEMPT_RT では sleep する可能性がある */
+    process_irq_data();
+    spin_unlock(&my_lock);
+    return IRQ_HANDLED;
+}
+```
+
+**問題:** PREEMPT_RT では `spin_lock()` が rt_mutex になるため sleep する可能性がある。
+ハード IRQ コンテキストでは sleep 不可。
+
+```c title="修正 (方法 A): threaded IRQ を使う"
+/* PREEMPT_RT では自動的にスレッド化されるので、
+   明示的に request_threaded_irq を使えば両方のカーネルで安全 */
+ret = request_threaded_irq(irq, NULL, my_threaded_handler,
+                           IRQF_ONESHOT, "my_device", dev);
+
+static irqreturn_t my_threaded_handler(int irq, void *dev_id)
+{
+    spin_lock(&my_lock);     /* プロセスコンテキストなので OK */
+    process_irq_data();
+    spin_unlock(&my_lock);
+    return IRQ_HANDLED;
+}
+```
+
+```c title="修正 (方法 B): raw_spinlock_t を使う (本当に必要な場合のみ)"
+static DEFINE_RAW_SPINLOCK(my_lock);
+
+static irqreturn_t my_handler(int irq, void *dev_id)
+{
+    unsigned long flags;
+    raw_spin_lock_irqsave(&my_lock, flags);  /* 真の spin */
+    process_irq_data();   /* この処理は極めて短くなければならない */
+    raw_spin_unlock_irqrestore(&my_lock, flags);
+    return IRQ_HANDLED;
+}
+```
+
+### パターン 2: spin_lock_irqsave() で IRQ 無効を仮定
+
+```c title="壊れるコード"
+static DEFINE_SPINLOCK(my_lock);
+
+void my_function(void)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&my_lock, flags);
+    /* IRQ が無効であることに依存するコード */
+    access_per_cpu_data();   /* IRQ 無効 → 他の割り込みが来ない → 安全... と思いきや */
+    spin_unlock_irqrestore(&my_lock, flags);
+}
+```
+
+**問題:** PREEMPT_RT では `spin_lock_irqsave()` が rt_mutex を取得するが、
+**ハードウェア割り込みは無効化しない**。
+IRQ が無効であることに依存するコードは壊れる。
+
+```c title="修正: per-CPU データには migrate_disable() を使う"
+static DEFINE_SPINLOCK(my_lock);
+
+void my_function(void)
+{
+    migrate_disable();   /* このタスクを現在の CPU に固定 */
+    spin_lock(&my_lock);
+    access_per_cpu_data();  /* マイグレーション無効 → per-CPU データに安全にアクセス */
+    spin_unlock(&my_lock);
+    migrate_enable();
+}
+```
+
+### パターン 3: spinlock 保持中に per-CPU データアクセス
+
+```c title="壊れるコード"
+static DEFINE_SPINLOCK(my_lock);
+static DEFINE_PER_CPU(int, my_counter);
+
+void increment(void)
+{
+    spin_lock(&my_lock);
+    this_cpu_inc(my_counter);  /* BUG: PREEMPT_RT では spin_lock 中にプリエンプトされ、
+                                   別の CPU にマイグレーションされる可能性がある */
+    spin_unlock(&my_lock);
+}
+```
+
+**問題:** PREEMPT_RT では `spinlock_t` 保持中にプリエンプションが発生する。
+タスクが別の CPU にマイグレーションされると、per-CPU データのアクセスが不正になる。
+
+```c title="修正: 明示的に migrate_disable()"
+void increment(void)
+{
+    migrate_disable();
+    spin_lock(&my_lock);
+    this_cpu_inc(my_counter);
+    spin_unlock(&my_lock);
+    migrate_enable();
+}
+```
+
+あるいは、per-CPU データをロック保護下で使う設計自体を見直す。
+
+### パターン 4: local_irq_disable() でプリエンプション防止を仮定
+
+```c title="壊れるコード"
+void my_function(void)
+{
+    local_irq_disable();
+    /* 「IRQ 無効 → プリエンプション不可 → 安全」と仮定 */
+    access_shared_data();
+    local_irq_enable();
+}
+```
+
+**問題:** PREEMPT_RT では `local_irq_disable()` がハードウェア IRQ を無効化しない場合がある
+(threaded IRQ はカーネルスレッドとして動作するため)。
+また、`local_irq_disable()` はプリエンプションを確実に防止する保証がない。
+
+```c title="修正: 適切なロックを使用する"
+static DEFINE_SPINLOCK(my_lock);
+
+void my_function(void)
+{
+    spin_lock(&my_lock);    /* 適切な同期プリミティブを使う */
+    access_shared_data();
+    spin_unlock(&my_lock);
+}
+```
+
+### パターンのまとめ
+
+| 壊れるパターン | 問題の原因 | 修正方法 |
+|---|---|---|
+| ハード IRQ 内の `spin_lock()` | rt_mutex は sleep する | threaded IRQ または `raw_spinlock_t` |
+| `spin_lock_irqsave()` で IRQ 無効を仮定 | rt_mutex は IRQ を無効化しない | `migrate_disable()` + `spin_lock()` |
+| spinlock 保持中の per-CPU アクセス | プリエンプション + マイグレーション | `migrate_disable()` を追加 |
+| `local_irq_disable()` でプリエンプション防止 | PREEMPT_RT では不十分 | 適切なロックを使用 |
+| `preempt_disable()` の多用 | RT のレイテンシ保証を台無しにする | 最小限に抑え、可能ならロックに置換 |
+| `in_interrupt()` の条件分岐 | PREEMPT_RT で IRQ がスレッド化される | コンテキストに依存しない設計にする |
+
+---
+
+## 39.7 リアルタイムスケジューリングポリシー
+
+PREEMPT_RT カーネルの真価を発揮するには、ユーザ空間のリアルタイムタスクに適切なスケジューリングポリシーを設定する必要がある。
+
+### SCHED_FIFO: 固定優先度
+
+**First-In, First-Out** の固定優先度スケジューリング。
+優先度は 1 (最低) から 99 (最高) の範囲で設定する。
+
+```bash
+# タスクを SCHED_FIFO, 優先度 80 で起動
+$ chrt -f 80 ./my_rt_application
+
+# 実行中のタスクの優先度を変更
+$ chrt -f -p 80 <pid>
+```
+
+**動作ルール:**
+
+- 同優先度のタスクは FIFO 順 (先に ready になったタスクが先に実行)
+- 実行中のタスクは、以下の条件でのみ CPU を譲る:
+  - より高優先度のタスクが ready になった
+  - 自発的にブロック (I/O 待ち、sleep、ロック待ち)
+  - `sched_yield()` を呼んだ
+- **タイムスライスなし** -- 優先度最高のタスクはブロックするまで走り続ける
+
+### SCHED_RR: ラウンドロビン
+
+SCHED_FIFO と同じ固定優先度だが、**同一優先度のタスク間でタイムスライスにより切り替え**が行われる。
+
+```bash
+# SCHED_RR, 優先度 50 で起動
+$ chrt -r 50 ./my_rt_application
+```
+
+**動作ルール:**
+
+- 異なる優先度のタスク間では SCHED_FIFO と同じ (高優先度が常に優先)
+- **同一優先度のタスク間で**、デフォルト 100ms のタイムスライスで切り替わる
+- タイムスライスは `/proc/sys/kernel/sched_rr_timeslice_ms` で変更可能
+
+### SCHED_DEADLINE: EDF スケジューリング
+
+**Earliest Deadline First (EDF)** に基づく最も先進的なスケジューリングポリシーである。
+Linux 3.14 で導入された。
+
+各タスクに 3 つのパラメータを設定する:
+
+```
+runtime:   タスクが各 period 内で使用できる最大 CPU 時間
+deadline:  タスクが処理を完了すべき期限
+period:    タスクの周期
+```
+
+```bash
+# SCHED_DEADLINE で起動 (runtime=10ms, deadline=30ms, period=30ms)
+$ chrt -d --sched-runtime 10000000 --sched-deadline 30000000 \
+         --sched-period 30000000 0 ./my_rt_application
+```
+
+**動作ルール:**
+
+- デッドラインが最も近いタスクが最優先で実行される
+- SCHED_FIFO/SCHED_RR よりも **高い優先度** で動作する
+- カーネルが **アドミッション制御** を行う: 全 SCHED_DEADLINE タスクの runtime/period の合計が CPU 容量を超える場合、タスクの作成を拒否する
+
+### ポリシー比較表
+
+| ポリシー | 優先度 | 時間制約 | アドミッション制御 | ユースケース |
+|---|---|---|---|---|
+| SCHED_OTHER (CFS) | 動的 (nice) | なし | なし | 通常プロセス |
+| SCHED_FIFO | 固定 (1-99) | なし | なし | 単純な RT タスク |
+| SCHED_RR | 固定 (1-99) | タイムスライス | なし | 同優先度 RT タスクの公平配分 |
+| SCHED_DEADLINE | なし (EDF) | runtime/deadline/period | **あり** | 周期的 RT タスク |
+
+### 優先度の関係
+
+```
+高  SCHED_DEADLINE (常に最優先)
+↑   SCHED_FIFO / SCHED_RR  priority=99
+│   SCHED_FIFO / SCHED_RR  priority=98
+│   ...
+│   SCHED_FIFO / SCHED_RR  priority=1
+↓   SCHED_OTHER (CFS)  nice=-20 〜 nice=19
+低
+```
+
+:::caution
+SCHED_FIFO 優先度 99 は**カーネル内部のスレッド (ksoftirqd, migration スレッド等) と同じ優先度帯**に位置する。
+優先度 99 のユーザタスクがビジーループするとシステムが応答不能になる危険がある。
+通常のリアルタイムアプリケーションでは **優先度 1〜89** を使用し、
+90 以上はカーネルスレッドや IRQ スレッドに予約すべきである。
+:::
+
+---
+
+## 39.8 レイテンシ計測ツール
+
+PREEMPT_RT カーネルのリアルタイム性能を評価するには、専用のツールが必要である。
+
+### cyclictest: ゴールドスタンダード
+
+`cyclictest` はリアルタイム Linux の **最悪ウェイクアップレイテンシ** を測定するツールである。
+リアルタイム性能の評価において事実上の標準 (gold standard) であり、
+PREEMPT_RT のメインライン化の議論でも常に参照されてきた。
+
+```bash
+# インストール (Debian/Ubuntu)
+$ apt install rt-tests
+
+# 基本的な測定 (全 CPU コア、100us 間隔、100000 ループ)
+$ sudo cyclictest --mlockall --smp --priority=80 --interval=100 --loops=100000
+
+# 出力例:
+# /dev/cpu_dma_latency set to 0us
+# policy: fifo: loadavg: 0.12 0.03 0.01 1/234 5678
+#
+# T: 0 ( 1234) P:80 I:100 C: 100000 Min:      1 Act:    3 Avg:    2 Max:      12
+# T: 1 ( 1235) P:80 I:100 C: 100000 Min:      1 Act:    2 Avg:    2 Max:      15
+# T: 2 ( 1236) P:80 I:100 C: 100000 Min:      1 Act:    4 Avg:    3 Max:      18
+# T: 3 ( 1237) P:80 I:100 C: 100000 Min:      1 Act:    2 Avg:    2 Max:      11
+```
+
+**出力の読み方:**
+
+| フィールド | 意味 |
+|---|---|
+| T: 0 | スレッド番号 |
+| P:80 | SCHED_FIFO 優先度 |
+| I:100 | 間隔 (マイクロ秒) |
+| C: 100000 | 完了したループ回数 |
+| Min | 最小レイテンシ (us) |
+| Act | 直近の実測値 (us) |
+| Avg | 平均レイテンシ (us) |
+| **Max** | **最大レイテンシ (us) -- 最も重要な値** |
+
+リアルタイムシステムの評価において最も重要なのは **Max** 値である。
+平均レイテンシが低くても、Max が大きければリアルタイム保証は破綻する。
+
+**目安:**
+
+| 環境 | 典型的な Max レイテンシ |
+|---|---|
+| PREEMPT_NONE (通常カーネル) | 数 ms〜数十 ms |
+| PREEMPT (Desktop) | 数百 us〜数 ms |
+| PREEMPT_RT (適切に設定) | **10〜50 us** |
+| PREEMPT_RT + CPU isolation | **5〜20 us** |
+
+### rteval: ストレステスト + cyclictest
+
+`rteval` はシステムに負荷をかけながら cyclictest を実行するツールである。
+リアルタイムシステムの性能を「最悪条件下」で評価する。
+
+```bash
+# インストール
+$ apt install rteval
+
+# 実行 (カーネルビルド負荷 + cyclictest, 1 時間)
+$ sudo rteval --duration=1h
+
+# rteval は以下を同時実行する:
+# 1. カーネルソースのコンパイル (CPU 負荷)
+# 2. hackbench (スケジューラ負荷)
+# 3. cyclictest (レイテンシ測定)
+```
+
+`rteval` は XML 形式の詳細レポートを生成する。
+本番環境のリアルタイム性能を保証するためには、
+24 時間以上の `rteval` 実行でレイテンシが閾値内に収まることを確認すべきである。
+
+### hwlatdetect: ハードウェア起因レイテンシの検出
+
+リアルタイム性能のボトルネックは、カーネルではなくハードウェアにある場合がある。
+
+- **SMI (System Management Interrupt)**: BIOS/UEFI が発生させる NMI 的な割り込み。OS から制御不能
+- **ファームウェアによる CPU 停止**: ACPI、メモリコントローラの再トレーニングなど
+- **ハイパーバイザーのオーバーヘッド**: 仮想化環境での VM exit
+
+`hwlatdetect` はこれらのハードウェア起因レイテンシを検出する:
+
+```bash
+# 60 秒間、10us を超えるハードウェアレイテンシを検出
+$ sudo hwlatdetect --duration=60 --threshold=10
+
+# 出力例:
+# hwlatdetect:  test duration 60 seconds
+#    parameters:
+#         Latency threshold: 10us
+#         Sample window:     1000000us
+#         Sample width:      500000us
+#      Non-sampling period:  500000us
+#         Output File:       None
+#
+# Starting test
+# test finished
+# Max Latency: 3us
+# Samples recorded: 0
+# Samples exceeding threshold: 0
+```
+
+SMI が検出された場合、BIOS 設定で「SMI-free」モードを有効化するか、
+SMI の発生間隔を調整する必要がある。これはソフトウェアでは対処できない問題である。
+
+### ftrace の hwlat トレーサー
+
+カーネル組み込みの hwlat トレーサーも利用できる:
+
+```bash
+# hwlat トレーサーを有効化
+$ echo hwlat > /sys/kernel/tracing/current_tracer
+
+# 検出閾値を設定 (ナノ秒)
+$ echo 10000 > /sys/kernel/tracing/tracing_thresh
+
+# トレース結果を確認
+$ cat /sys/kernel/tracing/trace
+
+# 使い終わったらトレーサーを無効化
+$ echo nop > /sys/kernel/tracing/current_tracer
+```
+
+### ツール比較表
+
+| ツール | 検出対象 | 用途 |
+|---|---|---|
+| **cyclictest** | ウェイクアップレイテンシ (SW+HW 統合) | リアルタイム性能の総合評価 |
+| **rteval** | 負荷下でのレイテンシ | ストレステスト |
+| **hwlatdetect** | SMI, ファームウェア等のハードウェア起因 | ハードウェアの選定・検証 |
+| **ftrace hwlat** | ハードウェア起因 (カーネル組み込み) | 追加インストール不要の検出手段 |
+
+---
+
+## 39.9 PREEMPT_RT の mainline マージ
+
+### 20 年の歴史
+
+PREEMPT_RT パッチセットは、2004 年に Ingo Molnar 氏と Thomas Gleixner 氏によって開発が始まった。
+当初は out-of-tree パッチとして存在し、各カーネルバージョンに手作業で移植されていた。
+
+長年にわたり、PREEMPT_RT の構成要素は少しずつ mainline にマージされてきた:
+
+| 年 | mainline にマージされた機能 |
+|---|---|
+| 2004-2006 | generic IRQ layer, hrtimer, threaded IRQ 基盤 |
+| 2009 | `request_threaded_irq()` API |
+| 2011 | rt_mutex の改良 |
+| 2013 | SCHED_DEADLINE |
+| 2015 | `migrate_disable()` / `migrate_enable()` |
+| 2020-2023 | printk rework (段階的) |
+| 2024 | **Linux 6.12: PREEMPT_RT 本体マージ** |
+
+### 最後のピース: printk
+
+PREEMPT_RT の mainline マージを最も長く阻んでいた要因の一つは `printk` であった。
+
+通常の `printk` は呼び出し元のコンテキストで直接コンソール出力を行う。
+これは PREEMPT_RT 環境では大きな問題を引き起こす:
+
+- コンソール出力はシリアルポートへの I/O を伴い、数ミリ秒かかることがある
+- `printk` は NMI、割り込み、スケジューラ内部など、あらゆるコンテキストから呼ばれる
+- ロックの競合やコンソールへの書き込み中のプリエンプションが決定論的レイテンシを破壊する
+
+Linux 6.12 では **threaded/nbcon console** (non-blocking console) アーキテクチャが採用された。
+`printk` のコンソール出力が専用のカーネルスレッドに委譲されることで、
+呼び出し元のレイテンシが大幅に削減された。
+
+### その他の最終変更
+
+- **タイマー**: `timer_list` のベースコードが PREEMPT_RT 互換に調整された
+- **RCU**: `rcu_read_lock()` のプリエンプション対応が完了した。PREEMPT_RT では RCU read-side クリティカルセクション内でプリエンプションが可能であり、grace period 検出メカニズムがこれに対応した
+- **softirq**: ksoftirqd へのフォールバックパスが PREEMPT_RT で常時有効化された
+
+### 現在の状態 (2026 年)
+
+Linux 6.12 以降、PREEMPT_RT はカーネルビルド時の設定オプション `CONFIG_PREEMPT_RT=y` として mainline に存在する。out-of-tree パッチを当てる必要はもはやない。
+
+ただし、すべてのアーキテクチャでサポートされているわけではない:
+
+| アーキテクチャ | PREEMPT_RT サポート |
+|---|---|
+| x86_64 | 完全サポート |
+| arm64 | 完全サポート |
+| arm (32-bit) | サポート |
+| RISC-V | サポート (6.12+) |
+| MIPS, PowerPC | 部分的 |
+
+---
+
+## 39.10 実践: RT カーネルの設定
+
+### カーネル設定
+
+```bash
+# カーネルのコンフィグ設定
+make menuconfig
+
+# General setup → Preemption Model → Fully Preemptible Kernel (Real-Time)
+
+# 主要な設定項目:
+# CONFIG_PREEMPT_RT=y        ← これが本体
+# CONFIG_HIGH_RES_TIMERS=y   ← 高精度タイマー (必須)
+# CONFIG_NO_HZ_FULL=y        ← フルダイナミックティック (推奨)
+# CONFIG_HZ_1000=y           ← タイマー周波数 1000Hz (推奨)
+
+# デバッグ (開発時):
+# CONFIG_DEBUG_PREEMPT=y     ← プリエンプション関連のデバッグ
+# CONFIG_PROVE_LOCKING=y     ← lockdep (ロック順序検証)
+```
+
+### カーネルコマンドライン
+
+```bash title="/etc/default/grub の GRUB_CMDLINE_LINUX への追加"
+# CPU アイソレーション (CPU 2, 3 を RT 専用にする例)
+isolcpus=2,3                  # 通常スケジューラから CPU 2,3 を除外
+nohz_full=2,3                 # CPU 2,3 のタイマーティックを停止
+rcu_nocbs=2,3                 # CPU 2,3 の RCU コールバックを別 CPU に移動
+irqaffinity=0,1               # IRQ をデフォルトで CPU 0,1 に割り当て
+
+# その他の推奨設定
+nowatchdog                    # ウォッチドッグタイマーを無効化 (レイテンシ源を除去)
+nosoftlockup                  # ソフトロックアップ検出を無効化
+tsc=reliable                  # TSC を信頼する (キャリブレーション省略)
+```
+
+### CPU アイソレーションの概念
+
+```
+CPU 0, 1:  汎用ワークロード (OS, IRQ, RCU, ksoftirqd)
+CPU 2, 3:  RT 専用 (isolcpus で隔離)
+           ├─ タイマーティック停止 (nohz_full)
+           ├─ RCU コールバック他 CPU に移動 (rcu_nocbs)
+           └─ デフォルト IRQ アフィニティ外 (irqaffinity)
+```
+
+RT 専用 CPU では、OS のバックグラウンドアクティビティが最小化され、
+リアルタイムタスクのレイテンシが改善する。
+
+### IRQ アフィニティの設定
+
+```bash
+# 特定の IRQ のアフィニティを確認
+$ cat /proc/irq/27/smp_affinity_list
+0-3
+
+# IRQ 27 を CPU 0 にのみ割り当て (RT CPU から排除)
+$ echo 0 > /proc/irq/27/smp_affinity_list
+
+# すべての IRQ を CPU 0,1 に移動するスクリプト
+for irq in /proc/irq/*/smp_affinity_list; do
+    echo "0,1" > "$irq" 2>/dev/null
+done
+```
+
+### RT タスクの起動と CPU 固定
+
+```bash
+# CPU 2 に固定して SCHED_FIFO 優先度 80 で起動
+$ taskset -c 2 chrt -f 80 ./my_rt_application
+
+# メモリロック (ページフォルト防止) は RT アプリケーション側で行う
+# mlockall(MCL_CURRENT | MCL_FUTURE);
+```
+
+### 完全な設定チェックリスト
+
+| 設定項目 | 方法 | 目的 |
+|---|---|---|
+| `CONFIG_PREEMPT_RT=y` | カーネルビルド | PREEMPT_RT 有効化 |
+| `CONFIG_HIGH_RES_TIMERS=y` | カーネルビルド | 高精度タイマー |
+| `CONFIG_NO_HZ_FULL=y` | カーネルビルド | ダイナミックティック |
+| `isolcpus=N,M` | カーネルコマンドライン | CPU 隔離 |
+| `nohz_full=N,M` | カーネルコマンドライン | ティック停止 |
+| `rcu_nocbs=N,M` | カーネルコマンドライン | RCU オフロード |
+| `irqaffinity=0,1` | カーネルコマンドライン | IRQ の CPU 制限 |
+| IRQ アフィニティ | `/proc/irq/*/smp_affinity_list` | 個別 IRQ の CPU 割り当て |
+| SCHED_FIFO/DEADLINE | `chrt` | RT スケジューリング |
+| CPU 固定 | `taskset` | タスクの CPU 固定 |
+| メモリロック | `mlockall()` | ページフォルト防止 |
+| `/dev/cpu_dma_latency` | `fd = open(); write(fd, &zero, 4);` | CPU C-state を最浅に制限 |
+
+---
+
+## 39.11 Rust カーネルモジュールと PREEMPT_RT
+
+### Rust の同期プリミティブの動作
+
+[Ch 9](/part3-kernel-concepts/09-concurrency/) で学んだ `kernel::sync::Mutex<T>` と `kernel::sync::SpinLock<T>` は、
+PREEMPT_RT 環境でどのように動作するか。
+
+**`kernel::sync::Mutex<T>`** -- 動作は変わらない。
+C の `mutex` と同じく、常に sleep するロックである。PREEMPT_RT の影響を受けない。
+
+**`kernel::sync::SpinLock<T>`** -- PREEMPT_RT では内部的に rt_mutex として動作する。
+C の `spinlock_t` と同じ変換が行われる。Rust 側のコードを変更する必要はない。
+
+```rust
+use kernel::sync::SpinLock;
+use kernel::new_spinlock;
+
+let s = KBox::pin_init(new_spinlock!(0_i32), GFP_KERNEL)?;
+
+let mut guard = s.lock();
+// 通常カーネル: ビジーウェイト + プリエンプション無効
+// PREEMPT_RT:  rt_mutex (sleep 可能, 優先度継承あり)
+*guard += 1;
+// guard の Drop で自動 unlock
+```
+
+### Rust の型安全性とリアルタイム
+
+Rust の型システムは PREEMPT_RT 環境で特に有益である:
+
+1. **ロック内データの強制**: ロックなしにデータにアクセスできないため、同期の見落としが起きない
+2. **Guard の自動 Drop**: `spin_unlock` の呼び忘れが不可能
+3. **コンパイル時のライフタイム検証**: ダングリングポインタによる use-after-free を防ぐ
+
+ただし、Rust の型システムでも以下は防げない:
+
+- 優先度逆転 (ロジックの問題であり、型の問題ではない)
+- デッドロック (ロック順序の問題)
+- 不適切なスケジューリング設定
+
+これらは `lockdep` や `cyclictest` などのランタイムツールで検証する必要がある。
+
+---
+
+## よくある罠
+
+1. **`raw_spinlock_t` を安易に使う** -- ほとんどのドライバでは `spinlock_t` で十分である。`raw_spinlock_t` はクリティカルセクションをプリエンプション不可にするため、RT のレイテンシ保証を弱める。
+
+2. **`preempt_disable()` の多用** -- PREEMPT_RT の利点を台無しにする。per-CPU データのアクセスには `migrate_disable()` を使う。
+
+3. **cyclictest を負荷なしで実行する** -- 無負荷時のレイテンシは参考にならない。必ずシステムに負荷をかけた状態で測定する。`rteval` を使うか、別途 `stress-ng` や `hackbench` を実行する。
+
+4. **SCHED_FIFO 優先度 99 でアプリケーションを動かす** -- カーネルスレッドと競合し、システムが応答不能になる。優先度 1〜89 を使用する。
+
+5. **仮想化環境で RT を評価する** -- ハイパーバイザーの VM exit によるレイテンシは数十 us に達する。RT 性能の評価はベアメタル環境で行う。
+
+6. **`local_irq_disable()` に依存する** -- PREEMPT_RT ではハードウェア IRQ の無効化とプリエンプションの無効化は独立した概念である。明示的な同期プリミティブを使用する。
+
+---
+
+## 章末演習
+
+1. QEMU 上で PREEMPT_RT カーネルをビルドし、`uname -a` で `PREEMPT_RT` の表示を確認せよ。
+
+2. `cyclictest` を通常カーネルと PREEMPT_RT カーネルの両方で実行し、Max レイテンシを比較せよ。`stress-ng --cpu $(nproc)` で負荷をかけた状態で測定すること。
+
+3. PREEMPT_RT カーネル上で `ps aux | grep irq/` を実行し、threaded IRQ スレッドの一覧を確認せよ。任意の IRQ スレッドの優先度を `chrt` で変更し、変更が反映されることを確認せよ。
+
+4. 以下の C コードが PREEMPT_RT で問題になる理由を説明し、修正せよ:
+
+   ```c
+   static DEFINE_SPINLOCK(lock);
+   static DEFINE_PER_CPU(int, counter);
+
+   void increment(void)
+   {
+       spin_lock(&lock);
+       this_cpu_inc(counter);
+       spin_unlock(&lock);
+   }
+   ```
+
+5. (発展) `SCHED_FIFO` と `SCHED_DEADLINE` のそれぞれで周期タスクを実装し、`cyclictest` と並行実行して互いのレイテンシへの影響を比較せよ。
+
+6. (発展) `hwlatdetect` を実行し、自身のハードウェアにおける SMI 起因レイテンシの有無を確認せよ。
+
+---
+
+## 参考資料
+
+### カーネルドキュメント
+
+- [Real-Time Linux (kernel.org)](https://docs.kernel.org/locking/locktypes.html) -- ロックタイプと PREEMPT_RT の関係
+- [RT-mutex implementation design (kernel.org)](https://docs.kernel.org/locking/rt-mutex-design.html) -- rt_mutex の設計文書
+- [Threaded IRQs (kernel.org)](https://docs.kernel.org/core-api/genericirq.html) -- 割り込みスレッド化の API
+- [NO_HZ: Reducing Scheduling-Clock Ticks (kernel.org)](https://docs.kernel.org/timers/no_hz.html) -- nohz_full の解説
+
+### 外部リソース
+
+- [OSADL Real-Time QA Farm](https://www.osadl.org/Realtime-Linux.projects-realtime-linux.0.html) -- 長期レイテンシ測定データ
+- [rt-tests (GitHub)](https://git.kernel.org/pub/scm/utils/rt-tests/rt-tests.git/) -- cyclictest 等のソースコード
+- [LWN: The PREEMPT_RT story (2024)](https://lwn.net/Articles/991514/) -- mainline マージの経緯
+
+### 関連する章
+
+- [Ch 7: プロセスと task_struct](/part3-kernel-concepts/07-process/) -- スケジューリングポリシーの基礎
+- [Ch 9: 並行性と同期プリミティブ](/part3-kernel-concepts/09-concurrency/) -- spinlock_t, Mutex, RCU
+- [Ch 18: 割り込み・タイマー・workqueue](/part5-hardware/18-irq-timer-wq/) -- threaded IRQ, hrtimer
+- [Ch 23: デバッグ・トレーシング・eBPF](/part7-observability/23-debug-tracing/) -- ftrace による解析

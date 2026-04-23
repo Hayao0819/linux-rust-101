@@ -1,0 +1,189 @@
+---
+title: "Ch 11. Linux デバイスモデル"
+description: bus, device, driver の三位一体と Device Tree によるハードウェア記述を学ぶ
+---
+
+## この章で学ぶこと
+
+- `struct device` / `device_driver` / `bus_type` の関係を理解する
+- `probe()` / `remove()` のライフサイクルを追える
+- Device Tree の基本構文とカーネルによるパースを把握する
+- sysfs に自動生成されるデバイス階層を読める
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::device::Device`, `kernel::types::ARef<Device>`
+🟢 **安定**: `dev_info!` / `dev_err!` / `dev_dbg!` マクロ
+🟡 **開発中**: Device Tree プロパティの Rust 読み取り API
+:::
+
+## 前提
+
+- [Ch 14](/part4-device-drivers/14-interfaces/) (sysfs) を完了している
+
+## バス・デバイス・ドライバの三角形
+
+Linux デバイスモデルは 3 つの概念で構成される:
+
+| 概念 | 役割 | 例 |
+|---|---|---|
+| **バス (bus_type)** | 通信チャネル。デバイスとドライバのマッチングルールを定義 | PCI, USB, I2C, SPI, platform |
+| **デバイス (device)** | 物理または仮想のハードウェア。バスに登録される | PCI デバイス, I2C センサ, platform デバイス |
+| **ドライバ (device_driver)** | デバイスを制御するコード。バスに登録される | NIC ドライバ, GPU ドライバ |
+
+### マッチングの流れ
+
+1. デバイスがバスに登録される (FW 列挙、Device Tree パース、手動登録)
+2. バスの `.match()` コールバックが全ドライバに対して呼ばれる
+3. マッチしたら、ドライバの `.probe()` が呼ばれる
+
+```
+デバイス登録 ─┐
+              ├─→ bus.match() ─→ 一致 ─→ driver.probe()
+ドライバ登録 ─┘
+```
+
+マッチング基準はバスによって異なる:
+
+| バス | マッチング基準 |
+|---|---|
+| PCI | vendor ID + device ID |
+| USB | vendor ID + product ID |
+| Platform / DT | `compatible` 文字列 |
+| ACPI | `_HID` 文字列 |
+
+## probe() と remove()
+
+### probe() が呼ばれるタイミング
+
+- デバイスが登録され、マッチするドライバが既にある場合
+- ドライバが登録され、マッチするデバイスが既にある場合
+- ホットプラグでデバイスが検出された場合
+
+### probe() の責務
+
+1. デバイスの検証 (リビジョンレジスタの確認など)
+2. リソースの取得: `devm_ioremap_resource()`, `devm_request_irq()`, `devm_clk_get()`
+3. ハードウェアの初期化
+4. サブシステムへの登録 (文字デバイス作成、ネットワークデバイス登録など)
+5. 成功なら `0`、失敗なら負の errno を返す
+
+### devm_\* パターン
+
+`devm_` プレフィックスのつく関数は **device-managed** リソースを確保する。
+デバイスがドライバから unbind されると、確保したリソースが自動的に解放される。
+
+```c
+/* devm_ あり: unbind 時に自動解放 */
+base = devm_ioremap_resource(&pdev->dev, res);
+
+/* devm_ なし: 手動で iounmap が必要 */
+base = ioremap(res->start, resource_size(res));
+/* ... */
+iounmap(base);  /* remove で忘れるとリーク */
+```
+
+`devm_*` は Rust の RAII と同じ発想で、C でリソースリークを防ぐパターンである。
+
+### remove() の責務
+
+1. サブシステムからの登録解除
+2. ハードウェアの停止
+3. `devm_*` で確保したリソースは**自動解放** (明示的な解放不要)
+
+## Device Tree
+
+Device Tree (DT) はハードウェアの構成をデータとして記述する仕組みである。
+ARM, RISC-V のほとんどのプラットフォームで使われる。
+
+### 基本構文
+
+```dts title="example.dts"
+/ {
+    compatible = "myboard";
+
+    mydevice@40000000 {
+        compatible = "myvendor,mydevice";   /* ドライバとのマッチングキー */
+        reg = <0x40000000 0x1000>;          /* MMIO ベースアドレス + サイズ */
+        interrupts = <0 42 4>;              /* IRQ 番号 + トリガタイプ */
+        clocks = <&clock_controller 12>;    /* クロック参照 */
+        status = "okay";                    /* "okay" = 有効, "disabled" = 無効 */
+    };
+};
+```
+
+### 主要プロパティ
+
+| プロパティ | 意味 |
+|---|---|
+| `compatible` | ドライバのマッチング文字列。最も具体的なものを先に書く |
+| `reg` | メモリマップド I/O のアドレスとサイズ |
+| `interrupts` | 割り込み番号とトリガ情報 |
+| `status` | `"okay"` (有効) または `"disabled"` (無効) |
+| `#address-cells` / `#size-cells` | 子ノードの `reg` の解釈方法 |
+
+### コンパイル
+
+```bash
+# .dts (ソース) → .dtb (バイナリ)
+dtc -I dts -O dtb -o board.dtb board.dts
+
+# .dtb → .dts (逆コンパイル)
+dtc -I dtb -O dts -o board.dts board.dtb
+
+# QEMU の DT をダンプ
+qemu-system-aarch64 -machine virt -machine dumpdtb=virt.dtb
+dtc -I dtb -O dts virt.dtb
+```
+
+## sysfs のデバイス階層
+
+```bash
+# バスの一覧
+ls /sys/bus/
+# pci  usb  i2c  spi  platform  ...
+
+# PCI バスのデバイス
+ls /sys/bus/pci/devices/
+
+# platform バスのドライバ
+ls /sys/bus/platform/drivers/
+
+# 特定デバイスの属性
+ls /sys/bus/pci/devices/0000:00:02.0/
+# class  vendor  device  resource  driver  ...
+```
+
+## Rust 側のデバイスモデル
+
+```rust
+use kernel::device::Device;
+use kernel::sync::ARef;
+
+// ARef<Device> は C の struct device への参照カウント付きポインタ
+let dev: ARef<Device> = /* ... */;
+dev_info!(dev, "device probed\n");
+```
+
+`ARef<T>` は [Ch 20](/part6-rust-kernel/20-ownership-unsafe/) で詳しく扱う。ここでは「C 側の参照カウントを Rust が自動管理する型」と理解しておけば十分である。
+
+## よくある罠
+
+1. **probe で全リソースを取得してから登録** — 途中で失敗した場合の cleanup を `devm_*` で自動化する。
+2. **`-EPROBE_DEFER` を忘れる** — 依存するリソース (クロック、レギュレータ) がまだ準備できていない場合、probe は `-EPROBE_DEFER` を返す。カーネルが後で再試行する。
+3. **DT の `compatible` を適当に書く** — `"vendor,device"` の形式が規約。ベンダプレフィックスが必要。
+4. **`status = "disabled"` のデバイスが probe されないのに困惑** — DT で無効化されている。
+
+## 章末演習
+
+1. `/sys/bus/platform/devices/` の中身を確認し、自分のシステムの platform デバイスを 5 つ列挙せよ。
+
+2. QEMU `-machine virt` の Device Tree を `dtc` で逆コンパイルし、`compatible` プロパティを 3 つ抽出せよ。
+
+3. `ls -la /sys/bus/pci/devices/0000:00:*/driver` で、各 PCI デバイスにどのドライバがバインドされているか確認せよ。
+
+## 参考資料
+
+- [Driver Model Overview (kernel.org)](https://docs.kernel.org/driver-api/driver-model/overview.html)
+- [Platform Devices and Drivers (kernel.org)](https://docs.kernel.org/driver-api/driver-model/platform.html)
+- [Linux and the Devicetree (kernel.org)](https://docs.kernel.org/devicetree/usage-model.html)
+- [Device Tree for Dummies (Thomas Petazzoni)](https://events.static.linuxfound.org/sites/events/files/slides/petazzoni-device-tree-dummies.pdf)

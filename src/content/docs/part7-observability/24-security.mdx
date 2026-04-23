@@ -1,0 +1,639 @@
+---
+title: "カーネルセキュリティ"
+description: "LSM フレームワーク、capabilities、Landlock、セキュリティバグ検出ツール — カーネルモジュール開発者が知るべきセキュリティ機構"
+---
+
+## この章で学ぶこと
+
+- Linux Security Modules (LSM) フレームワークを理解する
+- capabilities による権限分離を把握する
+- Landlock によるユーザ空間サンドボックスを知る
+- カーネルモジュール開発者がセキュリティのために守るべき原則を身につける
+- KASAN, KCSAN, UBSAN, KMSAN によるバグ検出を実践できる
+
+:::note[Rust API ステータス]
+この章は C のセキュリティ基盤 (LSM, capabilities, Landlock) を扱う。
+🟢 **安定**: `kernel::security` (Binder が LSM フックを呼び出す側の API)
+❌ **未実装**: LSM フック登録の Rust API, capabilities チェック (`capable()` 相当)
+:::
+
+---
+
+Linux カーネルはマルチユーザ OS の心臓部であり、あらゆるプロセスの資源を管理する。
+カーネルモジュールはカーネルと同じ権限で動作するため、**一つのバグがシステム全体の侵害に直結する**。
+この章では、カーネルが提供するセキュリティ機構と、モジュール開発者が守るべき原則を包括的に解説する。
+
+## Linux Security Modules (LSM)
+
+### LSM フレームワークの仕組み
+
+LSM はカーネル内部に **セキュリティフック** を挿入するフレームワークである。
+システムコールが実際の処理を行う直前に、LSM フックが呼ばれ、セキュリティモジュールが操作の許可・拒否を判断する。
+
+```
+ユーザプロセス → システムコール → DAC チェック → LSM フック → 実際の処理
+                                                    ↑
+                                            セキュリティモジュールが
+                                            許可/拒否を判断
+```
+
+LSM の重要な特徴を以下にまとめる。
+
+- カーネルの重要な操作に「フック」を挿入する
+- フックはセキュリティモジュールが許可/拒否を判断する
+- 複数の LSM をスタック可能である (Linux 5.1 以降)
+- フックの例: `bprm_check_security` (exec 時), `inode_permission` (ファイルアクセス), `socket_create` (ソケット作成)
+
+フックは `security/security.c` に集約されており、`security_XXX()` 関数として各サブシステムから呼び出される。
+例えば、ファイルを開く際のフックは以下のように呼ばれる。
+
+```c
+/* fs/open.c の do_dentry_open() から簡略化 */
+static int do_dentry_open(struct file *f, ...)
+{
+    /* ... DAC チェック ... */
+
+    /* LSM フック: セキュリティモジュールに許可を問い合わせ */
+    error = security_file_open(f);
+    if (error)
+        goto cleanup_all;
+
+    /* ... 実際のオープン処理 ... */
+}
+```
+
+### 主要な LSM
+
+| LSM | 特徴 | 用途 |
+|---|---|---|
+| SELinux | Type Enforcement、MAC | Red Hat 系、Android |
+| AppArmor | パスベースのプロファイル | Ubuntu/SUSE |
+| SMACK | シンプルなラベルベース | 組込み |
+| TOMOYO | ラーニングモード付き | 日本発、学習向け |
+| Landlock | ユーザ空間から設定可能 | アプリケーションサンドボックス |
+| BPF LSM | eBPF でフック実装 | 柔軟な動的セキュリティ |
+
+**SELinux** は最も広く使われている LSM であり、すべてのプロセスとリソースに「型ラベル」を付与し、ポリシーで型間のアクセスを制御する。
+**AppArmor** はファイルパスに基づくプロファイルでプロセスを制限し、SELinux より設定が容易である。
+**Landlock** は非特権プロセスから利用可能な唯一の LSM で、アプリケーション自身がサンドボックスを構築できる。
+
+### LSM とモジュール開発者
+
+モジュール開発者は通常 LSM を**実装しない**。
+しかし LSM が自分のドライバの操作を制限する可能性があることを認識しておく必要がある。
+例えば、SELinux が有効な環境で `ioctl` が拒否される、AppArmor がデバイスファイルへのアクセスをブロックする、といった事態が起こりうる。
+
+```bash
+# 有効な LSM を確認
+cat /sys/kernel/security/lsm
+# lockdown,capability,landlock,yama,apparmor
+
+# SELinux のモード確認
+getenforce
+# Enforcing / Permissive / Disabled
+
+# AppArmor のステータス確認
+aa-status
+```
+
+デバッグ時に「権限があるはずなのにアクセスが拒否される」場合、まず LSM を疑うとよい。
+`dmesg` や `audit.log` に LSM の拒否ログが出力されるため、確認する習慣をつけるべきである。
+
+```bash
+# SELinux の拒否ログを確認
+ausearch -m avc -ts recent
+
+# AppArmor の拒否ログを確認
+dmesg | grep apparmor
+```
+
+## Capabilities
+
+### 従来の UNIX 権限モデルの問題
+
+従来の UNIX では root (UID=0) が**全権限**を持っていた。
+これは「プログラムにネットワーク設定だけ変更させたいが、root にしないとできない」という状況を生み出す。
+root を与えると、ファイルシステムの変更もモジュールのロードもすべてできてしまう。
+
+capabilities はこの問題を解決するため、root の権限を**約 40 個の細かい単位**に分割する仕組みである。
+
+### 主要な capability
+
+| Capability | 権限 |
+|---|---|
+| `CAP_SYS_MODULE` | カーネルモジュールの insmod/rmmod |
+| `CAP_SYS_RAWIO` | iopl/ioperm, /dev/mem, /dev/port アクセス |
+| `CAP_NET_ADMIN` | ネットワーク設定変更 |
+| `CAP_NET_RAW` | RAW/PACKET ソケットの使用 |
+| `CAP_SYS_ADMIN` | 多くのシステム管理操作 (事実上の root) |
+| `CAP_DAC_OVERRIDE` | ファイルの DAC (パーミッション) バイパス |
+| `CAP_SYS_PTRACE` | ptrace によるプロセスデバッグ |
+| `CAP_SETUID` | UID の変更 |
+
+`CAP_SYS_ADMIN` は「何にでも使われる」capability であり、事実上の root に等しい。
+新しいドライバで特権チェックを行う場合は、可能な限り**より限定的な capability** を選ぶべきである。
+
+### ドライバでの capability チェック
+
+```c
+#include <linux/capability.h>
+
+static long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    switch (cmd) {
+    case MY_DANGEROUS_CMD:
+        /* この操作は CAP_SYS_ADMIN が必要 */
+        if (!capable(CAP_SYS_ADMIN))
+            return -EPERM;
+        /* ... 処理 ... */
+        return 0;
+
+    case MY_NET_CMD:
+        /* ネットワーク設定を変更するなら CAP_NET_ADMIN */
+        if (!capable(CAP_NET_ADMIN))
+            return -EPERM;
+        /* ... 処理 ... */
+        return 0;
+    }
+    return -ENOTTY;
+}
+```
+
+`capable()` はカーネルモジュールが「この操作を許可してよいか」を判断する標準的な方法である。
+呼び出し元のプロセスが指定された capability を持っているかチェックし、持っていなければ `false` を返す。
+
+### ns_capable: 名前空間対応
+
+コンテナ環境では、プロセスが属するユーザ名前空間内での capability を確認したい場合がある。
+`ns_capable()` はこの用途に使う。
+
+```c
+#include <linux/capability.h>
+#include <linux/cred.h>
+
+/* 特定の名前空間で capability を確認 */
+if (!ns_capable(current_user_ns(), CAP_NET_ADMIN))
+    return -EPERM;
+```
+
+`capable()` は init 名前空間での capability をチェックするのに対し、`ns_capable()` は指定した名前空間での capability をチェックする。
+コンテナ内のプロセスに限定的な特権を与えたい場合は `ns_capable()` を使う。
+
+```bash
+# プロセスの capability を確認
+getpcaps $$
+
+# 特定の capability を付与してプログラムを実行
+capsh --caps="cap_net_admin+ep" -- -c "/usr/local/bin/myapp"
+```
+
+## Landlock: ユーザ空間サンドボックス
+
+### 概要
+
+Landlock は Linux 5.13 で導入されたスタッカブル LSM である。
+他の LSM と異なり、**非特権プロセス (root でないプロセス) が自分自身のアクセスを制限できる**。
+これにより、アプリケーション自体がセキュリティサンドボックスを構築できる。
+
+### 仕組み
+
+Landlock の利用は 3 ステップで行う。
+
+1. **ルールセットを作成**: どの種類のアクセスを制限するか宣言する
+2. **ルールを追加**: 特定のパスに対して許可するアクセスを指定する
+3. **自分自身に適用**: `landlock_restrict_self()` で制限を有効化する
+
+重要な制約として:
+
+- 一度適用すると**緩和不可** (`no_new_privs` が設定される)
+- 子プロセスにも継承される
+- ルールは「許可リスト」方式 — 明示的に許可しないアクセスは拒否される
+
+### C での利用例
+
+```c
+#include <linux/landlock.h>
+#include <sys/prctl.h>
+#include <sys/syscall.h>
+
+int sandbox(void)
+{
+    int ruleset_fd, err;
+
+    struct landlock_ruleset_attr ruleset_attr = {
+        .handled_access_fs =
+            LANDLOCK_ACCESS_FS_READ_FILE |
+            LANDLOCK_ACCESS_FS_READ_DIR |
+            LANDLOCK_ACCESS_FS_WRITE_FILE,
+    };
+
+    /* ステップ 1: ルールセットを作成 */
+    ruleset_fd = syscall(SYS_landlock_create_ruleset,
+                         &ruleset_attr, sizeof(ruleset_attr), 0);
+    if (ruleset_fd < 0)
+        return -1;
+
+    /* ステップ 2: /tmp への読み書きを許可するルールを追加 */
+    int tmp_fd = open("/tmp", O_PATH | O_CLOEXEC);
+    struct landlock_path_beneath_attr path_beneath = {
+        .allowed_access =
+            LANDLOCK_ACCESS_FS_READ_FILE |
+            LANDLOCK_ACCESS_FS_WRITE_FILE,
+        .parent_fd = tmp_fd,
+    };
+    err = syscall(SYS_landlock_add_rule, ruleset_fd,
+                  LANDLOCK_RULE_PATH_BENEATH, &path_beneath, 0);
+    close(tmp_fd);
+    if (err)
+        return -1;
+
+    /* ステップ 3: 自分自身に適用 */
+    prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0);
+    err = syscall(SYS_landlock_restrict_self, ruleset_fd, 0);
+    close(ruleset_fd);
+
+    /* これ以降、/tmp への読み書き以外のファイルアクセスは拒否される */
+    return err;
+}
+```
+
+### Rust からの利用 (rust-landlock crate)
+
+`rust-landlock` crate を使うと、型安全に Landlock サンドボックスを構築できる。
+
+```rust
+use landlock::{
+    Access, AccessFs, Ruleset, RulesetAttr, RulesetCreatedAttr,
+    ABI,
+};
+
+fn sandbox() -> Result<(), Box<dyn std::error::Error>> {
+    let abi = ABI::V5;
+    let status = Ruleset::default()
+        .handle_access(AccessFs::from_all(abi))?
+        .create()?
+        .add_rule(landlock::PathBeneath::new(
+            landlock::PathFd::new("/tmp")?,
+            AccessFs::from_read(abi),
+        ))?
+        .restrict_self()?;
+    // これ以降、/tmp の読み取りのみ許可
+    // 他のパスへのアクセスはすべて拒否される
+    Ok(())
+}
+```
+
+### Landlock のバージョン (ABI)
+
+Landlock は ABI バージョンごとに機能が拡張されている。
+
+| ABI | カーネル | 追加機能 |
+|---|---|---|
+| V1 | 5.13 | ファイルシステムアクセス制御 |
+| V2 | 5.19 | ファイルリネーム/リンク |
+| V3 | 6.2 | ファイル切り詰め |
+| V4 | 6.7 | ネットワーク (TCP bind/connect) |
+| V5 | 6.10 | ioctl |
+
+アプリケーションは `landlock_create_ruleset()` に `LANDLOCK_CREATE_RULESET_VERSION` フラグを渡すことで、カーネルがサポートする ABI バージョンを取得できる。
+古いカーネルでもグレースフルに動作させるためには、ABI バージョンに応じてルールを調整する。
+
+## BPF LSM
+
+eBPF プログラムで LSM フックを**動的に**実装できる仕組みが BPF LSM である。
+従来の LSM はカーネルビルド時に組み込む必要があったが、BPF LSM は実行時にフックを追加・削除できる。
+
+```c
+SEC("lsm/file_open")
+int BPF_PROG(restrict_open, struct file *file, int ret)
+{
+    /* 前の LSM が既に拒否している場合はそのまま返す */
+    if (ret != 0)
+        return ret;
+
+    /* 特定のパスへのアクセスを拒否する例 */
+    /* (実際にはファイルパスの取得はもう少し複雑) */
+    return -EPERM;
+}
+```
+
+BPF LSM の利点:
+
+- カーネルの再ビルドが不要
+- 実行時にポリシーを動的変更可能
+- eBPF の安全性保証 (verifier) により、カーネルクラッシュを防止
+- 既存の LSM とスタック可能
+
+```bash
+# BPF LSM が有効か確認
+cat /sys/kernel/security/lsm | grep bpf
+
+# カーネルコンフィグで BPF LSM を有効にする
+scripts/config --enable BPF_LSM
+# ブートパラメータに追加: lsm=...,bpf
+```
+
+## セキュリティバグ検出ツール
+
+カーネルには強力な動的バグ検出ツール群が用意されている。
+モジュール開発者はこれらを積極的に活用すべきである。
+
+### KASAN (Kernel Address Sanitizer)
+
+KASAN はメモリ安全性のバグを実行時に検出するツールである。
+
+**検出できるバグ:**
+- Use-after-free (解放後のメモリアクセス)
+- Out-of-bounds (バッファ境界外アクセス)
+- Stack out-of-bounds
+- Global buffer overflow
+
+```bash
+# カーネルコンフィグで有効化
+scripts/config --enable KASAN
+scripts/config --enable KASAN_GENERIC
+```
+
+KASAN が有効な状態で use-after-free を起こすと、以下のようなレポートが出力される。
+
+```
+==================================================================
+BUG: KASAN: slab-use-after-free in my_module_read+0x42/0x80
+Read of size 4 at addr ffff888012345678 by task cat/1234
+
+CPU: 0 PID: 1234 Comm: cat Tainted: G    O  6.x.0
+Call Trace:
+ dump_stack_lvl+0x56/0x78
+ print_report+0xce/0x620
+ kasan_report+0xba/0xf0
+ my_module_read+0x42/0x80
+
+Allocated by task 1230:
+ kmalloc+0x5a/0x90
+ my_module_open+0x28/0x60
+
+Freed by task 1232:
+ kfree+0x42/0x80
+ my_module_release+0x18/0x30
+==================================================================
+```
+
+コンパイル時の計装により、メモリアクセスごとにシャドウメモリをチェックする。
+性能は 2-3 倍程度低下するが、開発・テスト段階では常に有効にすべきである。
+
+### KCSAN (Kernel Concurrency Sanitizer)
+
+KCSAN はデータ競合を検出するツールである。
+「ロックなしで複数のスレッドが同じメモリに同時アクセスし、少なくとも一方が書き込み」というパターンを検出する。
+
+```bash
+scripts/config --enable KCSAN
+```
+
+検出例:
+
+```
+==================================================================
+BUG: KCSAN: data-race in my_module_write / my_module_read
+
+write to 0xffff888012345678 of 4 bytes by task 1234 on cpu 0:
+ my_module_write+0x38/0x60
+
+read to 0xffff888012345678 of 4 bytes by task 1235 on cpu 1:
+ my_module_read+0x20/0x50
+==================================================================
+```
+
+意図的にロックなしでアクセスする場合は `READ_ONCE()` / `WRITE_ONCE()` を使うことで、KCSAN の警告を抑制し、コンパイラの最適化による問題も防げる。
+
+### UBSAN (Undefined Behavior Sanitizer)
+
+UBSAN は C 言語の未定義動作を検出する。
+
+**検出できるバグ:**
+- 符号付き整数オーバーフロー
+- アライメント違反
+- NULL ポインタへのメンバアクセス
+- 配列のインデックス範囲外
+
+```bash
+scripts/config --enable UBSAN
+```
+
+### KMSAN (Kernel Memory Sanitizer)
+
+KMSAN は未初期化メモリの使用を検出するツールである。
+`copy_to_user()` で構造体のパディングバイトが初期化されずにユーザ空間に漏れる、といった情報漏洩バグを発見できる。
+
+```bash
+scripts/config --enable KMSAN
+```
+
+:::caution[KMSAN の制限]
+KMSAN は Clang でのみサポートされており、GCC では使用できない。
+また、KASAN と同時に有効にすることはできない。
+:::
+
+### 有効化の推奨
+
+開発中は以下を全て有効にすることを強く推奨する。
+
+```bash
+# メモリ安全性
+scripts/config --enable KASAN --enable KASAN_GENERIC
+
+# データ競合
+scripts/config --enable KCSAN
+
+# 未定義動作
+scripts/config --enable UBSAN
+
+# デバッグ補助
+scripts/config --enable DEBUG_ATOMIC_SLEEP   # atomic コンテキストでの sleep 検出
+scripts/config --enable PROVE_LOCKING        # ロック順序の正当性検証
+scripts/config --enable LOCKDEP              # デッドロック検出
+```
+
+:::tip[CI でも有効に]
+これらのツールはローカル開発だけでなく、CI パイプラインでも有効にすべきである。
+特に KASAN と KCSAN は、テスト実行時に再現しにくいバグを捕捉するのに極めて有効である。
+:::
+
+## モジュール開発者のセキュリティチェックリスト
+
+以下は、カーネルモジュールを開発する際に必ず確認すべき項目である。
+
+### 1. ユーザ入力を信用しない
+
+`copy_from_user()` で取得したデータは**すべて検証**する。
+ポインタの値、サイズ、オフセット、フラグ — 全てが攻撃者の制御下にあると考えるべきである。
+
+```c
+static long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    struct my_request req;
+
+    if (copy_from_user(&req, (void __user *)arg, sizeof(req)))
+        return -EFAULT;
+
+    /* ユーザ入力を検証 */
+    if (req.size > MAX_ALLOWED_SIZE)
+        return -EINVAL;
+    if (req.offset > req.size)
+        return -EINVAL;
+    /* ... */
+}
+```
+
+### 2. バッファサイズを検証
+
+`ioctl` の引数サイズ、`read`/`write` の `count` パラメータを必ずチェックする。
+
+### 3. 整数オーバーフロー
+
+`size_t` の乗算でオーバーフローが起こりうる。`check_mul_overflow()` や `array_size()` を使う。
+
+```c
+/* 危険: count * size がオーバーフローする可能性 */
+buf = kmalloc(count * elem_size, GFP_KERNEL);
+
+/* 安全: オーバーフローチェック付き */
+buf = kmalloc_array(count, elem_size, GFP_KERNEL);
+```
+
+### 4. 情報漏洩を防ぐ
+
+`copy_to_user()` 前に構造体を**ゼロクリア**する。
+構造体のパディングバイトにカーネルスタックの内容が残っている可能性がある。
+
+```c
+struct my_response resp;
+
+/* 危険: パディングバイトに古いデータが残る */
+resp.field1 = value1;
+resp.field2 = value2;
+copy_to_user(user_buf, &resp, sizeof(resp));
+
+/* 安全: 全体をゼロクリアしてから値を設定 */
+memset(&resp, 0, sizeof(resp));
+resp.field1 = value1;
+resp.field2 = value2;
+copy_to_user(user_buf, &resp, sizeof(resp));
+```
+
+### 5. 権限チェック
+
+特権操作には `capable()` チェックを忘れずに入れる。
+
+### 6. TOCTOU (Time of Check, Time of Use) を避ける
+
+ユーザ空間のバッファは**1 回だけ**カーネルにコピーして、コピーした値を使う。
+ユーザ空間のメモリを何度も読むと、チェック後に攻撃者が値を変更する TOCTOU 攻撃が成立する。
+
+```c
+/* 危険: ユーザバッファを2回読む */
+if (get_user(len, &user_req->len))      /* 1回目: チェック用 */
+    return -EFAULT;
+if (len > MAX_LEN)
+    return -EINVAL;
+/* ここで攻撃者が user_req->len を MAX_LEN より大きい値に変更 */
+copy_from_user(kbuf, user_req->data, user_req->len);  /* 2回目: 使用 */
+
+/* 安全: カーネルにコピーしてからチェック */
+if (copy_from_user(&kreq, user_req, sizeof(kreq)))
+    return -EFAULT;
+if (kreq.len > MAX_LEN)
+    return -EINVAL;
+/* kreq はカーネルメモリにあるため、攻撃者が変更できない */
+```
+
+### 7. NULL ポインタ
+
+特に `ERR_PTR` のチェック忘れに注意する。
+`IS_ERR()` を使って確認する。
+
+```c
+struct resource *res = get_resource();
+
+/* 危険: res が ERR_PTR の場合、NULL チェックをすり抜ける */
+if (!res)
+    return -ENODEV;
+
+/* 安全: ERR_PTR もチェック */
+if (IS_ERR(res))
+    return PTR_ERR(res);
+```
+
+### 8. ロック順序
+
+lockdep を有効にして ABBA デッドロックを検出する。
+常に同じ順序でロックを取得する。
+
+## Rust が改善するもの
+
+Rust のカーネルモジュールでは、C で発生しやすいセキュリティバグの多くが**コンパイル時に防止**される。
+
+| セキュリティ問題 | C での対策 | Rust での対策 |
+|---|---|---|
+| Use-after-free | KASAN で実行時検出 | 所有権で**コンパイル時**防止 |
+| Buffer overflow | KASAN で実行時検出 | 境界チェックが**自動** |
+| Double free | KASAN で実行時検出 | `Drop` が**1 回だけ**呼ばれることを保証 |
+| Data race | KCSAN で実行時検出 | `Mutex<T>` でデータがロック内に |
+| 未初期化メモリ | KMSAN で実行時検出 | 初期化が**型レベルで強制** |
+| NULL deref | 実行時 oops | `Option<T>` で**コンパイル時**処理 |
+| 情報漏洩 (パディング) | 手動ゼロクリア | `#[repr(C)]` + 自動ゼロ初期化 |
+
+C の検出ツールは「バグを起こした瞬間にテストで通過したコードパスでのみ検出」という制限がある。
+Rust はこれらの問題の多くを**テストを書かなくても、コンパイル時に排除**する。
+
+### Rust が解決しないもの
+
+万能ではないことも理解しておく必要がある。
+
+- **論理バグ** — デッドロック、レースコンディション (データ競合でない種類)
+- **設計レベルの権限チェック漏れ** — `capable()` を呼ぶべき場所を忘れるのは Rust でも防げない
+- **サイドチャネル攻撃** — タイミング攻撃、Spectre/Meltdown 系の脆弱性
+- **unsafe ブロック内のバグ** — `unsafe` を使えば C と同じ問題が発生しうる
+
+## よくある罠
+
+### 1. `capable()` チェック忘れ
+
+特権操作に `capable()` チェックがないと、一般ユーザがシステム全体を危険にさらす操作を実行できてしまう。
+`ioctl` を追加したときは必ず「この操作は誰が実行してよいか」を考える。
+
+### 2. `copy_to_user` でパディングバイトを漏洩
+
+構造体をスタック上に宣言して値を埋めただけでは、パディングバイトにカーネルメモリの内容が残る。
+必ず `memset(&resp, 0, sizeof(resp))` してから値を設定する。
+
+### 3. KASAN を CI でだけ有効にする
+
+ローカル開発でも KASAN を有効にすべきである。
+CI でしか動かさないと、開発サイクルが遅くなり、バグの発見が遅れる。
+
+### 4. SELinux を Permissive にして開発
+
+開発中は面倒だからと SELinux を Permissive にすると、本番環境 (Enforcing) でドライバが動作しないことがある。
+最初から Enforcing で動作確認する習慣をつける。
+
+## 章末演習
+
+1. `capable(CAP_SYS_ADMIN)` チェック付きの `ioctl` を Ch 8 のデバイスに追加し、一般ユーザで呼び出して `EPERM` が返ることを確認せよ。
+
+2. `CONFIG_KASAN=y` + `CONFIG_KCSAN=y` でカーネルをビルドし、故意に use-after-free とデータ競合を起こすモジュールを作成して、検出レポートが出力されることを確認せよ。
+
+3. `cat /sys/kernel/security/lsm` で自分のシステムの LSM スタックを確認し、各 LSM の役割を説明せよ。
+
+4. (発展) Landlock の `rust-landlock` crate を使って、`/tmp` 以外の読み取りを禁止するサンドボックスプログラムを書け。禁止されたパスへのアクセスが `EACCES` で拒否されることを確認せよ。
+
+## 参考資料
+
+- [Linux Security Module Usage (kernel.org)](https://docs.kernel.org/admin-guide/LSM/index.html)
+- [Landlock (kernel.org)](https://docs.kernel.org/userspace-api/landlock.html)
+- [Capabilities (man7)](https://man7.org/linux/man-pages/man7/capabilities.7.html)
+- [KASAN (kernel.org)](https://docs.kernel.org/dev-tools/kasan.html)
+- [KCSAN (kernel.org)](https://docs.kernel.org/dev-tools/kcsan.html)
+- [BPF LSM (kernel.org)](https://docs.kernel.org/bpf/prog_lsm.html)
+- [rust-landlock (GitHub)](https://github.com/landlock-lsm/rust-landlock)
+- [kernel::security (rustdoc)](https://rust.docs.kernel.org/kernel/security/)

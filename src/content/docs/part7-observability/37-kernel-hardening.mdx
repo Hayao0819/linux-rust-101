@@ -1,0 +1,1247 @@
+---
+title: "カーネルの攻撃緩和メカニズム"
+description: "SMEP, SMAP, KASLR, CFI, Stack Canaries, KPTI, Spectre対策, W^X, Lockdown — ハードウェアとソフトウェアによるカーネル防御"
+---
+
+## この章で学ぶこと
+
+- SMEP/SMAP によるハードウェアレベルのメモリアクセス制御を理解する
+- KASLR / FGKASLR によるアドレス空間ランダム化の仕組みと限界を把握する
+- スタック保護 (Stack Canary) と制御フロー整合性 (CFI) の動作原理を説明できる
+- Spectre / Meltdown 系の投機実行攻撃とその緩和策を理解する
+- W^X、Kernel Lockdown、モジュール署名による多層防御を把握する
+- 代表的なカーネル exploit プリミティブとその対策を知る
+- Rust が各緩和メカニズムに対してどのような利点を持つか比較できる
+## 前提
+
+- [Ch 8](/part3-kernel-concepts/08-memory/) (メモリ管理) を完了している
+- [Ch 24](/part7-observability/24-security/) (カーネルセキュリティ) の LSM・capabilities を理解している
+- [Ch 15](/part6-rust-kernel/20-ownership-unsafe/) (所有権・unsafe) の基本を知っている
+- x86_64 アーキテクチャの基礎 (レジスタ、ページテーブル) をおおまかに理解している
+
+---
+
+Linux カーネルは攻撃者にとって最も価値の高い標的である。
+カーネル内でコード実行を達成すれば、あらゆるセキュリティ境界を突破できるからだ。
+この章では、カーネルが攻撃を緩和するために実装しているハードウェア・ソフトウェア両面のメカニズムを体系的に解説する。
+
+各メカニズムは**単独では破られうる**。
+しかし、複数のメカニズムを**多層防御 (defense in depth)** として組み合わせることで、
+攻撃の成功コストを飛躍的に引き上げる。これがカーネルハードニングの基本思想である。
+
+---
+
+## メモリアクセス制御 (ハードウェア)
+
+### SMEP (Supervisor Mode Execution Prevention)
+
+SMEP は x86 プロセッサの CR4 レジスタのビット 20 で制御されるハードウェア機能であり、
+**カーネルモード (Ring 0) でユーザ空間のページにあるコードを実行することを禁止する**。
+
+SMEP が導入される以前の典型的な攻撃手法は次のとおりだった。
+
+1. 攻撃者がユーザ空間にシェルコードを配置する
+2. カーネルの脆弱性を利用して関数ポインタを書き換える
+3. 書き換えたポインタがユーザ空間のシェルコードを指す
+4. カーネルがその関数ポインタを呼び出すと、ユーザ空間のコードがカーネル権限で実行される
+
+SMEP はこのステップ 4 を阻止する。カーネルモードでユーザ空間のページを実行しようとすると、
+CPU が即座にページフォルトを発生させる。
+
+```
++------------------------------------------------------------------+
+|                   SMEP の動作原理                                  |
++------------------------------------------------------------------+
+|                                                                   |
+|  カーネル空間 (Ring 0)            ユーザ空間 (Ring 3)              |
+|  +---------------------+        +---------------------+          |
+|  | カーネルコード       |        | ユーザコード         |          |
+|  | (実行可能)           |        | (ユーザモードでは     |          |
+|  |                     |        |  実行可能)            |          |
+|  +---------------------+        +---------------------+          |
+|                                                                   |
+|  カーネルモード実行時:                                            |
+|                                                                   |
+|    カーネル空間のコード → 実行 OK                                  |
+|    ユーザ空間のコード   → #PF (SMEP 違反)                         |
+|                                                                   |
+|  CR4 レジスタ:                                                    |
+|  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+  |
+|  |...|  bit 21 |  bit 20 |...|                                |  |
+|  |   |  SMAP   |  SMEP   |   |                                |  |
+|  +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+  |
+|                                                                   |
++------------------------------------------------------------------+
+```
+
+#### SMEP のバイパス: ROP/JOP
+
+SMEP は「ユーザ空間のコードを直接実行する」攻撃を防ぐが、
+**カーネル空間に既に存在するコード断片 (ガジェット)** を連鎖的に呼び出す
+ROP (Return-Oriented Programming) や JOP (Jump-Oriented Programming) には無力である。
+これらの攻撃ではカーネル空間のコードしか実行しないため、SMEP は発動しない。
+
+```c
+/* カーネル内に存在するガジェットの例 */
+/* gadget 1: pop rdi; ret */
+/* gadget 2: commit_creds(prepare_kernel_cred(0)) の呼び出し */
+
+/* 攻撃者はこれらのアドレスをスタック上に配置し、
+   関数からのリターン時に連鎖的に実行させる */
+```
+
+そのため、SMEP だけでは不十分であり、後述する CFI, KASLR, Stack Canary との組み合わせが不可欠である。
+
+### SMAP (Supervisor Mode Access Prevention)
+
+SMAP は CR4 レジスタのビット 21 で制御され、
+**カーネルモードでユーザ空間のページを読み書きすることを禁止する**。
+
+SMAP がない場合、カーネルの脆弱性を利用して「カーネルにユーザ空間のデータ構造を参照させる」
+攻撃が可能だった。例えば、カーネルのポインタをユーザ空間の偽構造体に向けることで、
+攻撃者が制御するデータをカーネルに処理させることができた。
+
+#### stac / clac 命令
+
+カーネルが正当にユーザ空間のメモリにアクセスする場面 (`copy_from_user` / `copy_to_user`) では、
+SMAP を一時的に無効化する必要がある。
+これには `stac` (Set AC flag) と `clac` (Clear AC flag) 命令を使う。
+
+```
++------------------------------------------------------------------+
+|                   SMAP と copy_from_user の関係                    |
++------------------------------------------------------------------+
+|                                                                   |
+|  copy_from_user(kernel_buf, user_buf, size)                      |
+|  の内部動作:                                                     |
+|                                                                   |
+|  1. アドレス検証: user_buf がユーザ空間範囲内か確認                |
+|  2. stac           ← SMAP を一時無効化 (EFLAGS.AC = 1)           |
+|  3. メモリコピー    ← ユーザ空間 → カーネル空間                   |
+|  4. clac           ← SMAP を再有効化 (EFLAGS.AC = 0)             |
+|                                                                   |
+|  タイムライン:                                                    |
+|                                                                   |
+|  ──[SMAP有効]──┤stac├──[SMAP無効]──┤clac├──[SMAP有効]──           |
+|                      ↑                                            |
+|               この区間のみ                                        |
+|           ユーザ空間アクセス可能                                   |
+|                                                                   |
++------------------------------------------------------------------+
+```
+
+SMAP の重要な原則は、`stac` と `clac` で囲むアクセス範囲を**最小限に保つ**ことである。
+カーネルコードが `copy_from_user` / `copy_to_user` 以外でユーザ空間のメモリに直接触れようとすると、
+即座にページフォルトが発生し、カーネルが検知できる。
+
+```c
+/* 正しい: copy_from_user を使う */
+char kbuf[256];
+if (copy_from_user(kbuf, ubuf, len))
+    return -EFAULT;
+
+/* 危険: ユーザ空間ポインタを直接参照 — SMAP により #PF */
+/* val = *(int __user *)user_ptr; */  /* コンパイルは通るが実行時に SMAP 違反 */
+```
+
+### SMEP / SMAP の有効化確認
+
+```bash
+# CPU が SMEP / SMAP をサポートしているか確認
+grep -o 'smep\|smap' /proc/cpuinfo | sort -u
+
+# 現在の CR4 レジスタの状態 (デバッグ用)
+# SMEP: bit 20 (0x100000), SMAP: bit 21 (0x200000)
+# カーネルが有効化していれば cpuinfo に表示される
+```
+
+---
+
+## アドレス空間ランダム化
+
+### KASLR (Kernel Address Space Layout Randomization)
+
+KASLR はカーネルのベースアドレスをブートごとにランダム化する仕組みである。
+攻撃者がカーネル内の特定の関数やデータ構造のアドレスを事前に知ることを困難にする。
+
+#### 仕組み
+
+x86_64 の KASLR は、カーネルイメージのロード先アドレスを物理メモリ上でランダムにオフセットする。
+一般的な実装では**約 9 ビットのエントロピー** (約 512 のスロット) が提供される。
+
+```
+KASLR 無効時 (固定アドレス):
+  カーネル開始: 0xffffffff81000000  ← 常に同じ
+
+KASLR 有効時 (ランダムオフセット):
+  カーネル開始: 0xffffffff81000000 + (ランダム × 0x200000)
+  スロット数: ~512
+  例: 0xffffffff83200000, 0xffffffff89a00000, ...
+```
+
+KASLR が有効であれば、攻撃者は ROP ガジェットのアドレスを特定できず、
+コード再利用攻撃の成功率が大幅に下がる。
+
+#### KASLR の限界
+
+KASLR のエントロピーは約 9 ビット (512 スロット) に過ぎない。
+これは以下の理由で問題となる。
+
+- **ブルートフォース**: 512 回の試行で当てられる可能性がある (ただし各試行でカーネルがクラッシュするため、実際には困難)
+- **情報漏洩**: カーネルポインタが 1 つ漏洩すれば、オフセット全体が判明する
+- **サイドチャネル**: キャッシュタイミング攻撃で推測可能な場合がある
+
+#### 情報漏洩ベクタ
+
+KASLR を無効化しうる情報漏洩源は多数存在する。
+
+| 漏洩源 | 説明 | 対策 |
+|---|---|---|
+| `dmesg` | カーネルログにポインタが含まれる | `dmesg_restrict=1`, `%pK` フォーマット |
+| `/proc/kallsyms` | カーネルシンボルテーブル | 非特権ユーザはアドレスが 0 表示 |
+| `/proc/modules` | モジュールのロードアドレス | `kptr_restrict=2` で制限 |
+| `/sys/kernel/debug/` | debugfs にカーネルポインタ | `debugfs=off` ブートオプション |
+| スタックトレース | oops メッセージ内のアドレス | `oops=panic` + `kptr_restrict` |
+| サイドチャネル | TLB/キャッシュタイミング | KPTI (後述) |
+
+```bash
+# kptr_restrict の設定確認
+cat /proc/sys/kernel/kptr_restrict
+# 0: 制限なし (危険)
+# 1: 非特権ユーザにはポインタを隠す
+# 2: すべてのユーザにポインタを隠す
+
+# dmesg_restrict の設定確認
+cat /proc/sys/kernel/dmesg_restrict
+# 1: 非特権ユーザは dmesg を読めない
+
+# sysctl で設定
+sysctl -w kernel.kptr_restrict=2
+sysctl -w kernel.dmesg_restrict=1
+```
+
+### FGKASLR (Function Granular KASLR)
+
+FGKASLR は KASLR を**関数単位**に拡張したものである。
+通常の KASLR がカーネル全体を 1 つのオフセットでスライドさせるのに対し、
+FGKASLR は個々の関数の配置順序をランダム化する。
+
+```
+通常の KASLR:
+  func_A  func_B  func_C  func_D    (順序は常に同じ)
+  |-------- オフセット ----------|    (全体が同じ量だけスライド)
+
+FGKASLR:
+  func_C  func_A  func_D  func_B    (順序がランダム)
+  各関数の相対位置が毎回変わる
+```
+
+FGKASLR の利点は、**1 つのカーネルポインタが漏洩しても、他の関数のアドレスが推測できない**ことである。
+ROP チェーンを構築するには複数のガジェットのアドレスが必要なため、攻撃コストが劇的に増加する。
+
+FGKASLR はカーネル 5.16 以降のオプションとして利用可能であるが、
+起動時間への影響があるため、デフォルトでは無効になっている環境が多い。
+
+---
+
+## スタック保護 (Stack Canaries)
+
+### CONFIG_STACKPROTECTOR / CONFIG_STACKPROTECTOR_STRONG
+
+スタックカナリアは、関数のリターンアドレスが上書きされたことを検出する仕組みである。
+関数のプロローグでスタック上のリターンアドレスの直前に**ランダムな値 (カナリア)** を配置し、
+エピローグでその値が変更されていないか検査する。
+
+```
++------------------------------------------------------------------+
+|              スタックカナリアの配置                                 |
++------------------------------------------------------------------+
+|                                                                   |
+|  高位アドレス                                                     |
+|  +----------------------+                                        |
+|  | 呼び出し元のフレーム   |                                        |
+|  +----------------------+                                        |
+|  | リターンアドレス       | ← 攻撃者がここを書き換えたい            |
+|  +----------------------+                                        |
+|  | saved RBP            |                                        |
+|  +----------------------+                                        |
+|  | スタックカナリア       | ← ランダムな値 (起動時に設定)           |
+|  +----------------------+                                        |
+|  | ローカル変数           |                                        |
+|  | char buf[64]         | ← バッファオーバーフローの起点            |
+|  +----------------------+                                        |
+|  低位アドレス                                                     |
+|                                                                   |
+|  攻撃の流れ:                                                     |
+|  1. buf にオーバーフローで書き込み                                  |
+|  2. カナリア値を上書きしてしまう                                    |
+|  3. リターンアドレスも書き換える                                    |
+|  4. 関数エピローグでカナリア値を検証                                |
+|  5. 不一致 → __stack_chk_fail() → カーネル panic                  |
+|                                                                   |
++------------------------------------------------------------------+
+```
+
+#### コンパイラの処理
+
+GCC / Clang は `CONFIG_STACKPROTECTOR` が有効な場合、以下のコードを自動挿入する。
+
+```asm
+; 関数プロローグ
+my_function:
+    push   rbp
+    mov    rbp, rsp
+    sub    rsp, 0x50
+    mov    rax, QWORD PTR gs:0x28    ; per-CPU カナリア値をロード
+    mov    QWORD PTR [rbp-0x8], rax  ; スタックに配置
+
+    ; ... 関数本体 ...
+
+; 関数エピローグ
+    mov    rax, QWORD PTR [rbp-0x8]  ; スタックからカナリアを読み出し
+    xor    rax, QWORD PTR gs:0x28    ; 元の値と比較
+    jne    .Lfail                     ; 不一致なら __stack_chk_fail
+    leave
+    ret
+.Lfail:
+    call   __stack_chk_fail          ; → panic / oops
+```
+
+#### CONFIG_STACKPROTECTOR vs CONFIG_STACKPROTECTOR_STRONG
+
+| オプション | 対象関数 | オーバーヘッド |
+|---|---|---|
+| `CONFIG_STACKPROTECTOR` | 文字配列を持つ関数のみ | 小さい |
+| `CONFIG_STACKPROTECTOR_STRONG` | ローカル変数のアドレスを取る関数も含む | やや大きい |
+
+`_STRONG` は `alloca` やローカル変数のポインタ渡しなど、
+より広範なスタック破壊パターンを検出する。
+現代のカーネルでは `CONFIG_STACKPROTECTOR_STRONG` を有効にすべきである。
+
+#### 制限事項
+
+スタックカナリアには以下の制限がある。
+
+- **任意アドレス書き込みには無力**: スタックを線形にオーバーフローさせる攻撃のみを検出する。カーネルの脆弱性で任意のアドレスに書き込める場合、カナリアをスキップしてリターンアドレスだけを書き換えられる
+- **カナリア値の漏洩**: 情報漏洩でカナリアの値が判明すると、攻撃者が正しい値を書き込める
+- **非スタック攻撃**: ヒープオーバーフロー、関数ポインタ上書きなどには効果がない
+
+---
+
+## 制御フロー整合性 (CFI)
+
+制御フロー整合性 (Control Flow Integrity) は、プログラムの制御フローが
+事前に定義された正当なパスから逸脱することを防ぐ仕組みである。
+
+### Clang CFI (CONFIG_CFI_CLANG)
+
+Clang CFI は間接呼び出し (関数ポインタ経由の呼び出し) の対象が**型シグネチャの一致する関数**
+であることを実行時に検証する。
+
+カーネルでは `struct file_operations` のような構造体に関数ポインタが多数含まれる。
+攻撃者がこれらのポインタを書き換えても、CFI が対象関数の型シグネチャを検証し、
+不正な呼び出しを検出する。
+
+```c
+/* file_operations の read 関数ポインタ */
+struct file_operations fops = {
+    .read = my_read,    /* ssize_t (*)(struct file *, char __user *, size_t, loff_t *) */
+    .write = my_write,
+};
+
+/* 攻撃者が fops.read を system() 等に書き換えた場合 */
+/* → CFI が型シグネチャの不一致を検出 → カーネル panic */
+```
+
+Clang CFI は以下の CFI スキームをサポートする。
+
+| スキーム | 内容 |
+|---|---|
+| `cfi-icall` | 間接呼び出し時に型チェック |
+| `cfi-vcall` | 仮想関数呼び出しの型チェック (C++ / Rust) |
+| `cfi-nvcall` | 非仮想メンバ関数の型チェック |
+| `cfi-cast` | 型キャストの検証 |
+
+カーネルでは主に `cfi-icall` が使用される。
+Android カーネルでは CFI が標準で有効化されている。
+
+```bash
+# CFI を有効にしてカーネルビルド
+scripts/config --enable CFI_CLANG
+# Clang が必須 (GCC では使用不可)
+```
+
+### Intel CET / IBT (CONFIG_X86_KERNEL_IBT)
+
+Intel CET (Control-flow Enforcement Technology) の IBT (Indirect Branch Tracking) は、
+間接ジャンプ・間接コールの着地先に `endbr64` 命令があることを強制するハードウェア機能である。
+
+```asm
+; IBT 有効時、正当な分岐先には endbr64 が必要
+valid_function:
+    endbr64              ; ← これがないと #CP (Control Protection) 例外
+    push   rbp
+    mov    rbp, rsp
+    ; ...
+
+; 攻撃者がガジェットの途中 (endbr64 がない場所) に
+; ジャンプしようとすると #CP 例外が発生する
+```
+
+IBT の利点は**ハードウェアレベル**で制御フローを保護することである。
+ソフトウェアの CFI と異なり、性能オーバーヘッドがほぼゼロである。
+
+ただし、IBT は「正当な関数エントリポイントへのジャンプ」は許可するため、
+Clang CFI のような型ベースの検証は行わない。
+IBT と Clang CFI は**相補的**な関係にある。
+
+Linux 6.2 以降で `CONFIG_X86_KERNEL_IBT` が利用可能である。
+
+### Shadow Call Stack (ARM64)
+
+Shadow Call Stack は ARM64 向けの軽量なリターンアドレス保護機構である。
+通常のスタックとは別の**シャドウスタック**にリターンアドレスのコピーを保存し、
+関数リターン時に両者を比較する。
+
+```
++------------------------------------------------------------------+
+|            Shadow Call Stack (ARM64)                               |
++------------------------------------------------------------------+
+|                                                                   |
+|  通常スタック              シャドウスタック                        |
+|  +------------------+     +------------------+                    |
+|  | ローカル変数      |     | ret addr (func_C)|                    |
+|  | ret addr (func_C)|     | ret addr (func_B)|                    |
+|  +------------------+     | ret addr (func_A)|                    |
+|  | ローカル変数      |     +------------------+                    |
+|  | ret addr (func_B)|          ↑                                  |
+|  +------------------+     x18 レジスタが指す                       |
+|  | ...              |     (攻撃者がアクセスしにくい)               |
+|  +------------------+                                             |
+|                                                                   |
+|  リターン時: 通常スタックの ret addr と                            |
+|              シャドウスタックの ret addr を比較                     |
+|              → 不一致なら改ざんを検出                              |
+|                                                                   |
++------------------------------------------------------------------+
+```
+
+Shadow Call Stack はリターンアドレスのみを保護するため、
+スタックカナリアより軽量であり、かつカナリア値の漏洩リスクがない。
+`CONFIG_SHADOW_CALL_STACK` で有効化する (ARM64 + Clang が必要)。
+
+---
+
+## Spectre / Meltdown の緩和
+
+### KPTI (Kernel Page Table Isolation) — Meltdown 対策
+
+Meltdown (CVE-2017-5754) は、投機実行中にカーネルメモリを読み取れる脆弱性である。
+KPTI はユーザモードとカーネルモードで**異なるページテーブル**を使用することで対策する。
+
+```
++------------------------------------------------------------------+
+|               KPTI によるページテーブル分離                        |
++------------------------------------------------------------------+
+|                                                                   |
+|  従来 (KPTI 無効):                                               |
+|  +-------------------------------------------------------+       |
+|  |  1 つのページテーブル                                   |       |
+|  |  +---------------------------------------------------+|       |
+|  |  | ユーザ空間マッピング   | カーネル空間マッピング      ||       |
+|  |  | (0x0000...)           | (0xffff...)               ||       |
+|  |  +---------------------------------------------------+|       |
+|  +-------------------------------------------------------+       |
+|  → ユーザモードでもカーネルのマッピングが存在                      |
+|  → 投機実行でカーネルメモリを読み取り可能 (Meltdown)               |
+|                                                                   |
+|  KPTI 有効:                                                      |
+|  ユーザモード用ページテーブル     カーネルモード用ページテーブル    |
+|  +---------------------------+  +---------------------------+     |
+|  | ユーザ空間マッピング       |  | ユーザ空間マッピング       |     |
+|  | (0x0000...)               |  | (0x0000...)               |     |
+|  |                           |  |                           |     |
+|  | カーネル空間:              |  | カーネル空間:              |     |
+|  | エントリ/トランポリンのみ  |  | 完全なカーネルマッピング   |     |
+|  | (最小限のマッピング)       |  | (すべてアクセス可能)       |     |
+|  +---------------------------+  +---------------------------+     |
+|  ↑ CR3 レジスタで切り替え ↑                                       |
+|                                                                   |
+|  ユーザ → カーネル遷移時:                                         |
+|  1. syscall / 割り込み発生                                        |
+|  2. トランポリンコードに入る                                      |
+|  3. CR3 を書き換えてカーネル用ページテーブルに切り替え              |
+|  4. 本来のカーネルコードを実行                                     |
+|                                                                   |
+|  カーネル → ユーザ遷移時:                                         |
+|  1. CR3 をユーザ用ページテーブルに戻す                             |
+|  2. iretq / sysretq でユーザモードに復帰                          |
+|                                                                   |
++------------------------------------------------------------------+
+```
+
+#### PCID による最適化
+
+KPTI はコンテキストスイッチごとに CR3 を書き換えるため、TLB フラッシュが発生し性能低下を招く。
+PCID (Process Context Identifier) は TLB エントリにプロセス ID を付与することで、
+CR3 切り替え時に TLB をフラッシュせずに済む最適化である。
+
+PCID 対応 CPU (Haswell 以降) では KPTI の性能オーバーヘッドが**約 1-5%** に抑えられる。
+PCID 非対応の古い CPU では **10-30%** の性能低下が発生する場合がある。
+
+```bash
+# KPTI の状態確認
+cat /sys/devices/system/cpu/vulnerabilities/meltdown
+# Mitigation: PTI
+
+# PCID サポート確認
+grep pcid /proc/cpuinfo
+```
+
+### Retpoline (Spectre v2 対策)
+
+Spectre v2 (CVE-2017-5715, Branch Target Injection) は、
+間接分岐の分岐予測を操作してカーネルに任意のガジェットを投機実行させる攻撃である。
+
+Retpoline は間接分岐 (`jmp *rax`, `call *rax`) を**リターンベースのトランポリン**に変換する。
+リターン命令のリターンスタックバッファ (RSB) は直接操作が困難なため、
+間接分岐の予測ミスを利用した攻撃を防ぐ。
+
+```asm
+; 通常の間接呼び出し (Spectre v2 に脆弱):
+    call   *rax       ; 分岐予測で攻撃者が選んだアドレスを投機実行
+
+; Retpoline に変換後:
+    call   .Ltarget
+.Lpause:
+    pause             ; 投機実行がここに来ても無害
+    lfence
+    jmp    .Lpause
+.Ltarget:
+    mov    [rsp], rax  ; リターンアドレスを実際のターゲットに書き換え
+    ret                ; RSB 経由でジャンプ (予測困難)
+```
+
+Retpoline はコンパイラレベルの緩和策であり、カーネルビルド時に `-mretpoline` フラグで有効化される。
+パフォーマンスオーバーヘッドは間接分岐の頻度に依存するが、一般的に**2-8%** 程度である。
+
+### マイクロコードによる緩和策
+
+Intel / AMD は Spectre 系の脆弱性に対してマイクロコードレベルの緩和策も提供している。
+
+| 機能 | 目的 | 説明 |
+|---|---|---|
+| IBRS (Indirect Branch Restricted Speculation) | Spectre v2 | 特権モード間の分岐予測を隔離 |
+| STIBP (Single Thread Indirect Branch Predictors) | Spectre v2 (SMT) | SMT 兄弟スレッド間の分岐予測を隔離 |
+| IBPB (Indirect Branch Prediction Barrier) | Spectre v2 | 分岐予測バッファをフラッシュ |
+| SSBD (Speculative Store Bypass Disable) | Spectre v4 | 投機的ストアバイパスを無効化 |
+
+### その他の投機実行攻撃の緩和策
+
+| 脆弱性 | CVE | 緩和策 |
+|---|---|---|
+| L1TF (L1 Terminal Fault) | CVE-2018-3615/20/46 | L1D フラッシュ、PTE inversion |
+| MDS (Microarchitectural Data Sampling) | CVE-2018-12126/7/30, CVE-2019-11091 | VERW によるバッファクリア |
+| TAA (TSX Asynchronous Abort) | CVE-2019-11135 | TSX 無効化、VERW |
+| MMIO Stale Data | CVE-2022-21123/5/66 | VERW、FB クリア |
+| Retbleed | CVE-2022-29900/1 | IBRS、untrained return thunks |
+| Downfall (GDS) | CVE-2022-40982 | マイクロコード更新 |
+| Inception (SRSO) | CVE-2023-20569 | safe RET |
+| RFDS (Register File Data Sampling) | CVE-2023-28746 | VERW |
+
+```bash
+# 現在の CPU の脆弱性状態と緩和策を一覧表示
+grep -r . /sys/devices/system/cpu/vulnerabilities/ 2>/dev/null
+
+# 出力例:
+# /sys/devices/system/cpu/vulnerabilities/meltdown:Mitigation: PTI
+# /sys/devices/system/cpu/vulnerabilities/spectre_v1:Mitigation: usercopy/swapgs barriers
+# /sys/devices/system/cpu/vulnerabilities/spectre_v2:Mitigation: Retpoline; IBPB; IBRS_FW
+# /sys/devices/system/cpu/vulnerabilities/l1tf:Mitigation: PTE Inversion
+```
+
+---
+
+## メモリ整合性 (W^X)
+
+### CONFIG_STRICT_KERNEL_RWX
+
+W^X (Write XOR Execute) は「メモリ領域が書き込み可能 (W) と実行可能 (X) を同時に持たない」
+という原則を強制する。これにより、攻撃者がコードを注入して実行する攻撃を困難にする。
+
+```
++------------------------------------------------------------------+
+|               W^X の原則                                          |
++------------------------------------------------------------------+
+|                                                                   |
+|  許可される組み合わせ:                                             |
+|                                                                   |
+|    R-X  → 読み取り + 実行 (コードセクション)                       |
+|    RW-  → 読み取り + 書き込み (データセクション)                    |
+|    R--  → 読み取りのみ (read-only データ)                          |
+|                                                                   |
+|  禁止される組み合わせ:                                             |
+|                                                                   |
+|    RWX  → 読み取り + 書き込み + 実行 (危険!)                       |
+|    -WX  → 書き込み + 実行 (同上)                                   |
+|                                                                   |
+|  W^X が無い場合の攻撃:                                            |
+|  1. RWX メモリ領域にシェルコードを書き込む                         |
+|  2. そのアドレスにジャンプしてコード実行                            |
+|                                                                   |
+|  W^X が有る場合:                                                  |
+|  → 書き込めるメモリは実行できない                                  |
+|  → 実行できるメモリは書き込めない                                  |
+|  → シェルコード注入が不可能                                        |
+|                                                                   |
++------------------------------------------------------------------+
+```
+
+| CONFIG オプション | 説明 |
+|---|---|
+| `CONFIG_STRICT_KERNEL_RWX` | カーネルの .text を RO+X、.rodata を RO、.data を RW に分離 |
+| `CONFIG_STRICT_MODULE_RWX` | ロードモジュールにも同じ制約を適用 |
+| `CONFIG_DEBUG_WX` | 起動時に W+X なページが存在しないかチェックし警告 |
+
+```bash
+# DEBUG_WX が検出した違反は dmesg に記録される
+dmesg | grep "W+X"
+# 正常時: "x86/mm: Checked W+X mappings: passed, no W+X pages found."
+```
+
+`CONFIG_DEBUG_WX` は開発・テスト環境で常に有効にすべきである。
+もし W+X なページが検出された場合、ドライバのバグか不適切なメモリマッピングが原因である。
+
+---
+
+## Kernel Lockdown
+
+Kernel Lockdown は、root ユーザであってもカーネルの内部を改変・閲覧する操作を制限する機能である。
+UEFI Secure Boot と連携し、ブートチェーンから実行環境までの信頼性を一貫して保証する。
+
+### 2 つのレベル
+
+| レベル | 制限 |
+|---|---|
+| `integrity` | カーネルの改変を防止。コード注入・修正を阻止 |
+| `confidentiality` | `integrity` に加え、カーネル内部データの読み取りも防止 |
+
+### Lockdown で制限される操作
+
+| 操作 | integrity | confidentiality |
+|---|---|---|
+| `kexec_load` (署名なしカーネル) | 制限 | 制限 |
+| `/dev/mem`, `/dev/kmem` | 制限 | 制限 |
+| `iopl()` / `ioperm()` (直接 I/O) | 制限 | 制限 |
+| カーネルモジュールの params (危険なもの) | 制限 | 制限 |
+| eBPF の write 系 helper | 制限 | 制限 |
+| `/proc/kcore` | 許可 | 制限 |
+| `/proc/kallsyms` (アドレス表示) | 許可 | 制限 |
+| `perf` のカーネルアドレス表示 | 許可 | 制限 |
+| `debugfs` | 許可 | 制限 |
+
+```bash
+# Lockdown の状態確認
+cat /sys/kernel/security/lockdown
+# [none] integrity confidentiality
+# [] で囲まれているのが現在の状態
+
+# カーネルコマンドラインで設定
+# GRUB_CMDLINE_LINUX に追加: lockdown=integrity
+# または: lockdown=confidentiality
+```
+
+Lockdown は UEFI Secure Boot が有効な場合に `integrity` モードが自動的に有効化される
+ディストリビューションが多い。
+
+---
+
+## モジュールセキュリティ
+
+### CONFIG_MODULE_SIG: モジュール署名
+
+カーネルモジュール署名は、ビルド時に生成した秘密鍵でモジュールに署名し、
+ロード時にカーネルが署名を検証する仕組みである。
+
+```
++------------------------------------------------------------------+
+|               モジュール署名の流れ                                  |
++------------------------------------------------------------------+
+|                                                                   |
+|  ビルド時:                                                        |
+|  1. カーネルビルド時に RSA/ECDSA 鍵ペアを生成                      |
+|  2. 公開鍵をカーネルイメージに組み込む                              |
+|  3. モジュール (.ko) をビルド後、秘密鍵で署名                      |
+|                                                                   |
+|  ロード時 (insmod / modprobe):                                    |
+|  1. カーネルがモジュールの署名を検証                                |
+|  2. 組み込まれた公開鍵で署名が正当か確認                            |
+|  3. 正当 → ロード許可 / 不正 → ロード拒否 (設定次第)              |
+|                                                                   |
++------------------------------------------------------------------+
+```
+
+| CONFIG オプション | 説明 |
+|---|---|
+| `CONFIG_MODULE_SIG` | モジュール署名の基本機能を有効化 |
+| `CONFIG_MODULE_SIG_FORCE` | 署名がないモジュールのロードを完全に拒否 |
+| `CONFIG_MODULE_SIG_SHA256` | 署名アルゴリズムに SHA-256 を使用 |
+| `CONFIG_MODULE_SIG_SHA512` | 署名アルゴリズムに SHA-512 を使用 |
+
+```bash
+# モジュール署名の状態確認
+cat /proc/sys/kernel/modules_disabled
+# 1 の場合: 新規モジュールのロードが完全に無効化されている
+
+# モジュールの署名を確認
+modinfo my_module.ko | grep sig
+# sig_id:         PKCS#7
+# signer:         Build time autogenerated kernel key
+# sig_hashalgo:   sha512
+```
+
+開発中は `CONFIG_MODULE_SIG_FORCE` を無効にし、テスト完了後に有効にするのが一般的である。
+`CONFIG_LOCK_DOWN_KERNEL_FORCE_CONFIDENTIALITY` は Lockdown の最大レベルを
+ブートオプションに関係なく強制する。
+
+---
+
+## 一般的な Exploit プリミティブ
+
+攻撃緩和メカニズムを理解するには、攻撃者が実際に使うテクニック (exploit プリミティブ) を
+知っておく必要がある。ここでは代表的なプリミティブを解説する。
+
+:::caution[教育目的]
+以下の内容は攻撃手法の理解を通じて防御を強化することを目的としている。
+実際のシステムに対する不正な攻撃は法律で禁止されている。
+:::
+
+### Heap Spray (ヒープスプレー)
+
+ヒープスプレーは、特定のサイズのオブジェクトをカーネルヒープに大量に割り当て、
+解放済みオブジェクトの跡地に攻撃者が制御するデータを配置するテクニックである。
+
+```c
+/* sendmsg を使ったヒープスプレーの概念 */
+struct msghdr msg = {};
+struct iovec iov = {
+    .iov_base = spray_data,
+    .iov_len  = TARGET_SIZE,     /* 狙うスラブキャッシュのサイズ */
+};
+msg.msg_iov     = &iov;
+msg.msg_iovlen  = 1;
+msg.msg_control = control_buf;   /* 補助データ → kmalloc で確保される */
+msg.msg_controllen = TARGET_SIZE;
+
+for (int i = 0; i < SPRAY_COUNT; i++)
+    sendmsg(sock, &msg, 0);     /* カーネルヒープに大量配置 */
+```
+
+### msg_msg の悪用
+
+`struct msg_msg` は System V メッセージキューのカーネル内表現であり、
+**可変サイズ**のカーネルオブジェクトとして攻撃者に好まれる。
+
+```c
+/* msg_msg 構造体の概要 */
+struct msg_msg {
+    struct list_head m_list;  /* リンクリスト */
+    long m_type;              /* メッセージタイプ */
+    size_t m_ts;              /* データサイズ */
+    struct msg_msgseg *next;  /* 大きいメッセージの続きセグメント */
+    void *security;           /* LSM セキュリティポインタ */
+    /* ... ここにユーザデータが続く ... */
+};
+```
+
+msg_msg が悪用される理由は以下の通りである。
+
+1. **サイズ可変**: `msgsnd()` のデータサイズで任意のスラブキャッシュに配置可能
+2. **読み書き可能**: `msgsnd()` で書き込み、`msgrcv()` で読み出し
+3. **ヘッダ操作**: ヒープ脆弱性で `m_ts` フィールドを書き換えると、境界外読み取りが可能
+
+### Cross-Cache 攻撃
+
+Linux のスラブアロケータはオブジェクトをサイズ別のキャッシュ (kmalloc-32, kmalloc-64, ...) に分類する。
+同じキャッシュ内のオブジェクトは物理的に隣接するため、
+**オーバーフローで隣接オブジェクトを破壊する攻撃**が可能である。
+
+Cross-cache 攻撃は、さらにページアロケータレベルでの再利用を悪用する。
+
+```
+スラブキャッシュ A (例: kmalloc-256)       スラブキャッシュ B (例: cred_jar)
++--------+--------+--------+            +--------+--------+--------+
+|  obj1  |  obj2  |  obj3  |            |  cred1 |  cred2 |  cred3 |
++--------+--------+--------+            +--------+--------+--------+
+      ↓ キャッシュ A のページを全て解放
++--------+--------+--------+
+|      空きページ           |  → ページアロケータに返却
++--------+--------+--------+
+      ↓ キャッシュ B がページを再取得
++--------+--------+--------+
+|  cred4 |  cred5 |  脆弱   |  → 脆弱な obj のページに cred が配置される
++--------+--------+--------+
+```
+
+### DirtyPipe (CVE-2022-0847)
+
+DirtyPipe はパイプバッファ (`struct pipe_buffer`) のフラグ操作を悪用し、
+**任意のファイルの内容を書き換える**脆弱性であった。
+
+```
+攻撃の流れ:
+1. パイプを作成し、ページキャッシュを充填
+2. splice() で対象ファイルのページをパイプに結合
+3. pipe_buffer のフラグに PIPE_BUF_FLAG_CAN_MERGE が残る (バグ)
+4. パイプへの write() がページキャッシュを直接上書き
+5. read-only ファイル (例: /etc/passwd) の内容が改変される
+```
+
+DirtyPipe は権限チェックの論理バグであり、メモリ安全性バグではない。
+そのため、**Rust でも防げない類の脆弱性**である (ただし、Rust の型システムでフラグ管理を
+より厳密にすることは可能であった)。
+
+### ROP / JOP チェーン
+
+ROP (Return-Oriented Programming) は、カーネル内の短いコード断片 (ガジェット) を
+リターンアドレスの連鎖で繋げて任意の処理を実行するテクニックである。
+
+```
+スタック上の ROP チェーン:
+
+低位アドレス
++---------------------------+
+| ガジェット1 のアドレス      |  ← RSP が指す
+| pop rdi; ret              |
++---------------------------+
+| 0x0                       |  ← rdi に 0 がロードされる
++---------------------------+
+| prepare_kernel_cred のアドレス |
++---------------------------+
+| ガジェット2 のアドレス      |
+| mov rdi, rax; ... ; ret   |
++---------------------------+
+| commit_creds のアドレス    |
++---------------------------+
+| swapgs_restore... のアドレス |  ← ユーザ空間に復帰
++---------------------------+
+高位アドレス
+
+→ prepare_kernel_cred(0) + commit_creds() で root 権限を取得
+```
+
+ROP の成功には以下が必要である。
+
+1. ガジェットのアドレスを知る (→ KASLR / FGKASLR が阻止)
+2. スタックを制御する (→ Stack Canary が検出)
+3. 間接分岐の制御 (→ CFI / IBT が阻止)
+
+### CONFIG_RANDOM_KMALLOC_CACHES (6.6+)
+
+Linux 6.6 で導入されたこの機能は、`kmalloc` のスラブキャッシュ割り当てを
+ランダム化する。同じサイズの割り当てでも、複数のキャッシュのいずれかに
+ランダムに振り分けられるため、ヒープスプレーや cross-cache 攻撃の
+予測可能性を大幅に低下させる。
+
+```bash
+# 有効化
+scripts/config --enable RANDOM_KMALLOC_CACHES
+```
+
+デフォルトでは 16 個のランダムキャッシュが作成される。
+これにより、攻撃者が特定のオブジェクトの隣に自分のデータを配置する確率が 1/16 に低下する。
+
+---
+
+## Rust による緩和効果
+
+Rust はコンパイル時の安全性保証により、多くの攻撃緩和メカニズムを
+**そもそも不要にする**か、**より根本的なレベルで同等の保護を提供する**。
+
+### 包括的比較表: C の緩和策 vs Rust の対応
+
+| 緩和メカニズム | C での仕組み | Rust の対応 | Rust の優位性 |
+|---|---|---|---|
+| **SMEP** | HW が Ring 0 でのユーザ空間コード実行を阻止 | safe Rust では raw pointer を deref 不可 → ユーザ空間アドレスへのジャンプ自体が型レベルで防止 | コード実行の前提となるポインタ書き換え自体を防ぐ |
+| **SMAP** | HW が Ring 0 でのユーザ空間メモリアクセスを阻止 | `UserSliceReader` / `UserSliceWriter` で型安全にアクセス。生ポインタの直接参照は safe Rust で不可 | API ミスユース自体をコンパイル時に防止 |
+| **KASLR** | カーネルアドレスをランダム化し攻撃者の推測を困難に | アドレス推測の前提となるメモリ破壊バグをコンパイル時に排除 | 情報漏洩があってもメモリ破壊バグがなければ exploit 不可 |
+| **Stack Canary** | リターンアドレスの改ざんを実行時に検出 | 境界チェックによりバッファオーバーフロー自体を防止 | 検出ではなく**防止** — カナリア漏洩のリスクがない |
+| **CFI (Clang)** | 間接呼び出しの型シグネチャを実行時に検証 | 型安全性によりコンパイル時に不正な呼び出しを排除。trait object の vtable は安全に管理 | 実行時コストゼロで同等の保証 |
+| **IBT (Intel CET)** | HW が不正な分岐先を検出 | Rust でも IBT の恩恵を受けるが、そもそも制御フローの逸脱原因を排除 | 相補的に利用可能 |
+| **Shadow Call Stack** | リターンアドレスの二重管理で改ざんを検出 | リターンアドレスの書き換え原因 (バッファオーバーフロー) を排除 | 根本原因の排除 |
+| **W^X** | 書き込み可能 + 実行可能なメモリを禁止 | コード注入の前提となるバッファオーバーフローを防止 | 相補的 — Rust カーネルモジュールにも W^X は適用される |
+| **Lockdown** | root でもカーネル改変を制限 | Rust でもロック対象操作は制限される — 論理レベルの制約 | Rust は Lockdown を代替しない |
+| **Module Sig** | モジュールの改ざんを暗号署名で検出 | Rust モジュールも同じ署名メカニズムを使用 | 同等 |
+| **KPTI** | 投機実行によるカーネルメモリ読み取りを防止 | Rust は Spectre/Meltdown を**緩和しない** | ハードウェア脆弱性は言語で解決不可 |
+| **Retpoline** | 投機実行の分岐先注入を防止 | 同上 | 同上 |
+
+### 攻撃プリミティブに対する Rust の効果
+
+| 攻撃プリミティブ | C でのリスク | Rust での状況 |
+|---|---|---|
+| Buffer overflow (スタック) | 高い — 配列の境界チェックなし | **排除** — `[]` アクセスは自動で境界チェック |
+| Buffer overflow (ヒープ) | 高い — `kmalloc` + 手動サイズ管理 | **排除** — `Vec`, `Box<[T]>` が境界チェック |
+| Use-after-free | 高い — `kfree` 後のポインタ使用 | **排除** — 所有権システムで借用の有効性を保証 |
+| Double free | 中 — エラーパス等でミス | **排除** — `Drop` は所有者がスコープを抜けたとき1回だけ |
+| Heap spray | 可能 — 既知サイズで大量確保 | **大幅低減** — メモリ破壊バグがなければスプレーの意味がない |
+| Cross-cache | 可能 — スラブ再利用を悪用 | **大幅低減** — UAF がなければ cross-cache は成立しない |
+| msg_msg abuse | 可能 — 可変サイズの制御可能オブジェクト | **大幅低減** — ヘッダ書き換えの前提となる脆弱性が減る |
+| ROP / JOP | 可能 — メモリ破壊で制御フロー逸脱 | **大幅低減** — 制御フロー逸脱の原因を排除 |
+| Logic bugs | 同等 — 言語で防げない | **同等** — DirtyPipe のような論理バグは Rust でも起こりうる |
+| Spectre / Meltdown | 同等 — HW 脆弱性 | **同等** — 投機実行攻撃は言語レベルで解決不可 |
+| unsafe ブロック内のバグ | N/A | **C と同等のリスク** — unsafe 内は安全性保証が外れる |
+
+### Rust が緩和しないもの
+
+Rust は万能ではない。以下の問題は Rust でも解決されない。
+
+1. **投機実行攻撃 (Spectre / Meltdown 系)**
+   - ハードウェアの微細アーキテクチャに起因する問題であり、プログラミング言語の範疇外
+   - KPTI, Retpoline, IBRS 等のハードウェア/マイクロコード緩和策が引き続き必要
+
+2. **論理バグ**
+   - 権限チェックの漏れ、TOCTOU、レースコンディション (データ競合ではない種類)
+   - DirtyPipe (CVE-2022-0847) は論理バグであり、Rust でも同種のミスは起こりうる
+
+3. **unsafe ブロック内のバグ**
+   - `unsafe` ブロック内では C と同じ種類のバグが発生しうる
+   - ただし、unsafe の使用箇所が明示的に限定されるため、**監査範囲が大幅に縮小する**
+
+4. **サイドチャネル攻撃全般**
+   - タイミング攻撃、電力解析、電磁波解析等
+   - constant-time 実装は言語レベルでは保証されない
+
+### Rust カーネルモジュールにおける型安全性の具体例
+
+```rust
+// C: copy_from_user で size を誤ると OOB 読み取り
+// Rust: UserSliceReader が型安全にアクセスを管理
+
+use kernel::uaccess::UserSliceReader;
+
+fn read_user_data(reader: &mut UserSliceReader) -> Result<u32> {
+    // read() は内部で境界チェックを行い、
+    // 残りバイト数が足りなければ EFAULT を返す
+    let value: u32 = reader.read()?;
+    Ok(value)
+}
+
+// C: 関数ポインタの型チェックはプログラマ責任
+// Rust: trait object が型安全な仮想ディスパッチを提供
+
+use kernel::file::Operations;
+
+struct MyDevice;
+
+// #[vtable] マクロにより、実装が file_operations の
+// 型シグネチャに合致することをコンパイル時に保証
+#[vtable]
+impl Operations for MyDevice {
+    fn read(/* ... */) -> Result<usize> {
+        // 型が合わなければコンパイルエラー
+        // → CFI が解決する問題をコンパイル時に排除
+        Ok(0)
+    }
+}
+```
+
+---
+
+## 実践的なセキュリティ設定
+
+### 開発・テスト環境の推奨 CONFIG
+
+以下は、カーネルモジュールの開発・テスト環境で有効にすべきセキュリティ関連の CONFIG オプションである。
+
+#### メモリアクセス制御
+
+```bash
+# SMEP/SMAP は CPU がサポートしていれば自動有効化
+# QEMU でテストする場合は CPU フラグを明示する
+# qemu-system-x86_64 -cpu host  (KVM 使用時)
+# qemu-system-x86_64 -cpu qemu64,+smep,+smap  (エミュレーション時)
+```
+
+#### アドレスランダム化
+
+```bash
+scripts/config --enable RANDOMIZE_BASE        # KASLR
+scripts/config --enable RANDOMIZE_MEMORY      # メモリレイアウトランダム化
+# FGKASLR はカーネルバージョンとアーキテクチャによる
+```
+
+#### スタック保護
+
+```bash
+scripts/config --enable STACKPROTECTOR
+scripts/config --enable STACKPROTECTOR_STRONG
+scripts/config --enable INIT_STACK_ALL_ZERO   # スタック変数のゼロ初期化
+```
+
+#### 制御フロー整合性
+
+```bash
+# Clang CFI (Clang コンパイラ必須)
+scripts/config --enable CFI_CLANG
+
+# Intel CET / IBT (対応 CPU 必須)
+scripts/config --enable X86_KERNEL_IBT
+```
+
+#### 投機実行攻撃の緩和
+
+```bash
+# これらは通常デフォルトで有効
+scripts/config --enable PAGE_TABLE_ISOLATION  # KPTI
+scripts/config --enable RETPOLINE             # Spectre v2
+```
+
+#### メモリ整合性
+
+```bash
+scripts/config --enable STRICT_KERNEL_RWX     # W^X (カーネル)
+scripts/config --enable STRICT_MODULE_RWX     # W^X (モジュール)
+scripts/config --enable DEBUG_WX              # W+X ページの検出
+```
+
+#### ヒープ保護
+
+```bash
+scripts/config --enable SLAB_FREELIST_RANDOM  # freelist のランダム化
+scripts/config --enable SLAB_FREELIST_HARDENED # freelist ポインタの難読化
+scripts/config --enable RANDOM_KMALLOC_CACHES # キャッシュ割り当てのランダム化 (6.6+)
+scripts/config --enable INIT_ON_ALLOC_DEFAULT_ON  # 確保時ゼロクリア
+scripts/config --enable INIT_ON_FREE_DEFAULT_ON   # 解放時ゼロクリア
+```
+
+#### モジュールセキュリティ
+
+```bash
+scripts/config --enable MODULE_SIG            # モジュール署名
+# 開発中は FORCE を無効にしておく
+# scripts/config --enable MODULE_SIG_FORCE    # 本番向け
+scripts/config --enable MODULE_SIG_SHA512     # 署名アルゴリズム
+```
+
+#### バグ検出ツール (再掲)
+
+```bash
+scripts/config --enable KASAN
+scripts/config --enable KASAN_GENERIC
+scripts/config --enable UBSAN
+scripts/config --enable KCSAN
+scripts/config --enable DEBUG_ATOMIC_SLEEP
+scripts/config --enable PROVE_LOCKING
+scripts/config --enable LOCKDEP
+```
+
+#### Lockdown
+
+```bash
+scripts/config --enable SECURITY_LOCKDOWN_LSM
+scripts/config --enable SECURITY_LOCKDOWN_LSM_EARLY
+# テスト時は none、本番は integrity 以上
+```
+
+### 一括設定スクリプト例
+
+```bash
+#!/bin/bash
+# hardening.sh — 開発用カーネルのセキュリティ設定
+# 使い方: カーネルソースディレクトリで実行
+
+set -e
+
+echo "=== メモリ保護 ==="
+scripts/config --enable STACKPROTECTOR_STRONG
+scripts/config --enable INIT_STACK_ALL_ZERO
+scripts/config --enable STRICT_KERNEL_RWX
+scripts/config --enable STRICT_MODULE_RWX
+scripts/config --enable DEBUG_WX
+
+echo "=== ヒープ保護 ==="
+scripts/config --enable SLAB_FREELIST_RANDOM
+scripts/config --enable SLAB_FREELIST_HARDENED
+scripts/config --enable INIT_ON_ALLOC_DEFAULT_ON
+scripts/config --enable INIT_ON_FREE_DEFAULT_ON
+
+echo "=== アドレスランダム化 ==="
+scripts/config --enable RANDOMIZE_BASE
+scripts/config --enable RANDOMIZE_MEMORY
+
+echo "=== 投機実行攻撃対策 ==="
+scripts/config --enable PAGE_TABLE_ISOLATION
+scripts/config --enable RETPOLINE
+
+echo "=== バグ検出 ==="
+scripts/config --enable KASAN
+scripts/config --enable KASAN_GENERIC
+scripts/config --enable UBSAN
+scripts/config --enable PROVE_LOCKING
+
+echo "=== モジュール署名 ==="
+scripts/config --enable MODULE_SIG
+scripts/config --enable MODULE_SIG_SHA512
+
+echo "設定完了。make olddefconfig を実行してください。"
+```
+
+### QEMU での検証
+
+セキュリティ機能のテストには QEMU が最適である。
+SMEP/SMAP を有効にした QEMU 環境は以下のように起動する。
+
+```bash
+qemu-system-x86_64 \
+    -kernel bzImage \
+    -initrd initramfs.cpio.gz \
+    -append "console=ttyS0 nokaslr" \
+    -cpu qemu64,+smep,+smap \
+    -m 2G \
+    -nographic
+
+# KASLR のテスト時は nokaslr を外す
+# -append "console=ttyS0"
+
+# KVM 使用時 (ホスト CPU の機能をパススルー)
+qemu-system-x86_64 \
+    -enable-kvm \
+    -cpu host \
+    -kernel bzImage \
+    -initrd initramfs.cpio.gz \
+    -append "console=ttyS0" \
+    -m 2G \
+    -nographic
+```
+
+---
+
+## 多層防御のまとめ
+
+各緩和メカニズムは単独では突破される可能性がある。
+しかし、組み合わせることで攻撃の成功に必要なステップ数が増加し、コストが跳ね上がる。
+
+```
++------------------------------------------------------------------+
+|                  多層防御の構造                                     |
++------------------------------------------------------------------+
+|                                                                   |
+|  攻撃者の目標: カーネルでの任意コード実行                           |
+|                                                                   |
+|  必要なステップと対応する緩和策:                                    |
+|                                                                   |
+|  1. 脆弱性の発見                                                  |
+|     └─ Rust: メモリ安全性バグをコンパイル時に排除                   |
+|     └─ KASAN/UBSAN: テスト時にバグを検出                           |
+|                                                                   |
+|  2. メモリ破壊                                                    |
+|     └─ Stack Canary: スタック破壊を検出                            |
+|     └─ SLAB_FREELIST_HARDENED: ヒープ破壊を検出                    |
+|     └─ INIT_ON_FREE: 解放後のデータを消去                          |
+|     └─ RANDOM_KMALLOC_CACHES: ヒープスプレーを困難に               |
+|                                                                   |
+|  3. カーネルアドレスの特定                                         |
+|     └─ KASLR / FGKASLR: アドレスをランダム化                       |
+|     └─ kptr_restrict: 情報漏洩を制限                               |
+|     └─ KPTI: サイドチャネルによる推測を困難に                       |
+|                                                                   |
+|  4. 制御フローの奪取                                               |
+|     └─ CFI / IBT: 不正な分岐先を阻止                               |
+|     └─ Shadow Call Stack: リターンアドレスの改ざんを検出             |
+|                                                                   |
+|  5. コード実行                                                    |
+|     └─ SMEP: ユーザ空間コードのカーネル実行を阻止                   |
+|     └─ SMAP: ユーザ空間データへの不正アクセスを阻止                 |
+|     └─ W^X: コード注入を阻止                                       |
+|                                                                   |
+|  6. 永続化・権限昇格                                               |
+|     └─ Lockdown: カーネル改変を制限                                 |
+|     └─ Module Sig: 不正モジュールのロードを阻止                     |
+|     └─ Secure Boot: ブートチェーンの改ざんを阻止                    |
+|                                                                   |
++------------------------------------------------------------------+
+```
+
+---
+
+## よくある罠
+
+### 1. KASLR に過度に依存する
+
+KASLR は約 9 ビットのエントロピーしか提供しない。
+1 つのカーネルポインタが漏洩するだけで完全に無効化される。
+KASLR は**追加の障壁**であり、唯一の防御策として頼ってはならない。
+
+### 2. 開発中に hardening を無効化する
+
+「デバッグの邪魔になるから」と hardening オプションを無効化すると、
+本番環境でのみ発現するバグを見逃す。
+特に `CONFIG_STACKPROTECTOR_STRONG` と `CONFIG_STRICT_KERNEL_RWX` は
+開発中も常に有効にすべきである。
+
+### 3. unsafe ブロックを安易に広げる
+
+Rust の安全性保証は `unsafe` ブロックの外でのみ有効である。
+`unsafe` ブロックを「コンパイルが通らないから」という理由で広げると、
+C と同じリスクを抱えることになる。
+
+### 4. Spectre 緩和の無効化
+
+`mitigations=off` カーネルパラメータは全ての投機実行攻撃緩和策を無効化する。
+パフォーマンス測定時を除き、使用すべきではない。
+
+### 5. Lockdown の confidentiality レベルの未活用
+
+`integrity` レベルだけではカーネルメモリの読み取りは防げない。
+情報漏洩を防ぐには `confidentiality` レベルが必要である。
+
+---
+
+## 章末演習
+
+1. 自分の環境で以下のコマンドを実行し、有効な緩和策を一覧にまとめよ。
+
+   ```bash
+   grep -o 'smep\|smap' /proc/cpuinfo | sort -u
+   cat /proc/sys/kernel/kptr_restrict
+   cat /proc/sys/kernel/dmesg_restrict
+   cat /sys/kernel/security/lockdown
+   ls /sys/devices/system/cpu/vulnerabilities/
+   ```
+
+2. QEMU 環境で `nokaslr` オプション付きと無しでカーネルを起動し、`/proc/kallsyms` の出力を比較せよ。KASLR が有効な場合にアドレスがどの程度変化するか観察せよ。
+
+3. `CONFIG_STACKPROTECTOR_STRONG=y` でカーネルをビルドし、以下の C モジュールをロードして `dmesg` に出力されるカナリア違反メッセージを確認せよ。
+
+   ```c
+   /* 教育目的: 意図的なスタック破壊 — 実機で行わないこと */
+   #include <linux/module.h>
+   static int __init canary_test_init(void)
+   {
+       char buf[8];
+       /* 境界外書き込みでカナリアを破壊 */
+       memset(buf, 'A', 64);
+       return 0;
+   }
+   module_init(canary_test_init);
+   MODULE_LICENSE("GPL");
+   ```
+
+4. (発展) 同等の処理を Rust カーネルモジュールで書こうとした場合、コンパイラがどのように安全性違反を報告するか確認せよ。`unsafe` を使わずに境界外アクセスが書けないことを確かめよ。
+
+5. (発展) `CONFIG_DEBUG_WX=y` でカーネルをビルドし、起動時のログに "Checked W+X mappings: passed" が表示されることを確認せよ。カスタムモジュールで意図的に W+X マッピングを作成し、警告が出るか実験せよ。
+
+---
+
+## 参考資料
+
+- [Kernel Self Protection Project (kernel.org)](https://docs.kernel.org/security/self-protection.html)
+- [SMEP / SMAP (kernel.org)](https://docs.kernel.org/arch/x86/features.html)
+- [KASLR (kernel.org)](https://docs.kernel.org/admin-guide/kernel-parameters.html) — `nokaslr` パラメータの説明
+- [CFI in the Linux kernel (kernel.org)](https://docs.kernel.org/kbuild/llvm.html)
+- [Spectre / Meltdown mitigations (kernel.org)](https://docs.kernel.org/admin-guide/hw-vuln/index.html)
+- [Kernel Lockdown (kernel.org)](https://docs.kernel.org/admin-guide/LSM/lockdown.html)
+- [Dirty Pipe (CVE-2022-0847)](https://dirtypipe.cm4all.com/)
+- [A Decade of Linux Kernel Vulnerabilities (BlackHat)](https://i.blackhat.com/briefings/asia/2024/asia-24-Lin-A-Decade-of-Linux-Kernel-Vulnerabilities.pdf)
+- [kCFI in LLVM (LLVM docs)](https://clang.llvm.org/docs/ControlFlowIntegrity.html)
+- [Intel CET specification (Intel)](https://www.intel.com/content/www/us/en/developer/articles/technical/technical-look-control-flow-enforcement-technology.html)

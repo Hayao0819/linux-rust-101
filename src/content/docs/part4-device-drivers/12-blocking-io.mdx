@@ -1,0 +1,430 @@
+---
+title: "Ch 8b. ブロッキング I/O と wait queue"
+description: wait queue, completion, poll/select サポートを理解し、実用的な文字デバイスドライバを作る
+---
+
+## この章で学ぶこと
+
+- wait queue の仕組みと使い方を理解する
+- `wait_event_interruptible` / `wake_up_interruptible` でプロセスの sleep/wake を制御する
+- `struct completion` による一回限りの待ち合わせを把握する
+- `poll` / `select` / `epoll` をドライバ側でサポートする方法を習得する
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::sync::CondVar` (wait queue ラッパー — wait, wait_interruptible, notify_one, notify_all)
+🟡 **開発中**: poll サポートの Rust API (カーネルバージョンにより変化の可能性)
+:::
+
+## 前提
+
+- [Ch 11](/part4-device-drivers/11-chardev-c/) (文字デバイスドライバ C 版) を完了している
+- [Ch 9](/part3-kernel-concepts/09-concurrency/) (同期プリミティブ) の基礎を理解している
+
+## Wait Queue
+
+### なぜブロッキングが必要か
+
+文字デバイスの `read()` を考えてみよう。ハードウェアからデータがまだ届いていない場合、ドライバにはどう応答する方法があるだろうか。
+
+| 方法 | 説明 | 問題点 |
+|---|---|---|
+| `-EAGAIN` を即座に返す | ノンブロッキング (O_NONBLOCK 時) | ユーザがビジーループで再試行する必要がある |
+| ビジーウェイト | `while (!ready) {}` | CPU を 100% 消費し、カーネルをロックする |
+| **ブロッキング** | プロセスを sleep させ、データ到着時に起こす | **正解** — CPU を他のタスクに明け渡せる |
+
+Linux カーネルでブロッキングを実現する仕組みが **wait queue** である。プロセスは wait queue 上で sleep し、条件が満たされたときに別のコンテキスト (割り込みハンドラ、別のプロセスなど) から起こされる。
+
+### wait_queue_head_t の初期化
+
+wait queue は `wait_queue_head_t` で管理される。初期化には 2 つの方法がある:
+
+```c
+/* 方法 1: 静的初期化 (グローバル変数向き) */
+static DECLARE_WAIT_QUEUE_HEAD(my_wq);
+
+/* 方法 2: 動的初期化 (構造体メンバ向き) */
+wait_queue_head_t my_wq;
+init_waitqueue_head(&my_wq);
+```
+
+内部的には spinlock + 双方向リンクリストである。sleep するプロセスはリストに自身を繋ぎ、`TASK_INTERRUPTIBLE` または `TASK_UNINTERRUPTIBLE` に状態を変更してスケジューラに CPU を返す。
+
+### wait_event / wait_event_interruptible
+
+```c
+/* condition が true になるまで sleep (シグナルで起きない) */
+wait_event(wq, condition);
+
+/* condition が true になるまで sleep (シグナルで起きる — 推奨) */
+int ret = wait_event_interruptible(wq, condition);
+/* ret == 0: 条件成立で起床 */
+/* ret == -ERESTARTSYS: シグナルで起床 */
+
+/* タイムアウト付き (jiffies 単位) */
+long remaining = wait_event_interruptible_timeout(wq, condition, timeout);
+/* remaining > 0: 条件成立、remaining == 0: タイムアウト、remaining < 0: シグナル */
+```
+
+**重要**: `wait_event_interruptible` を使うのが原則である。`wait_event` (uninterruptible) を使うとプロセスが `kill -9` でも殺せない D 状態になり、ユーザから見ると「フリーズした」ように見える。
+
+### wake_up / wake_up_interruptible
+
+```c
+/* TASK_INTERRUPTIBLE + TASK_UNINTERRUPTIBLE の両方を起こす */
+wake_up(&my_wq);
+
+/* TASK_INTERRUPTIBLE のみ起こす */
+wake_up_interruptible(&my_wq);
+```
+
+`wake_up_interruptible` は `wait_event_interruptible` と対になる。組み合わせを揃えるのが慣例である。
+
+### 完全なコード例: プロデューサー/コンシューマー型デバイス
+
+以下は、`write` でデータを書き込み、`read` でデータが届くまで sleep するデバイスドライバである。
+
+```c title="wq_dev.c"
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/miscdevice.h>
+#include <linux/uaccess.h>
+#include <linux/wait.h>
+#include <linux/mutex.h>
+
+#define BUF_SIZE 256
+
+static DECLARE_WAIT_QUEUE_HEAD(my_wq);
+static DEFINE_MUTEX(my_lock);
+static char kbuf[BUF_SIZE];
+static size_t data_len;  /* 0 = データなし */
+
+static ssize_t my_read(struct file *file, char __user *buf,
+                       size_t count, loff_t *ppos)
+{
+    /* データが書き込まれるまで sleep */
+    if (wait_event_interruptible(my_wq, data_len != 0))
+        return -ERESTARTSYS;
+
+    mutex_lock(&my_lock);
+    if (data_len == 0) {
+        /* spurious wakeup 対策 */
+        mutex_unlock(&my_lock);
+        return -EAGAIN;
+    }
+
+    if (count > data_len)
+        count = data_len;
+    if (copy_to_user(buf, kbuf, count)) {
+        mutex_unlock(&my_lock);
+        return -EFAULT;
+    }
+
+    data_len = 0;  /* データを消費 */
+    mutex_unlock(&my_lock);
+    return count;
+}
+
+static ssize_t my_write(struct file *file, const char __user *buf,
+                        size_t count, loff_t *ppos)
+{
+    if (count > BUF_SIZE)
+        count = BUF_SIZE;
+
+    mutex_lock(&my_lock);
+    if (copy_from_user(kbuf, buf, count)) {
+        mutex_unlock(&my_lock);
+        return -EFAULT;
+    }
+    data_len = count;
+    mutex_unlock(&my_lock);
+
+    wake_up_interruptible(&my_wq);
+    return count;
+}
+
+static const struct file_operations my_fops = {
+    .owner = THIS_MODULE,
+    .read  = my_read,
+    .write = my_write,
+};
+
+static struct miscdevice my_misc = {
+    .minor = MISC_DYNAMIC_MINOR,
+    .name  = "wqdev",
+    .fops  = &my_fops,
+};
+
+module_misc_device(my_misc);
+MODULE_LICENSE("GPL");
+MODULE_DESCRIPTION("Wait queue demo device");
+```
+
+テスト方法:
+
+```bash
+# 端末 A: read は sleep する
+cat /dev/wqdev
+
+# 端末 B: write でデータを書き込む → 端末 A が起きて表示
+echo "hello" > /dev/wqdev
+```
+
+### O_NONBLOCK の対応
+
+実際のドライバでは `O_NONBLOCK` フラグも考慮すべきである:
+
+```c
+static ssize_t my_read(struct file *file, char __user *buf,
+                       size_t count, loff_t *ppos)
+{
+    if (file->f_flags & O_NONBLOCK) {
+        if (data_len == 0)
+            return -EAGAIN;
+    } else {
+        if (wait_event_interruptible(my_wq, data_len != 0))
+            return -ERESTARTSYS;
+    }
+    /* ... copy_to_user ... */
+}
+```
+
+## Completion
+
+### 概要
+
+`struct completion` は wait queue の上に構築された、**一回限りの待ち合わせ**に特化した同期プリミティブである。wait queue を直接使うよりも API がシンプルで、以下の場面でよく使われる:
+
+- ファームウェアロード完了の待ち合わせ
+- ハードウェア初期化完了の通知
+- カーネルスレッド間の同期
+
+### 基本 API
+
+```c
+#include <linux/completion.h>
+
+/* 初期化 */
+static DECLARE_COMPLETION(my_comp);        /* 静的 */
+struct completion my_comp;
+init_completion(&my_comp);                 /* 動的 */
+
+/* 待つ側 */
+wait_for_completion(&my_comp);             /* uninterruptible */
+int ret = wait_for_completion_interruptible(&my_comp);  /* 推奨 */
+unsigned long left = wait_for_completion_timeout(&my_comp, msecs_to_jiffies(5000));
+/* left == 0: タイムアウト */
+
+/* 通知する側 */
+complete(&my_comp);                        /* 1 つのウェイターを起こす */
+complete_all(&my_comp);                    /* 全ウェイターを起こす */
+
+/* 再利用する場合 */
+reinit_completion(&my_comp);
+```
+
+### 使用例: ハードウェア初期化待ち
+
+```c
+static DECLARE_COMPLETION(fw_ready);
+
+static int my_probe(struct platform_device *pdev)
+{
+    /* ファームウェアロードを非同期で開始 */
+    start_firmware_load(pdev);
+
+    /* ロード完了を待つ (最大 10 秒) */
+    if (!wait_for_completion_timeout(&fw_ready, msecs_to_jiffies(10000))) {
+        dev_err(&pdev->dev, "firmware load timed out\n");
+        return -ETIMEDOUT;
+    }
+    dev_info(&pdev->dev, "firmware loaded successfully\n");
+    return 0;
+}
+
+/* 割り込みハンドラまたはコールバック内 */
+static void firmware_loaded_callback(void)
+{
+    complete(&fw_ready);
+}
+```
+
+### Wait Queue vs Completion の使い分け
+
+| 観点 | Wait Queue | Completion |
+|---|---|---|
+| 用途 | 繰り返しの条件待ち | 一回限りのイベント通知 |
+| API の複雑さ | 条件式を自分で書く | complete/wait のみ |
+| 典型的な場面 | データ到着待ち | 初期化完了、ファームウェアロード |
+| 再利用 | 常に可能 | `reinit_completion` が必要 |
+
+## poll/select/epoll サポート
+
+### なぜ必要か
+
+ユーザ空間のアプリケーションは、複数のファイルディスクリプタを同時に監視するために `poll()`, `select()`, `epoll()` を使う。これらのシステムコールが正しく動作するには、ドライバ側が `file_operations` の `.poll` メンバを実装する必要がある。
+
+### .poll の仕組み
+
+```c
+static __poll_t my_poll(struct file *file, poll_table *wait)
+{
+    __poll_t mask = 0;
+
+    /* ① poll_wait: この wait queue を poll テーブルに登録 */
+    poll_wait(file, &my_wq, wait);
+
+    /* ② 現在の状態に応じてマスクを返す */
+    if (data_len > 0)
+        mask |= EPOLLIN | EPOLLRDNORM;    /* 読み取り可能 */
+
+    mask |= EPOLLOUT | EPOLLWRNORM;        /* 常に書き込み可能 */
+
+    return mask;
+}
+```
+
+処理の流れは以下のとおりである:
+
+1. カーネルの `poll` 実装がドライバの `.poll` を呼ぶ
+2. `poll_wait()` は wait queue に「この fd を監視したい」というエントリを追加する (sleep はしない)
+3. ドライバは現在の I/O 状態をビットマスクで返す
+4. どの fd も ready でなければ、カーネルが一括して sleep する
+5. いずれかの wait queue で `wake_up` が発生すると、再度 `.poll` が呼ばれる
+
+### poll マスクの主要フラグ
+
+| フラグ | 意味 |
+|---|---|
+| `EPOLLIN \| EPOLLRDNORM` | 通常データの読み取り可能 |
+| `EPOLLOUT \| EPOLLWRNORM` | 書き込み可能 |
+| `EPOLLPRI` | 優先データ (OOB) |
+| `EPOLLERR` | エラー発生 |
+| `EPOLLHUP` | ハングアップ |
+
+### 完全なコード例
+
+先ほどの `wq_dev.c` に poll サポートを追加する:
+
+```c title="wq_dev.c (poll 追加版)"
+#include <linux/poll.h>
+
+static __poll_t my_poll(struct file *file, poll_table *wait)
+{
+    __poll_t mask = 0;
+
+    poll_wait(file, &my_wq, wait);
+
+    mutex_lock(&my_lock);
+    if (data_len > 0)
+        mask |= EPOLLIN | EPOLLRDNORM;
+    mask |= EPOLLOUT | EPOLLWRNORM;  /* 常に書き込み可能 */
+    mutex_unlock(&my_lock);
+
+    return mask;
+}
+
+static const struct file_operations my_fops = {
+    .owner = THIS_MODULE,
+    .read  = my_read,
+    .write = my_write,
+    .poll  = my_poll,
+};
+```
+
+ユーザ空間からのテスト:
+
+```c title="test_poll.c"
+#include <stdio.h>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+
+int main(void)
+{
+    int fd = open("/dev/wqdev", O_RDWR);
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+
+    printf("waiting for data...\n");
+    int ret = poll(&pfd, 1, 5000);  /* 5 秒タイムアウト */
+
+    if (ret > 0 && (pfd.revents & POLLIN)) {
+        char buf[256];
+        ssize_t n = read(fd, buf, sizeof(buf) - 1);
+        buf[n] = '\0';
+        printf("got: %s\n", buf);
+    } else if (ret == 0) {
+        printf("timeout\n");
+    }
+
+    close(fd);
+    return 0;
+}
+```
+
+## Rust 側の状況
+
+### kernel::sync::CondVar
+
+Rust for Linux には `kernel::sync::CondVar` が存在する。これは wait queue (`wait_queue_head_t`) の安全なラッパーであり、以下の API を提供する:
+
+```rust
+use kernel::sync::CondVar;
+
+// CondVar は通常 Lock の中の状態と組み合わせて使う
+// wait() は Guard を受け取り、ロックを一時解放して sleep する
+fn wait(&self, guard: &mut Guard<'_, T, B>);
+fn wait_interruptible(&self, guard: &mut Guard<'_, T, B>) -> Result;
+fn notify_one(&self);
+fn notify_all(&self);
+```
+
+C の wait queue と比較すると:
+
+| C | Rust (CondVar) |
+|---|---|
+| `wait_event_interruptible(wq, cond)` | `condvar.wait_interruptible(&mut guard)` |
+| `wake_up_interruptible(&wq)` | `condvar.notify_one()` / `condvar.notify_all()` |
+| 条件はマクロ引数として渡す | ループ内で guard 経由で条件チェック |
+
+### 実際の使用例: Binder ドライバ
+
+Android の Binder ドライバ (`drivers/android/`) は Rust で書き直されつつあり、`CondVar` を実際に使っている。プロセス間通信の応答待ちに `wait_interruptible` を使用し、応答到着時に `notify_one` で起こすパターンが典型的である。
+
+### poll サポート
+
+Rust 側の poll サポートは、`file_operations` の `.poll` に対応する `poll` メソッドを `impl FileOperations` ブロック内で定義する形になる。ただし、この API はまだ安定化途上であり、カーネルバージョンによって変化する可能性がある。
+
+## よくある罠
+
+1. **`wait_event` を使って D 状態のプロセスを作ってしまう** — 原則として `wait_event_interruptible` を使い、`-ERESTARTSYS` を返すこと。
+2. **wake_up を呼び忘れる** — データを書き込んだのに wake_up しなければ、reader は永遠に sleep する。
+3. **spurious wakeup を考慮しない** — `wait_event` マクロは内部でループしているため安全だが、手動でwait queueを操作する場合は条件再チェックが必須。
+4. **poll_wait() が sleep すると勘違いする** — `poll_wait` は wait queue への登録のみを行い、sleep しない。
+5. **poll のマスクを常に 0 で返す** — `EPOLLOUT` を返し忘れると、write 可能なのに `select` が書き込み不可と報告する。
+6. **mutex を割り込みコンテキストで使う** — `wake_up` は割り込みから呼べるが、mutex は呼べない。poll 内での lock に注意。
+
+## 章末演習
+
+1. 上記の `wq_dev.c` をビルドし、端末 2 つで read/write のブロッキング動作を確認せよ。
+
+2. `O_NONBLOCK` 対応を追加し、`-EAGAIN` が返ることを確認せよ。
+
+3. poll サポートを追加し、`test_poll.c` で動作を確認せよ。`strace` で `poll()` のシステムコール引数と戻り値を観察せよ。
+
+4. `completion` を使って「probe が完了するまで read をブロックする」仕組みを実装せよ。
+
+5. (発展) `wait_event_interruptible_timeout` を使い、3 秒以内にデータが来なければ `-ETIMEDOUT` を返す read を実装せよ。
+
+---
+
+次の章 → [Ch 13. 文字デバイスドライバ — Rust 版](/part4-device-drivers/13-chardev-rust/)
+
+## 参考資料
+
+- [Wait queues (Linux Kernel Labs)](https://linux-kernel-labs.github.io/refs/heads/master/labs/deferred_work.html)
+- [Sleeping and Waking (LDD3 Ch.6)](https://lwn.net/Kernel/LDD3/)
+- [poll and select (LDD3 Ch.6)](https://lwn.net/Kernel/LDD3/)
+- [Completion (kernel.org)](https://docs.kernel.org/scheduler/completion.html)
+- [kernel::sync::CondVar (rustdoc)](https://rust.docs.kernel.org/kernel/sync/struct.CondVar.html)
+- [Ch 11. 文字デバイスドライバ — C 版](/part4-device-drivers/11-chardev-c/) — file_operations の基本
+- [Ch 18. 割り込みハンドリング](/part5-hardware/18-irq-timer-wq/) — 割り込みコンテキストからの wake_up

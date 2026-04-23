@@ -1,0 +1,270 @@
+---
+title: "Ch 2. 開発環境の構築"
+description: 最短 30 分で Rust カーネルモジュールをビルド・実行できる環境を作る
+---
+
+## この章で学ぶこと
+
+- Linux カーネルのビルドシステム (Kconfig / Kbuild) の基本を理解する
+- Rust サポートを有効化したカーネルをビルドできる
+- virtme-ng による高速 edit-compile-test ループを確立する
+## 前提
+
+- Linux 環境 (Ubuntu 24.04 LTS 以降, Debian Trixie, Arch Linux, または WSL2)
+- 基本的なコマンドライン操作ができる
+- `git`, `make` が使える
+
+## カーネルのビルドシステム
+
+Linux カーネルのビルドは一般的なユーザランドプログラムとは大きく異なる。
+`gcc main.c -o main` のような単純なコンパイルではなく、
+数千のオプションを管理する独自のビルドシステムが存在する。
+
+### Kconfig: カーネルの設定システム
+
+Kconfig は「何をビルドするか」を決める設定システムである。
+
+```bash
+# テキストベースのメニュー UI で設定
+make menuconfig
+
+# 既定の設定を生成
+make defconfig
+
+# 現在のホストカーネルの設定をコピー
+cp /boot/config-$(uname -r) .config
+make olddefconfig
+```
+
+設定は `.config` ファイルに保存される。各設定項目は `CONFIG_` プレフィックスを持つ:
+
+```makefile
+CONFIG_RUST=y           # Rust サポートを有効化
+CONFIG_SAMPLES_RUST=y   # Rust サンプルモジュールをビルド
+CONFIG_EXPERT=y         # 上級者向けオプションを表示
+```
+
+値は 3 種類:
+
+- `=y` — カーネル本体に組み込む (built-in)
+- `=m` — ローダブルモジュールとしてビルド
+- (未設定) — ビルドしない
+
+### Kbuild: ビルドの実行エンジン
+
+Kbuild は各ディレクトリの `Makefile` を連鎖的に処理して、カーネル全体をビルドする:
+
+```makefile
+# drivers/net/phy/Makefile の例
+obj-$(CONFIG_AX88796B_RUST_PHY)  += ax88796b_rust.o
+```
+
+`obj-y` はカーネル本体に組み込み、`obj-m` はモジュールとしてビルドする。
+`$(CONFIG_...)` が `y` か `m` かで自動的に切り替わる。
+
+## 必要なツール一覧
+
+### パッケージインストール (Ubuntu/Debian)
+
+```bash
+# カーネルビルドの基本ツール
+sudo apt install build-essential flex bison bc libelf-dev libssl-dev
+
+# LLVM ツールチェーン (Rust サポートに必須)
+sudo apt install clang lld llvm libclang-dev
+
+# QEMU (仮想マシンでのテスト用)
+sudo apt install qemu-system-x86
+
+# その他
+sudo apt install pkg-config curl git
+```
+
+### Rust ツールチェーン
+
+```bash
+# rustup のインストール (まだの場合)
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+
+# カーネルが要求する Rust バージョンを確認
+# (カーネルソース内で実行)
+scripts/min-tool-version.sh rustc
+
+# 必要なコンポーネントを追加
+rustup component add rust-src rustfmt clippy
+
+# bindgen のインストール
+cargo install --locked bindgen-cli
+```
+
+> **重要:** `rust-src` コンポーネントは必須である。これがないと `core` crate が見つからずビルドが失敗する。
+
+### バージョン確認
+
+```bash
+# カーネルソース内で全ツールの互換性を一括チェック
+make LLVM=1 rustavailable
+```
+
+このコマンドが成功すれば、Rust カーネルモジュールをビルドする準備ができている。
+
+## カーネルのビルド手順
+
+### 1. ソースの取得
+
+```bash
+# 最新の安定版を shallow clone (ディスク節約)
+git clone --depth=1 https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git
+cd linux
+```
+
+> フルヒストリが必要な場合は `--depth=1` を省略する。ただし、全履歴は約 4GB になる。
+
+### 2. 設定
+
+```bash
+# デフォルト設定をベースにする
+make LLVM=1 defconfig
+
+# Rust サポートを有効化
+scripts/config --enable RUST
+scripts/config --enable SAMPLES_RUST
+scripts/config --enable SAMPLE_RUST_MINIMAL
+
+# 設定の整合性を自動修正
+make LLVM=1 olddefconfig
+
+# Rust が有効になったか確認
+grep CONFIG_RUST .config
+# CONFIG_RUST=y と表示されれば OK
+```
+
+### 3. ビルド
+
+```bash
+# 全 CPU コアを使ってビルド
+make LLVM=1 -j$(nproc)
+```
+
+初回ビルドは環境によって **15〜40 分** かかる。
+
+> **`LLVM=1` を忘れないこと。** Rust カーネルモジュールは LLVM/Clang でビルドする必要がある。GCC ではビルドできない。
+
+### 4. rust-analyzer の設定
+
+IDE でコード補完を効かせるために:
+
+```bash
+make LLVM=1 rust-analyzer
+```
+
+これにより `rust-project.json` が生成される。VSCode の rust-analyzer はこのファイルを自動的に検出する。
+
+## virtme-ng: 高速テストループ
+
+カーネルモジュールの開発で最も重要なのは **素早いフィードバックループ** である。
+QEMU を手動で設定する代わりに、virtme-ng を使えばホストのファイルシステムをそのまま使って
+カーネルを数秒で起動できる。
+
+### インストール
+
+```bash
+pip install virtme-ng
+```
+
+### 使い方
+
+```bash
+# ビルドしたカーネルで仮想マシンを起動
+vng --build
+
+# カスタムカーネルを指定して起動
+vng -k path/to/linux
+
+# 起動後、仮想マシン内で:
+insmod /path/to/module.ko
+dmesg | tail
+rmmod module
+```
+
+virtme-ng の最大の利点は、ホストのファイルシステムが自動的にマウントされるため、
+ホスト側でビルドしたモジュールを即座に仮想マシン内でテストできることである。
+
+**典型的な開発サイクル:**
+
+1. ホスト側でモジュールのコードを編集
+2. `make LLVM=1 M=samples/rust` でモジュールだけ再ビルド (数秒)
+3. virtme-ng 内で `insmod` → `dmesg` 確認
+
+## 環境構築の 4 つの経路
+
+### A. 生ホスト (推奨)
+
+最も高速で直感的。Ubuntu 24.04 以降なら上記の手順そのまま。
+
+### B. Docker
+
+```dockerfile
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y \
+    build-essential flex bison bc libelf-dev libssl-dev \
+    clang lld llvm libclang-dev pkg-config curl git \
+    qemu-system-x86
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+ENV PATH="/root/.cargo/bin:${PATH}"
+RUN rustup component add rust-src rustfmt clippy
+RUN cargo install --locked bindgen-cli
+```
+
+### C. Nix Flakes
+
+```nix
+{
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+  outputs = { nixpkgs, ... }:
+    let pkgs = nixpkgs.legacyPackages.x86_64-linux; in {
+      devShells.x86_64-linux.default = pkgs.mkShell {
+        buildInputs = with pkgs; [
+          gnumake flex bison bc elfutils openssl
+          llvmPackages.clang llvmPackages.lld llvmPackages.llvm
+          pkg-config qemu
+        ];
+      };
+    };
+}
+```
+
+### D. WSL2
+
+Windows ユーザ向け。WSL2 内で Ubuntu を使う。
+
+> **WSL2 の注意:** `/mnt/c/` 上での作業は I/O が極端に遅い。必ず WSL2 の ext4 ホームディレクトリ (`~`) で作業すること。
+
+## よくある罠
+
+1. **`make LLVM=1` を付け忘れる** — GCC でビルドされ、Rust モジュールがコンパイルされない
+2. **`rust-src` コンポーネントを忘れる** — `core` crate が見つからないエラー
+3. **bindgen のバージョン不一致** — `scripts/min-tool-version.sh bindgen` で必要バージョンを確認
+4. **`CONFIG_RUST` が menuconfig で見えない** — `CONFIG_EXPERT=y` が必要な場合がある
+5. **WSL2 の `/mnt/c/` でビルドする** — I/O 速度が 10 倍以上遅い
+
+## 章末演習
+
+1. 上記の手順に従い、`make LLVM=1 rustavailable` が成功する環境を構築せよ。
+
+2. `make LLVM=1 defconfig` の後、`.config` ファイル内の `CONFIG_RUST` 関連の行を
+   全て `grep` で抽出せよ。
+
+3. `scripts/min-tool-version.sh` を実行し、`rustc`, `bindgen`, `llvm` の
+   それぞれの最低要求バージョンを記録せよ。
+
+---
+
+次の章 → [Ch 4. 最初のカーネルモジュール — C 版](/part2-first-module/04-hello-c/)
+
+## 参考資料
+
+- [Rust Quick Start (kernel.org)](https://docs.kernel.org/rust/quick-start.html)
+- [virtme-ng (GitHub)](https://github.com/arighi/virtme-ng)
+- [Kconfig documentation](https://docs.kernel.org/kbuild/kconfig-language.html)
+- [Kbuild documentation](https://docs.kernel.org/kbuild/makefiles.html)

@@ -1,0 +1,1402 @@
+---
+title: "高度なデバッグ技法"
+description: "kdump, crash, perf, kmemleak, livepatch, fault injection, KMSAN, /proc/kcore — カーネル問題解析の上級手法"
+---
+
+## この章で学ぶこと
+
+- kdump + crash でカーネルパニック後のメモリダンプを取得・解析できる
+- カーネルライブパッチの仕組みと適用方法を理解する
+- KMSAN で未初期化メモリの使用を検出する方法を知る
+- /proc/kcore を使ったライブカーネルの解析手法を習得する
+- lockdep の上級機能で複雑なロック依存関係を検証できる
+- printk の高度な書式指定と構造化ロギングを使いこなす
+- KASAN の 3 つの動作モードの違いと使い分けを理解する
+- Rust カーネルコードのデバッグ手法を把握する
+---
+
+第 23 章ではカーネルデバッグの基礎を扱った。oops の読み方、GDB+QEMU による対話的デバッグ、
+KASAN/KCSAN/UBSAN によるバグの自動検出、ftrace/kprobe/bpftrace による動的トレーシングなどである。
+
+本章ではそれらの基礎の上に立ち、本番環境で発生したクラッシュの事後解析、
+実行中カーネルへのパッチ適用、より高度なメモリバグ検出、ロック検証の上級機能など、
+カーネル開発者が実務で直面する難易度の高い問題に対処するための技法を解説する。
+
+---
+
+## 1. kdump とクラッシュダンプ解析
+
+### 1.1 kdump の仕組み
+
+カーネルパニックが発生すると、通常のカーネルは信頼できない状態に陥る。
+メモリが破壊されている可能性があり、そのまま情報を収集することはできない。
+kdump はこの問題を **kexec** を使って解決する。
+
+```
+通常運用時:
+┌─────────────────────────────────────────────┐
+│           通常カーネル (メインメモリ)          │
+│                                             │
+│   ┌──────────┐                              │
+│   │ 予約領域  │ ← crashkernel=256M          │
+│   │ (クラッシュ│                              │
+│   │  カーネル) │                              │
+│   └──────────┘                              │
+└─────────────────────────────────────────────┘
+
+パニック発生時:
+1. 通常カーネルがパニック
+2. kexec が予約領域のクラッシュカーネルに切り替え
+3. クラッシュカーネルが起動 (メインメモリは保存される)
+4. /proc/vmcore 経由でメインメモリの内容をダンプ
+5. ダンプ完了後、再起動
+```
+
+kexec は「カーネルからカーネルへ直接ブートする」仕組みである。
+BIOS/UEFI を経由しないため高速であり、クラッシュ時にはメインメモリの内容を
+そのまま保持した状態で別のカーネルを起動できる。
+
+### 1.2 kdump のセットアップ
+
+#### カーネル設定
+
+```bash
+# クラッシュカーネルのサポートを有効化
+scripts/config --enable CRASH_DUMP
+scripts/config --enable KEXEC
+scripts/config --enable KEXEC_CORE
+scripts/config --enable PROC_VMCORE
+
+# デバッグ情報を含める (crash で解析するために必要)
+scripts/config --enable DEBUG_INFO
+scripts/config --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+
+make olddefconfig
+make -j$(nproc)
+```
+
+#### ブートパラメータ
+
+```bash
+# GRUB の設定例 (/etc/default/grub)
+GRUB_CMDLINE_LINUX="crashkernel=256M"
+```
+
+`crashkernel=256M` はメモリの先頭から 256MB をクラッシュカーネル用に予約する。
+物理メモリが大きいシステムでは `crashkernel=512M` や `crashkernel=1G-4G:256M,4G-:512M`
+のように条件付き指定も可能である。
+
+#### クラッシュカーネルのロード
+
+```bash
+# クラッシュカーネルをメモリに事前ロード
+sudo kexec -p /boot/vmlinuz-$(uname -r) \
+    --initrd=/boot/initrd.img-$(uname -r) \
+    --append="root=/dev/sda1 irqpoll nr_cpus=1 reset_devices"
+
+# ロード状態の確認
+cat /sys/kernel/kexec_crash_loaded
+# 1 = ロード済み
+```
+
+`irqpoll` は割り込みのポーリングモードを有効にする。クラッシュ後のカーネルでは
+割り込みコントローラの状態が不定であるため必要となる。
+`nr_cpus=1` はシングル CPU で起動することでクラッシュカーネル自体の安定性を高める。
+
+### 1.3 makedumpfile によるダンプの圧縮
+
+クラッシュカーネルが起動した後、`/proc/vmcore` にメインメモリの内容が ELF 形式で公開される。
+しかし、物理メモリ全体をそのまま保存するとファイルサイズが巨大になる。
+`makedumpfile` はダンプの圧縮とページフィルタリングを行う。
+
+```bash
+# クラッシュカーネル起動後に実行
+# -l: lzo 圧縮, -d 31: 全てのフィルタを適用
+makedumpfile -l -d 31 /proc/vmcore /var/crash/vmcore.$(date +%F)
+
+# -c: zlib 圧縮 (より高圧縮)
+makedumpfile -c -d 31 /proc/vmcore /var/crash/vmcore.$(date +%F)
+```
+
+`-d` オプションのビットフラグでフィルタリングするページの種類を指定する。
+
+| ビット | 値 | 除外対象 |
+|---|---|---|
+| 0 | 1 | ゼロページ |
+| 1 | 2 | キャッシュページ |
+| 2 | 4 | キャッシュのプライベートページ |
+| 3 | 8 | ユーザ空間ページ |
+| 4 | 16 | フリーページ |
+
+`-d 31` (= 1+2+4+8+16) は全種類を除外し、カーネル空間の有用なデータのみを残す。
+これにより 64GB メモリのシステムでも数百 MB 程度のダンプに圧縮できる場合がある。
+
+### 1.4 crash ユーティリティによるダンプ解析
+
+`crash` はカーネルクラッシュダンプを対話的に解析するためのツールである。
+GDB をベースに構築されており、カーネルのデータ構造を理解した専用コマンドを提供する。
+
+#### 起動
+
+```bash
+# ダンプファイルの解析
+crash /usr/lib/debug/lib/modules/$(uname -r)/vmlinux \
+      /var/crash/vmcore.2026-04-20
+
+# /proc/kcore を使ったライブシステムの解析も可能
+sudo crash /usr/lib/debug/lib/modules/$(uname -r)/vmlinux
+```
+
+#### 主要コマンド
+
+| コマンド | 用途 | 例 |
+|---|---|---|
+| `bt` | バックトレース表示 | `bt`, `bt -a` (全 CPU) |
+| `bt <PID>` | 指定プロセスのバックトレース | `bt 1234` |
+| `ps` | プロセス一覧 | `ps`, `ps -k` (カーネルスレッドのみ) |
+| `log` | カーネルログ (dmesg) | `log`, `log -T` (タイムスタンプ付き) |
+| `struct` | 構造体の中身を表示 | `struct task_struct ffff888100a5c000` |
+| `sym` | アドレス/シンボルの変換 | `sym vfs_read`, `sym ffffffff81234567` |
+| `rd` | メモリの読み出し | `rd -64 ffff888100a5c000 16` |
+| `dis` | 逆アセンブル | `dis vfs_read 20` |
+| `files` | プロセスのオープンファイル | `files 1234` |
+| `vm` | プロセスの仮想メモリマップ | `vm 1234` |
+| `dev` | デバイス情報 | `dev -d` (ディスク), `dev -i` (I/O ポート) |
+| `mod` | ロード済みモジュール | `mod`, `mod -s my_module` |
+| `kmem` | カーネルメモリ使用状況 | `kmem -s` (slab), `kmem -i` (全体) |
+| `runq` | 実行キューの状態 | `runq` |
+| `set` | コンテキストの切り替え | `set 1234` (PID 1234 をカレントに) |
+
+### 1.5 実践: クラッシュダンプの解析ウォークスルー
+
+以下では NULL ポインタ参照によるカーネルパニックを例に、
+crash を使った解析の全手順を追う。
+
+#### ステップ 1: ダンプのロードとログの確認
+
+```
+$ crash vmlinux vmcore.2026-04-20
+
+crash> log | tail -30
+[  125.678901] BUG: kernel NULL pointer dereference, address: 0000000000000010
+[  125.678905] #PF: supervisor read access in kernel mode
+[  125.678908] #PF: error_code(0x0000) - not-present page
+[  125.678912] RIP: 0010:my_buggy_driver_read+0x2a/0x80 [my_buggy_driver]
+[  125.678920] RSP: 0018:ffffc90000b3be50 EFLAGS: 00010246
+[  125.678925] RAX: 0000000000000000 RBX: ffff888100c4e000 RCX: 0000000000001000
+[  125.678930] Call Trace:
+[  125.678935]  <TASK>
+[  125.678940]  vfs_read+0x9d/0x1a0
+[  125.678945]  ksys_read+0x67/0xe0
+[  125.678950]  do_syscall_64+0x82/0x170
+[  125.678955]  entry_SYSCALL_64_after_hwframe+0x76/0x7e
+[  125.678960]  </TASK>
+[  125.678965] Kernel panic - not syncing: Fatal exception
+```
+
+ログから `my_buggy_driver_read` 関数のオフセット `+0x2a` で NULL ポインタ参照が
+発生したことが分かる。RAX が `0x0000000000000000` であり、このレジスタ経由で
+オフセット `0x10` のメモリを参照しようとして失敗している。
+
+#### ステップ 2: パニック時のバックトレース
+
+```
+crash> bt
+PID: 5678  TASK: ffff888100c4e000  CPU: 2  COMMAND: "cat"
+ #0 [ffffc90000b3bdb8] machine_kexec at ffffffff8106a8e0
+ #1 [ffffc90000b3be10] __crash_kexec at ffffffff811c5e72
+ #2 [ffffc90000b3bed8] panic at ffffffff81bc0100
+ #3 [ffffc90000b3bf58] oops_end at ffffffff81026a90
+ #4 [ffffc90000b3bf78] page_fault_oops at ffffffff81073e50
+ #5 [ffffc90000b3bfd8] exc_page_fault at ffffffff81e00abc
+ #6 [ffffc90000b3c008] asm_exc_page_fault at ffffffff82000b62
+    [exception RIP: my_buggy_driver_read+0x2a]
+    RIP: ffffffffc0001a2a  RSP: ffffc90000b3c0b8  RFLAGS: 00010246
+    RAX: 0000000000000000  RBX: ffff888100c4e000  RCX: 0000000000001000
+    RDX: 0000000000001000  RSI: 00007ffd3c5a1000  RDI: ffff888100d82400
+    RBP: ffffc90000b3c0e0   R8: 0000000000000000   R9: 0000000000000000
+    R10: 0000000000000000  R11: 0000000000000246  R12: ffff888100d82400
+    R13: 0000000000001000  R14: 0000000000000000  R15: 0000000000000000
+    CS: 0010  SS: 0018
+ #7 [ffffc90000b3c0b8] vfs_read at ffffffff8131629d
+ #8 [ffffc90000b3c108] ksys_read at ffffffff81316767
+ #9 [ffffc90000b3c148] do_syscall_64 at ffffffff81002082
+#10 [ffffc90000b3c158] entry_SYSCALL_64_after_hwframe at ffffffff82000176
+```
+
+#### ステップ 3: 問題関数の逆アセンブル
+
+```
+crash> dis my_buggy_driver_read
+0xffffffffc0001a00 <my_buggy_driver_read>:      push   %rbp
+0xffffffffc0001a01 <my_buggy_driver_read+0x1>:  mov    %rsp,%rbp
+0xffffffffc0001a04 <my_buggy_driver_read+0x4>:  push   %rbx
+0xffffffffc0001a05 <my_buggy_driver_read+0x5>:  push   %r12
+0xffffffffc0001a07 <my_buggy_driver_read+0x7>:  mov    %rdi,%r12
+0xffffffffc0001a0a <my_buggy_driver_read+0xa>:  mov    %rdx,%rbx
+0xffffffffc0001a0d <my_buggy_driver_read+0xd>:  mov    0xe8(%rdi),%rax   ; file->private_data
+0xffffffffc0001a14 <my_buggy_driver_read+0x14>: test   %rax,%rax
+0xffffffffc0001a17 <my_buggy_driver_read+0x17>: je     0xffffffffc0001a60
+0xffffffffc0001a19 <my_buggy_driver_read+0x19>: mov    (%rax),%rax       ; priv->data
+0xffffffffc0001a1c <my_buggy_driver_read+0x1c>: test   %rax,%rax
+0xffffffffc0001a1f <my_buggy_driver_read+0x1f>: je     0xffffffffc0001a60
+0xffffffffc0001a21 <my_buggy_driver_read+0x21>: mov    0x8(%rax),%rcx    ; data->buf
+0xffffffffc0001a24 <my_buggy_driver_read+0x24>: mov    (%rax),%rax       ; data->ctx  (= NULL)
+0xffffffffc0001a27 <my_buggy_driver_read+0x27>: test   %rax,%rax
+                                                ; ★ ここで NULL チェックをしていない
+0xffffffffc0001a2a <my_buggy_driver_read+0x2a>: mov    0x10(%rax),%rdx   ; ctx->len ← ★クラッシュ
+```
+
+オフセット `+0x2a` で RAX=0 に対して `0x10(%rax)` を読もうとしている。
+`data->ctx` が NULL であるにもかかわらず、NULL チェックなしに `ctx->len` を
+参照したことが原因である。
+
+#### ステップ 4: 関連するデータ構造の調査
+
+```
+crash> struct file ffff888100d82400
+struct file {
+  f_path = {
+    mnt = 0xffff888100a12300,
+    dentry = 0xffff888100b45600
+  },
+  f_inode = 0xffff888100b78900,
+  f_op = 0xffffffffc0002000 <my_buggy_fops>,
+  f_count = {
+    counter = 1
+  },
+  private_data = 0xffff888100e9a000,  ← 非 NULL、構造体が存在する
+  ...
+}
+
+crash> rd -64 0xffff888100e9a000 4
+ffff888100e9a000:  ffff888100fab000  ← priv->data
+ffff888100e9a008:  0000000000000001
+ffff888100e9a010:  0000000000000000
+ffff888100e9a018:  0000000000000000
+
+crash> rd -64 0xffff888100fab000 4
+ffff888100fab000:  0000000000000000  ← data->ctx = NULL  ★ ここが原因
+ffff888100fab008:  ffff888100fc0000  ← data->buf
+ffff888100fab010:  0000000000001000  ← data->size
+ffff888100fab018:  0000000000000000
+```
+
+`data->ctx` が NULL であることが確認できた。
+ドライバの初期化パスで `ctx` の割り当てが漏れている、
+あるいは競合状態で解放されている可能性がある。
+
+#### ステップ 5: パニック時のプロセス状態
+
+```
+crash> ps | grep ">" 
+   5678   5670   2  ffff888100c4e000  RU   0.0    2580   1024  cat
+
+crash> files 5678
+PID: 5678  TASK: ffff888100c4e000  CPU: 2  COMMAND: "cat"
+ROOT: /    CWD: /home/user
+ FD    FILE            DENTRY          INODE       TYPE  PATH
+  0  ffff888100d82000  ffff888100b45000  ...        CHR   /dev/pts/0
+  1  ffff888100d82200  ffff888100b45200  ...        CHR   /dev/pts/0
+  2  ffff888100d82400  ffff888100b45400  ...        CHR   /dev/pts/0
+  3  ffff888100d82400  ffff888100b45600  ...        CHR   /dev/my_device
+```
+
+`cat` が `/dev/my_device` を読み取り中にクラッシュしたことが確認できる。
+
+---
+
+## 2. カーネルライブパッチ
+
+### 2.1 ライブパッチとは
+
+カーネルライブパッチ (livepatch) は、**カーネルを再起動せずに**実行中のカーネルコードを
+修正する仕組みである。主にセキュリティ修正を迅速に適用するために使用される。
+
+Linux 4.0 で導入された in-tree の livepatch フレームワークは、
+Red Hat の **kpatch** と SUSE の **kGraft** の設計を統合したものである。
+
+### 2.2 動作原理: ftrace ベースの関数リダイレクト
+
+livepatch は ftrace の仕組みを利用して、対象関数の呼び出しを新しい実装にリダイレクトする。
+
+```
+修正前:
+  呼び出し元 → original_func() を実行
+
+ライブパッチ適用後:
+  呼び出し元 → ftrace フック → patched_func() にジャンプ
+               (original_func のプロローグで     (新しい実装)
+                フックを起動)
+```
+
+カーネル関数のプロローグには ftrace 用の `nop` / `call __fentry__` が挿入されている。
+livepatch はこのフックポイントを利用して、関数のエントリで新しい実装に制御を移す。
+
+### 2.3 一貫性モデル
+
+ライブパッチの適用で最も難しいのは **一貫性の保証** である。
+パッチを適用する瞬間にその関数を実行中のスレッドがあると、
+古いコードと新しいコードが混在して不整合が発生する可能性がある。
+
+Linux の livepatch は **スタックチェック** を使って安全な切り替えポイントを見つける。
+
+```
+1. パッチを登録 (まだ適用しない)
+2. 各タスクのスタックをチェック
+3. パッチ対象の関数がスタック上にないタスクを「移行済み」にマーク
+4. 全タスクが移行済みになったらパッチが完全に有効化
+5. 長時間ブロックしているタスクは、次のスケジュール時にチェック
+```
+
+移行は段階的に行われる。各タスクは安全なポイント (スケジューラに戻る時点) で
+チェックされ、パッチ対象関数がコールスタック上にないことが確認されると移行される。
+全タスクが移行するまでパッチは部分的に有効な状態となる。
+
+### 2.4 ライブパッチの実装例
+
+```c
+#include <linux/module.h>
+#include <linux/kernel.h>
+#include <linux/livepatch.h>
+
+/* 新しい関数の実装 */
+static int patched_buggy_function(int arg)
+{
+    /* 元の関数のバグを修正した版 */
+    if (arg < 0)              /* ← このチェックが欠けていたバグを修正 */
+        return -EINVAL;
+    return arg * 2;
+}
+
+/* パッチ対象の関数を定義 */
+static struct klp_func funcs[] = {
+    {
+        .old_name = "buggy_function",
+        .new_func = patched_buggy_function,
+    },
+    { }  /* 番兵 */
+};
+
+/* パッチ対象のオブジェクト (vmlinux またはモジュール名) */
+static struct klp_object objs[] = {
+    {
+        .name = NULL,       /* NULL = vmlinux (カーネル本体) */
+        .funcs = funcs,
+    },
+    { }  /* 番兵 */
+};
+
+/* パッチ定義 */
+static struct klp_patch patch = {
+    .mod = THIS_MODULE,
+    .objs = objs,
+};
+
+static int __init livepatch_init(void)
+{
+    return klp_enable_patch(&patch);
+}
+
+static void __exit livepatch_exit(void)
+{
+    /* klp_enable_patch で登録したパッチはモジュールアンロード時に自動解除 */
+}
+
+module_init(livepatch_init);
+module_exit(livepatch_exit);
+MODULE_LICENSE("GPL");
+MODULE_INFO(livepatch, "Y");
+```
+
+**注意:** `MODULE_INFO(livepatch, "Y")` はモジュールローダーにこれがライブパッチモジュール
+であることを伝えるために必須である。
+
+#### ビルドと適用
+
+```bash
+# カーネル設定
+scripts/config --enable LIVEPATCH
+
+# ライブパッチモジュールのビルド
+make -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+
+# 適用
+sudo insmod livepatch-fix.ko
+
+# 状態確認
+cat /sys/kernel/livepatch/livepatch_fix/enabled
+# 1 = 有効
+
+# 移行状態の確認
+cat /sys/kernel/livepatch/livepatch_fix/transition
+# 0 = 全タスクが移行完了, 1 = 移行中
+```
+
+### 2.5 kpatch ツールチェーン
+
+Red Hat の **kpatch** プロジェクトは、ソースパッチ (unified diff) から
+ライブパッチモジュールを自動生成するツールチェーンを提供する。
+
+```bash
+# kpatch-build: ソースパッチからライブパッチモジュールを生成
+kpatch-build -s /path/to/kernel-source fix-null-deref.patch
+
+# 生成されたモジュールを適用
+sudo kpatch load livepatch-fix-null-deref.ko
+
+# 適用状態の確認
+kpatch list
+```
+
+これにより、カーネル開発者でなくてもセキュリティパッチを迅速に適用できる。
+
+---
+
+## 3. KMSAN (Kernel Memory Sanitizer)
+
+### 3.1 検出対象
+
+KMSAN は **未初期化メモリの使用** を検出するサニタイザである。
+第 23 章で扱った KASAN (範囲外アクセスと use-after-free) とは検出対象が異なる。
+
+未初期化メモリの使用は以下のようなセキュリティ問題を引き起こす。
+
+| パターン | リスク |
+|---|---|
+| `copy_to_user()` でパディングバイトを含む構造体をコピー | カーネルメモリの情報漏洩 |
+| 未初期化変数による条件分岐 | 非決定的動作 |
+| 未初期化データのネットワーク送信 | カーネルアドレスの漏洩 → KASLR バイパス |
+
+特に **構造体のパディングバイト** が問題になりやすい。C コンパイラはアラインメントのために
+構造体にパディングを挿入するが、`memset` でゼロクリアしないと古いカーネルスタックの
+データがそのまま残り、`copy_to_user()` でユーザ空間に漏洩する。
+
+```c
+struct my_info {
+    __u8  type;       /* 1 byte */
+                      /* 3 bytes padding ← 未初期化 */
+    __u32 value;      /* 4 bytes */
+    __u8  flags;      /* 1 byte */
+                      /* 7 bytes padding ← 未初期化 */
+    __u64 timestamp;  /* 8 bytes */
+};
+
+static long my_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+    struct my_info info;
+    info.type = 1;
+    info.value = 42;
+    info.flags = 0;
+    info.timestamp = ktime_get_ns();
+    /* パディングバイトは未初期化のまま! */
+    if (copy_to_user((void __user *)arg, &info, sizeof(info)))
+        return -EFAULT;
+    return 0;
+}
+```
+
+### 3.2 有効化と制約
+
+```bash
+# Clang のみ対応 (GCC 非対応)
+scripts/config --enable KMSAN
+
+# 重要: KASAN と共存不可
+scripts/config --disable KASAN
+
+make CC=clang LLVM=1 olddefconfig
+make CC=clang LLVM=1 -j$(nproc)
+```
+
+KMSAN の制約事項を以下にまとめる。
+
+- **Clang 専用** である。GCC では利用できない
+- **KASAN と同時に有効化できない**。KASAN と KMSAN はシャドウメモリの用途が競合するためである
+- **大きなオーバーヘッド** がある。速度は 2-3 倍低下し、メモリ使用量も増加する
+- **x86_64** のみで十分にテストされている
+
+### 3.3 KMSAN の検出レポート例
+
+```
+BUG: KMSAN: uninit-value in copy_to_user
+ copy_to_user+0x7e/0xb0
+ my_ioctl+0x123/0x200 [my_module]
+ __x64_sys_ioctl+0x156/0x1c0
+ do_syscall_64+0x82/0x170
+
+Uninit was stored to memory at:
+ my_ioctl+0x45/0x200 [my_module]
+
+Local variable info created at:
+ my_ioctl+0x30/0x200 [my_module]
+
+Bytes 1-3 of 24 are uninitialized
+Memory access of size 24 starts at ffff888100123000
+```
+
+KMSAN はバイト単位で未初期化領域を特定するため、
+パディングの何バイト目が問題かまで正確に報告する。
+
+### 3.4 修正方法
+
+```c
+static long my_ioctl(struct file *f, unsigned int cmd, unsigned long arg)
+{
+    struct my_info info;
+
+    /* 修正: memset で全バイトをゼロクリア */
+    memset(&info, 0, sizeof(info));
+
+    info.type = 1;
+    info.value = 42;
+    info.flags = 0;
+    info.timestamp = ktime_get_ns();
+
+    if (copy_to_user((void __user *)arg, &info, sizeof(info)))
+        return -EFAULT;
+    return 0;
+}
+```
+
+あるいはスタック変数の宣言時に初期化子を使う方法もある。
+
+```c
+struct my_info info = {};   /* 全メンバをゼロ初期化 */
+```
+
+---
+
+## 4. /proc/kcore
+
+### 4.1 概要
+
+`/proc/kcore` はカーネルの物理メモリ全体を **ELF コアファイル形式** で公開する
+疑似ファイルである。これにより GDB でライブカーネルを解析できる。
+
+```bash
+# ファイルサイズ (仮想的に物理メモリサイズと同等)
+ls -lh /proc/kcore
+# -r-------- 1 root root 128T Apr 20 10:00 /proc/kcore
+
+# ELF ヘッダの確認
+sudo file /proc/kcore
+# /proc/kcore: ELF 64-bit LSB core file, x86-64
+```
+
+サイズが 128T と表示されるのは、仮想アドレス空間全体をカバーするためである。
+実際のデータはマップされている物理メモリ分のみ存在する。
+
+### 4.2 GDB によるライブカーネルの解析
+
+```bash
+# vmlinux (デバッグ情報付き) と /proc/kcore を使用
+sudo gdb /usr/lib/debug/lib/modules/$(uname -r)/vmlinux /proc/kcore
+```
+
+```
+(gdb) print jiffies
+$1 = 4297123456
+
+(gdb) print init_task.comm
+$2 = "swapper/0"
+
+(gdb) p/x init_task.mm
+$3 = 0x0    ← カーネルスレッドなので mm = NULL
+
+# グローバル変数の参照
+(gdb) print nr_cpu_ids
+$4 = 8
+
+# カーネルデータ構造のウォーク
+(gdb) print init_task.tasks.next
+$5 = (struct list_head *) 0xffff888100045678
+
+# 指定アドレスのメモリダンプ
+(gdb) x/16xb 0xffff888100045678
+```
+
+### 4.3 使用上の注意
+
+`/proc/kcore` は**読み取り専用**であり、カーネルメモリを変更することはできない。
+ただし以下の点に留意する必要がある。
+
+- **root 権限が必要** である。非特権ユーザからはアクセスできない
+- **KASLR 有効時**はアドレスがランダム化されているため、
+  `/proc/kallsyms` でシンボルアドレスを確認する必要がある
+- **スナップショットではない**。読み取り中にカーネルの状態が変化する可能性がある
+- **lockdown モード** (セキュアブート環境) では無効化される場合がある
+- crash ユーティリティのライブモードでも内部的に `/proc/kcore` を使用する
+
+---
+
+## 5. lockdep の上級機能
+
+### 5.1 lockdep の基本概念の復習
+
+lockdep はカーネルのロック依存関係を実行時に検証する仕組みである。
+デッドロックの可能性を **実際にデッドロックが発生する前に** 検出する。
+
+lockdep が検出できる問題は以下のとおりである。
+
+- ロック順序の逆転 (AB-BA デッドロック)
+- 再帰ロック (非再帰ロックに対する二重取得)
+- 不適切なコンテキストでのロック取得 (割り込みコンテキストで sleep 可能ロック)
+- ロック取得中の割り込み有効化 (ハードロック → ソフトロックの順序違反)
+
+### 5.2 ロッククラスとロックインスタンス
+
+lockdep の理解で最も重要な概念が **ロッククラス** と **ロックインスタンス** の区別である。
+
+```c
+struct my_device {
+    struct mutex lock;    /* 全 my_device インスタンスが同じ「クラス」 */
+    int data;
+};
+```
+
+`struct my_device` が 100 個インスタンス化されると、`lock` フィールドは 100 個の
+**異なるロックインスタンス** として存在する。しかし lockdep はこれらを全て
+**同じロッククラス** として扱う。
+
+```
+ロッククラス: "my_device.lock" (定義箇所で決まる)
+  ├── インスタンス A (デバイス 1 の lock)
+  ├── インスタンス B (デバイス 2 の lock)
+  └── インスタンス C (デバイス 3 の lock)
+```
+
+lockdep はクラス間の依存関係を追跡するため、
+インスタンス A → インスタンス B の順でロックを取得すると、
+**同じクラスのロックを入れ子に取得した** として警告を出す。
+
+正当な理由で同じクラスのロックを入れ子に取得する必要がある場合は、
+`mutex_lock_nested()` でネストレベルを指定して lockdep に伝える。
+
+```c
+/* 親デバイスと子デバイスのロックを同時に取得 */
+mutex_lock(&parent->lock);                         /* サブクラス 0 (デフォルト) */
+mutex_lock_nested(&child->lock, SINGLE_DEPTH_NESTING);  /* サブクラス 1 */
+```
+
+### 5.3 lockdep_assert_held() による文書化と検証
+
+`lockdep_assert_held()` は「この関数はこのロックを保持した状態で呼ばれるべきである」
+という意図を表明し、実行時に検証するマクロである。
+
+```c
+static void update_device_state(struct my_device *dev, int new_state)
+{
+    /* このロックを保持していなければ BUG() */
+    lockdep_assert_held(&dev->lock);
+
+    dev->state = new_state;
+    dev->last_update = jiffies;
+}
+```
+
+lockdep が有効なカーネルでは、ロックを保持せずにこの関数を呼び出すと即座に
+警告が出力される。lockdep が無効なカーネルでもソースコードの文書としての役割を果たす。
+
+関連するアサートマクロを以下に示す。
+
+| マクロ | 意味 |
+|---|---|
+| `lockdep_assert_held(&lock)` | lock を保持していること |
+| `lockdep_assert_held_write(&rwlock)` | 書き込みロックを保持していること |
+| `lockdep_assert_held_read(&rwlock)` | 読み取りロック以上を保持していること |
+| `lockdep_assert_not_held(&lock)` | lock を保持していないこと |
+| `lockdep_assert_irqs_disabled()` | 割り込みが無効であること |
+| `lockdep_assert_irqs_enabled()` | 割り込みが有効であること |
+| `lockdep_assert_in_softirq()` | ソフト割り込みコンテキストであること |
+
+### 5.4 lockdep 警告の読み方
+
+lockdep 警告は長大で複雑に見えるが、構造を理解すれば読解できる。
+以下に典型的な AB-BA デッドロック警告を解析する。
+
+```
+======================================================
+WARNING: possible circular locking dependency detected
+6.8.0-debug #1 Not tainted
+------------------------------------------------------
+thread_A/1234 is trying to acquire lock:
+ffff888100a00100 (&dev->data_lock){+.+.}-{3:3}, at: process_data+0x30/0x100
+
+but task is already holding lock:
+ffff888100b00200 (&dev->config_lock){+.+.}-{3:3}, at: update_config+0x20/0x80
+
+which lock already depends on the new lock.
+
+the existing dependency chain (in reverse order) is:
+
+-> #1 (&dev->config_lock){+.+.}-{3:3}:
+       lock_acquire+0x1a0/0x420
+       mutex_lock+0x2c/0x40
+       read_config+0x25/0x60       ← ★ ここで config_lock を取得
+       process_data+0x55/0x100     ← process_data 内で呼ばれた
+       worker_thread+0x250/0x500
+
+-> #0 (&dev->data_lock){+.+.}-{3:3}:
+       lock_acquire+0x1a0/0x420
+       mutex_lock+0x2c/0x40
+       process_data+0x30/0x100     ← ★ ここで data_lock を取得
+       update_config+0x50/0x80     ← update_config 内で呼ばれた
+       config_store+0x80/0xc0
+
+other info that might help us debug this:
+
+ Possible unsafe locking scenario:
+
+       CPU0                    CPU1
+       ----                    ----
+  lock(&dev->data_lock);
+                               lock(&dev->config_lock);
+                               lock(&dev->data_lock);      ← ★ デッドロック
+  lock(&dev->config_lock);     ← ★ デッドロック
+
+ *** DEADLOCK ***
+```
+
+#### 警告の構造
+
+| セクション | 内容 |
+|---|---|
+| 冒頭のスレッド情報 | どのスレッドが何のロックを取得しようとしているか |
+| `already holding lock` | 既に保持しているロック |
+| `dependency chain` | 過去に観測されたロック取得順序 |
+| `Possible unsafe locking scenario` | **最も重要**: 具体的なデッドロックシナリオ |
+
+#### ロック記法の読み方
+
+```
+(&dev->data_lock){+.+.}-{3:3}
+  │                │ │ │    │
+  │                │ │ │    └─ ロック種別 (3=mutex)
+  │                │ │ └── softirq コンテキストでの使用
+  │                │ └── hardirq コンテキストでの使用
+  │                └── 読み取りロックの使用パターン
+  └── ロック名
+```
+
+`+` はそのコンテキストで使用されることがある、`.` は使用されない、
+`-` は割り込み無効で使用される、を意味する。
+
+#### 修正方法
+
+上記の例では、2 つのロックの取得順序を統一する必要がある。
+`data_lock` → `config_lock` という順序に統一する場合は以下のようになる。
+
+```c
+/* 修正前 (update_config): config_lock → data_lock の順 */
+/* 修正後: data_lock → config_lock の順に統一 */
+void update_config(struct my_device *dev, struct config *cfg)
+{
+    mutex_lock(&dev->data_lock);        /* 先に data_lock */
+    mutex_lock(&dev->config_lock);      /* 次に config_lock */
+    dev->config = *cfg;
+    recalculate_data(dev);
+    mutex_unlock(&dev->config_lock);
+    mutex_unlock(&dev->data_lock);
+}
+```
+
+### 5.5 クロスロック依存関係の検証
+
+lockdep はロック間だけでなく、ロックと他の同期プリミティブ
+(wait_for_completion, flush_workqueue など) の依存関係も追跡する。
+
+```c
+/* 危険なパターン: ロック保持中に完了待ち */
+mutex_lock(&dev->lock);
+flush_work(&dev->work);         /* work ハンドラが dev->lock を取得する場合 */
+mutex_unlock(&dev->lock);       /* → デッドロック */
+```
+
+lockdep はこのパターンも検出する。`flush_work` は内部的にロック的な依存関係として
+扱われるためである。
+
+---
+
+## 6. printk と構造化ロギングの高度な技法
+
+### 6.1 printk のレート制限
+
+カーネルログが大量に出力されると、ログバッファのオーバーフローやパフォーマンス低下を引き起こす。
+レート制限マクロを使うことで、同じメッセージの繰り返し出力を抑制できる。
+
+```c
+/* printk_ratelimited: 一定時間内に一定回数まで出力 */
+if (error_condition) {
+    /* デフォルト: 5 秒間に 10 回まで */
+    printk_ratelimited(KERN_WARNING "something went wrong: %d\n", err);
+}
+
+/* dev_*_ratelimited: デバイスドライバ版 */
+dev_warn_ratelimited(&pdev->dev, "hardware error: reg=%x\n", reg);
+
+/* カスタムレート制限 */
+static DEFINE_RATELIMIT_STATE(my_ratelimit, 10 * HZ, 5);
+/* 10 秒間に 5 回まで */
+
+if (__ratelimit(&my_ratelimit))
+    pr_err("error occurred: code=%d\n", code);
+```
+
+割り込みハンドラやホットパスでは `printk_ratelimited` の使用が強く推奨される。
+レート制限なしに大量ログを出力するとシステム全体のパフォーマンスが大幅に低下する。
+
+### 6.2 printk の特殊フォーマット指定子
+
+カーネルの `printk` は標準の C `printf` にはない特殊なフォーマット指定子を持つ。
+
+| 指定子 | 出力内容 | 使用例 |
+|---|---|---|
+| `%pS` | シンボル名+オフセット | `my_func+0x10/0x80` |
+| `%ps` | シンボル名のみ | `my_func` |
+| `%pSR` | Rust のシンボル名 (デマングル) | `my_module::my_func` |
+| `%pB` | バックトレース用シンボル | `my_func+0x10/0x80 [my_module]` |
+| `%px` | ハッシュ化しないアドレス | `ffff888100123000` |
+| `%p` | ハッシュ化されたアドレス | `000000001a2b3c4d` (情報漏洩防止) |
+| `%pI4` | IPv4 アドレス | `192.168.1.1` |
+| `%pI6` | IPv6 アドレス | `2001:0db8::1` |
+| `%pM` | MAC アドレス | `00:11:22:33:44:55` |
+| `%pU` | UUID/GUID | `01020304-0506-0708-090a-0b0c0d0e0f10` |
+| `%pd` | dentry 名 | `my_file.txt` |
+| `%pD` | ファイルパス (dentry ベース) | `my_file.txt` |
+| `%pV` | va_format 構造体 | (可変引数の転送用) |
+| `%pOF` | デバイスツリーノード | `/soc/i2c@12340000/sensor@48` |
+
+**重要:** Linux 5.x 以降、`%p` はアドレスをハッシュ化して出力する (情報漏洩防止)。
+デバッグ目的で実アドレスが必要な場合は `%px` を使う。ただし `%px` をリリースコードに
+残してはならない。
+
+```c
+/* シンボル名の出力 (関数ポインタのデバッグ) */
+pr_info("callback = %pS\n", dev->callback);
+/* 出力: callback = my_callback_func+0x0/0x40 [my_module] */
+
+/* ネットワークデバッグ */
+pr_info("src=%pI4 dst=%pI4 mac=%pM\n", &saddr, &daddr, mac_addr);
+/* 出力: src=192.168.1.10 dst=10.0.0.1 mac=00:11:22:33:44:55 */
+
+/* アドレスの出力 (開発ビルドのみ) */
+pr_debug("buffer at %px, size=%zu\n", buf, size);
+```
+
+### 6.3 構造化ロギングと自動解析
+
+`/dev/kmsg` はカーネルログを構造化形式で提供する。
+`dmesg` の出力よりも多くのメタデータを含んでいる。
+
+```bash
+# /dev/kmsg の生データ
+sudo cat /dev/kmsg
+# 6,1234,567890123,-;my_driver 0000:03:00.0: probe successful
+#  SUBSYSTEM=pci
+#  DEVICE=+pci:0000:03:00.0
+```
+
+フォーマットは以下のとおりである。
+
+```
+priority,sequence,timestamp,flags;message
+ KEY=VALUE  (メタデータ)
+```
+
+`dev_*` 系のログ関数を使うと `SUBSYSTEM` と `DEVICE` メタデータが自動付加される。
+これにより systemd-journald などのログ基盤での構造化クエリが可能になる。
+
+```bash
+# journalctl でデバイス別にフィルタ
+journalctl _KERNEL_SUBSYSTEM=pci _KERNEL_DEVICE=+pci:0000:03:00.0
+
+# 優先度でフィルタ (エラー以上)
+journalctl -k -p err
+```
+
+### 6.4 printk の非同期化
+
+Linux 6.x 系では printk の非同期化が進められている。
+従来の printk は呼び出し元のコンテキストで直接コンソールに出力するため、
+割り込みコンテキストやクリティカルセクションからの呼び出しで遅延が発生していた。
+
+非同期 printk ではメッセージはリングバッファに書き込まれ、
+専用のカーネルスレッド (printk kthread) が別途コンソールに出力する。
+これにより、ホットパスでの printk のオーバーヘッドが大幅に削減される。
+
+---
+
+## 7. KASAN の動作モード
+
+第 23 章では Generic KASAN を紹介した。
+実際には KASAN には 3 つの動作モードがあり、用途に応じて使い分ける。
+
+### 7.1 Generic KASAN
+
+```bash
+scripts/config --enable KASAN
+scripts/config --enable KASAN_GENERIC
+```
+
+- **全アーキテクチャ** で利用可能
+- コンパイラ計装により**全てのメモリアクセス**にチェックを挿入する
+- 8 バイトの実メモリに対して 1 バイトのシャドウメモリを使用する
+- **最も高い検出精度** を持つが、**2-3 倍の速度低下** と **1.5-3 倍のメモリ増加** を伴う
+- 用途: 開発環境、CI パイプライン
+
+### 7.2 SW_TAGS KASAN (Software Tag-Based)
+
+```bash
+scripts/config --enable KASAN
+scripts/config --enable KASAN_SW_TAGS
+```
+
+- **ARM64 のみ** で利用可能
+- ARM64 の **TBI (Top Byte Ignore)** 機能を利用する
+- ポインタの上位バイトにタグ (ランダムな値) を埋め込み、
+  メモリ割り当て時にシャドウメモリにも同じタグを記録する
+- メモリアクセス時にポインタのタグとシャドウのタグが一致するかチェックする
+- Generic KASAN より**低いオーバーヘッド**だが、確率的な検出になる
+  (タグの衝突で見逃しが発生しうる)
+- 用途: ARM64 環境での広範なテスト
+
+### 7.3 HW_TAGS KASAN (Hardware Tag-Based)
+
+```bash
+scripts/config --enable KASAN
+scripts/config --enable KASAN_HW_TAGS
+```
+
+- **ARM64 MTE (Memory Tagging Extension)** 対応ハードウェアが必要
+- CPU がハードウェアレベルでタグチェックを行うため、
+  **ほぼゼロのオーバーヘッド** でメモリバグを検出できる
+- ソフトウェアによるチェック挿入が不要なため、コードサイズの増加もない
+- 用途: ARM64 MTE 搭載デバイスでの本番運用、広範なファジング
+
+### 7.4 モードの比較
+
+| 特性 | Generic | SW_TAGS | HW_TAGS |
+|---|---|---|---|
+| アーキテクチャ | 全て | ARM64 のみ | ARM64 MTE のみ |
+| 速度オーバーヘッド | 2-3x | 1.5-2x | ~1x |
+| メモリオーバーヘッド | 1.5-3x | 1.2-1.5x | ~1x |
+| 検出精度 | 完全 | 確率的 | 確率的 |
+| コンパイラ | GCC, Clang | Clang のみ | GCC, Clang |
+| 本番運用 | 不適 | 限定的 | 可能 |
+| use-after-free | 検出可 | 検出可 | 検出可 |
+| out-of-bounds | 検出可 | 検出可 | 検出可 |
+
+---
+
+## 8. perf によるカーネルプロファイリング (上級)
+
+第 23 章で perf の基本を紹介した。ここではカーネルモジュール開発で頻出する
+上級的な使用法を掘り下げる。
+
+### 8.1 ハードウェアパフォーマンスカウンタ
+
+```bash
+# キャッシュミス率の測定
+sudo perf stat -e cache-misses,cache-references,instructions,cycles \
+    -a sleep 5
+
+# 出力例:
+#   1,234,567  cache-misses     # 3.45% of all cache refs
+#  35,789,012  cache-references
+# 987,654,321  instructions     # 1.23 insn per cycle
+# 802,345,678  cycles
+
+# 分岐予測ミスの測定
+sudo perf stat -e branch-misses,branch-instructions \
+    insmod my_module.ko
+
+# TLB ミスの測定 (仮想メモリ関連)
+sudo perf stat -e dTLB-load-misses,dTLB-store-misses \
+    -a sleep 10
+```
+
+### 8.2 フレームグラフ
+
+フレームグラフはコールスタックの CPU 使用率を視覚的に表現する手法である。
+Brendan Gregg が開発したツールが広く使われている。
+
+```bash
+# スタックトレース付きでサンプリング
+sudo perf record -g -a --call-graph dwarf sleep 30
+
+# perf script でテキスト化
+sudo perf script > out.perf
+
+# Brendan Gregg のスクリプトでフレームグラフ生成
+git clone https://github.com/brendangregg/FlameGraph.git
+./FlameGraph/stackcollapse-perf.pl out.perf > out.folded
+./FlameGraph/flamegraph.pl out.folded > flamegraph.svg
+```
+
+フレームグラフの読み方は以下のとおりである。
+
+- **横軸**: CPU 使用率の割合 (アルファベット順にソート、時間順ではない)
+- **縦軸**: コールスタックの深さ (下が浅い、上が深い)
+- **幅の広いフレーム**: 多くの CPU 時間を消費している関数
+- **上端の幅広フレーム**: ボトルネック候補
+
+### 8.3 perf probe によるカーネル関数の動的トレース
+
+```bash
+# カーネル関数にトレースポイントを追加
+sudo perf probe --add 'vfs_read file->f_path.dentry->d_iname:string'
+
+# トレースを記録
+sudo perf record -e probe:vfs_read -a sleep 5
+
+# 結果を表示
+sudo perf script
+
+# クリーンアップ
+sudo perf probe --del vfs_read
+```
+
+### 8.4 perf による off-CPU 解析
+
+CPU 上で実行されている時間だけでなく、**CPU を待っている時間** (off-CPU) も重要である。
+I/O 待ちやロック待ちのボトルネックを特定するには off-CPU 解析が必要になる。
+
+```bash
+# スケジュールイベントの記録
+sudo perf record -e sched:sched_switch -a sleep 10
+sudo perf script
+
+# off-CPU フレームグラフの生成 (bpftrace の方がより適切)
+sudo bpftrace -e '
+tracepoint:sched:sched_switch {
+    @start[args->next_pid] = nsecs;
+}
+tracepoint:sched:sched_switch /@start[args->prev_pid]/ {
+    @offcpu[kstack, ustack, args->prev_comm] =
+        hist(nsecs - @start[args->prev_pid]);
+    delete(@start[args->prev_pid]);
+}'
+```
+
+---
+
+## 9. kmemleak: カーネルメモリリーク検出
+
+kmemleak はカーネル空間のメモリリークを検出するツールである。
+`kmalloc` / `vmalloc` で確保されたメモリのうち、
+どのポインタからも参照されていない (到達不能な) オブジェクトを報告する。
+
+### 9.1 有効化
+
+```bash
+scripts/config --enable DEBUG_KMEMLEAK
+scripts/config --set-val DEBUG_KMEMLEAK_SCAN_TIMEOUT 600
+make olddefconfig
+make -j$(nproc)
+```
+
+### 9.2 使用方法
+
+```bash
+# 手動スキャンの実行
+echo scan > /sys/kernel/debug/kmemleak
+
+# 検出結果の確認
+cat /sys/kernel/debug/kmemleak
+
+# 出力例:
+# unreferenced object 0xffff888100234000 (size 128):
+#   comm "insmod", pid 1234, jiffies 4295012345 (age 60.123s)
+#   hex dump (first 32 bytes):
+#     00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+#     00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+#   backtrace:
+#     [<ffffffff81234567>] kmalloc+0x5a/0x80
+#     [<ffffffffc0001234>] my_driver_init+0x34/0x80 [my_driver]
+#     [<ffffffff81000123>] do_one_initcall+0x56/0x2c0
+
+# 既知のリークをクリア (偽陽性の除外)
+echo clear > /sys/kernel/debug/kmemleak
+
+# 自動スキャンの無効化
+echo off > /sys/kernel/debug/kmemleak
+```
+
+バックトレースから、どの関数でメモリを確保し、どこで参照を失ったかを特定できる。
+モジュールのアンロード前にスキャンを実行すると、モジュールが解放し忘れた
+メモリを効率的に検出できる。
+
+---
+
+## 10. fault injection: 障害注入テスト
+
+### 10.1 概要
+
+実際のシステムでは `kmalloc` が失敗したり、ディスク I/O がエラーを返すことがある。
+しかし開発環境でこれらの失敗を再現するのは難しい。
+カーネルの fault injection フレームワークは、これらの失敗を**人為的に発生させる**
+仕組みを提供する。
+
+### 10.2 メモリ割り当て失敗の注入
+
+```bash
+# カーネル設定
+scripts/config --enable FAULT_INJECTION
+scripts/config --enable FAILSLAB        # slab アロケータの失敗
+scripts/config --enable FAIL_PAGE_ALLOC  # ページ割り当ての失敗
+scripts/config --enable FAIL_MAKE_REQUEST # ブロック I/O の失敗
+
+make olddefconfig
+make -j$(nproc)
+```
+
+```bash
+# kmalloc の 10% を失敗させる
+echo 10 > /sys/kernel/debug/failslab/probability
+echo 1 > /sys/kernel/debug/failslab/times  # -1 = 無制限
+echo 100 > /sys/kernel/debug/failslab/interval
+
+# 特定のプロセスにのみ適用
+echo 1 > /proc/self/make-it-fail
+```
+
+### 10.3 プログラムからの制御
+
+```c
+#include <linux/fault-inject.h>
+
+/* モジュール固有の障害注入ポイント */
+static DECLARE_FAULT_ATTR(my_fault_attr);
+
+static int __init my_module_init(void)
+{
+    /* debugfs にコントロールファイルを作成 */
+    fault_create_debugfs_attr("my_fault", NULL, &my_fault_attr);
+    return 0;
+}
+
+static int my_critical_function(void)
+{
+    /* この呼び出しが確率的に失敗をシミュレート */
+    if (should_fail(&my_fault_attr, 1))
+        return -ENOMEM;
+
+    /* 通常の処理 */
+    return 0;
+}
+```
+
+fault injection は特にエラーパスのテストに有用である。
+多くのカーネルバグはエラーハンドリングパスに存在するが、
+正常系のテストだけでは到達できない。
+
+---
+
+## 11. Rust カーネルコードのデバッグ
+
+### 11.1 Rust モジュールでの pr_info!
+
+Rust カーネルモジュールでは `kernel::prelude` が提供する `pr_info!` マクロを使用する。
+
+```rust
+use kernel::prelude::*;
+
+fn my_function(value: i32) -> Result {
+    pr_info!("my_function called with value={}\n", value);
+
+    if value < 0 {
+        pr_err!("invalid negative value: {}\n", value);
+        return Err(EINVAL);
+    }
+
+    pr_debug!("processing value={}\n", value);  // dynamic debug 対応
+    Ok(())
+}
+```
+
+Rust の `pr_info!` は内部的に C の `_printk` を FFI 経由で呼び出す。
+フォーマット文字列はコンパイル時に検証され、型安全である。
+C の `printk` で発生しがちなフォーマット文字列と引数の型不一致は Rust では起こらない。
+
+### 11.2 Rust パニックとカーネルコンテキスト
+
+カーネル内の Rust コードは `panic=abort` で動作する。
+Rust のパニック (配列の境界外アクセス、`unwrap()` の失敗など) が発生すると
+カーネルパニックに直結する。
+
+```rust
+fn dangerous_function(data: &[u8], index: usize) -> u8 {
+    // index が範囲外の場合、Rust のパニックが発生
+    // → カーネルパニック
+    data[index]
+}
+```
+
+カーネルモジュールでは以下の方針を守る。
+
+- `unwrap()` を使わず `?` 演算子でエラーを伝播する
+- 配列アクセスには `.get()` を使い、`None` の場合のハンドリングを行う
+- `panic!()` マクロを直接呼び出さない
+
+```rust
+fn safe_function(data: &[u8], index: usize) -> Result<u8> {
+    // 安全: 範囲外なら Err を返す
+    data.get(index).copied().ok_or(EINVAL)
+}
+```
+
+### 11.3 GDB による Rust カーネルモジュールのデバッグ
+
+Rust カーネルモジュールも C モジュールと同様に GDB でデバッグできる。
+DWARF デバッグ情報が Rust のシンボル名を含むため、Rust のマングル名で
+ブレークポイントを設定する。
+
+```bash
+# QEMU + GDB での接続後
+(gdb) lx-symbols
+
+# Rust シンボル名でブレークポイント
+(gdb) break rust_my_module::my_function
+Breakpoint 1 at 0xffffffffc0002000: file my_module/src/lib.rs, line 42.
+
+(gdb) continue
+
+# ブレークポイントで停止
+(gdb) print value
+$1 = 42
+
+# Rust の構造体を表示
+(gdb) print *self
+$2 = MyDevice {
+    data: Vec<u8> { len: 128, cap: 256, ... },
+    state: Running,
+}
+
+# ステップ実行
+(gdb) next
+```
+
+Rust のシンボル名はマングルされるため、`info functions` で正確な名前を確認する
+のが確実である。
+
+```bash
+(gdb) info functions my_module
+# All functions matching regular expression "my_module":
+# 0xffffffffc0002000  rust_my_module::my_function
+# 0xffffffffc0002080  rust_my_module::init::{{closure}}
+```
+
+### 11.4 KASAN と Rust unsafe ブロック
+
+Rust の安全なコードでは KASAN が検出するような use-after-free や
+バッファオーバーフローは型システムにより防止される。
+しかし `unsafe` ブロック内のコードはこの保護を受けない。
+
+```rust
+unsafe fn raw_pointer_access(ptr: *mut u8, offset: usize) {
+    // unsafe: KASAN がバッファオーバーフローを検出する
+    let val = ptr.add(offset).read();
+    pr_info!("read value: {}\n", val);
+}
+```
+
+KASAN は Rust の `unsafe` ブロック内のメモリアクセスも通常の C コードと
+同様に計装する。Rust カーネルモジュールを開発する際は、
+`unsafe` ブロックを含むコードを `CONFIG_KASAN=y` でテストすることが特に重要である。
+
+Rust の型システムが保証する範囲と KASAN の検出範囲を組み合わせることで、
+より堅牢なカーネルモジュールを実現できる。
+
+| 検出手段 | safe Rust | unsafe Rust | C |
+|---|---|---|---|
+| コンパイル時型チェック | 検出 | 一部のみ | なし |
+| KASAN (実行時) | 不要 (型安全) | 検出 | 検出 |
+| KMSAN (未初期化) | 不要 (初期化保証) | 検出 | 検出 |
+| UBSAN (未定義動作) | 不要 (UB なし) | 一部検出 | 検出 |
+
+---
+
+## よくある罠
+
+1. **kdump で crashkernel の予約サイズが不足** -- クラッシュカーネルが起動できない場合、
+   `crashkernel=` のサイズを増やす。`dmesg | grep -i crash` でメモリ予約状態を確認する。
+
+2. **makedumpfile で -d 31 を指定し過ぎる** -- ユーザ空間のメモリも解析したい場合は
+   `-d 8` を外す必要がある。解析目的に応じてフィルタを調整する。
+
+3. **crash で vmlinux のバージョンが不一致** -- ダンプ取得時と異なるカーネルの vmlinux を
+   使うとシンボルが一致しない。必ず同一ビルドの vmlinux を使用する。
+
+4. **KMSAN と KASAN を同時に有効化しようとする** -- 共存不可である。
+   メモリバグと未初期化バグの検出は別々のビルドで行う。
+
+5. **lockdep の警告を「偽陽性」として安易に無視する** -- lockdep の警告は
+   ほとんどの場合正しい。実際にデッドロックが発生していないだけで、
+   特定のタイミングで発生する可能性がある。
+
+6. **%px を本番コードに残す** -- カーネルアドレスの漏洩はセキュリティ上の問題である。
+   開発が終わったら `%p` または `%pS` に変更するか、`pr_debug` に降格する。
+
+7. **fault injection を有効にしたまま忘れる** -- 本番環境で有効にすると
+   ランダムな障害が発生する。テスト終了後は必ず無効化する。
+
+8. **Rust カーネルモジュールで unwrap() を使用** -- パニックがカーネルパニックに直結する。
+   `?` 演算子と `Result` 型で適切にエラーをハンドリングする。
+
+---
+
+## 章末演習
+
+1. QEMU 上で kdump をセットアップし、`echo c > /proc/sysrq-trigger` で故意に
+   パニックを発生させ、crash で vmcore を解析せよ。`bt`, `log`, `ps` コマンドを使い、
+   パニック時の状態を確認せよ。
+
+2. 以下の簡易ライブパッチモジュールを作成し、適用・解除を確認せよ。
+   対象: `/proc/version` の表示内容を変更する `linux_proc_banner` のパッチ。
+
+3. 構造体にパディングバイトが存在するモジュールを書き、`copy_to_user()` で
+   ユーザ空間にコピーせよ。KMSAN ビルドのカーネルで未初期化バイトの
+   検出レポートを確認せよ。
+
+4. 以下のコードに意図的な AB-BA デッドロックを含むモジュールを書き、
+   lockdep の警告を発生させよ。警告メッセージの各セクションを読解し、
+   ロック取得順序の修正方法を文書化せよ。
+
+   ```c
+   /* Thread A: lock_a → lock_b */
+   /* Thread B: lock_b → lock_a */
+   ```
+
+5. `/proc/kcore` を GDB で開き、`jiffies` の値、`init_task.comm`、
+   `nr_cpu_ids` を読み取れ。
+
+6. `printk` の特殊フォーマット指定子を使うモジュールを書き、以下を出力せよ。
+   - `%pS` で関数ポインタのシンボル名
+   - `%pI4` で IPv4 アドレス
+   - `%pM` で MAC アドレス
+
+7. fault injection で `kmalloc` の失敗率を 50% に設定し、
+   自作モジュールのエラーハンドリングが正しく動作するかテストせよ。
+
+8. (発展) Rust カーネルモジュールで `unsafe` ブロックを含む関数を書き、
+   故意にバッファオーバーフローを起こして KASAN が検出することを確認せよ。
+   同じバグを `safe` Rust で再現しようとするとコンパイルエラーになることも確認せよ。
+
+---
+
+## 参考資料
+
+- [kdump (kernel.org)](https://docs.kernel.org/admin-guide/kdump/kdump.html)
+- [makedumpfile (GitHub)](https://github.com/makedumpfile/makedumpfile)
+- [crash utility (GitHub)](https://github.com/crash-utility/crash)
+- [Livepatch (kernel.org)](https://docs.kernel.org/livepatch/livepatch.html)
+- [KMSAN (kernel.org)](https://docs.kernel.org/dev-tools/kmsan.html)
+- [KASAN (kernel.org)](https://docs.kernel.org/dev-tools/kasan.html)
+- [kmemleak (kernel.org)](https://docs.kernel.org/dev-tools/kmemleak.html)
+- [lockdep (kernel.org)](https://docs.kernel.org/locking/lockdep-design.html)
+- [printk formats (kernel.org)](https://docs.kernel.org/core-api/printk-formats.html)
+- [Fault Injection (kernel.org)](https://docs.kernel.org/fault-injection/fault-injection.html)
+- [perf examples (Brendan Gregg)](https://www.brendangregg.com/perf.html)
+- [Flame Graphs (Brendan Gregg)](https://www.brendangregg.com/flamegraphs.html)
+- [Rust for Linux (kernel.org)](https://docs.kernel.org/rust/index.html)

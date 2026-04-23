@@ -1,0 +1,583 @@
+---
+title: "プロセスとスケジューラ"
+description: "task_struct, プロセス状態遷移, CFS スケジューラ, sched_ext, Rust の kernel::task — カーネルモジュール開発者のためのプロセス管理入門"
+---
+
+## この章で学ぶこと
+
+- `task_struct` の主要フィールドを把握する
+- プロセスの状態遷移を理解する
+- CFS スケジューラの基本動作を説明できる
+- sched_ext による BPF スケジューラの概念を知る
+- `kernel::task::Task` (Rust) の使い方を理解する
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::task::Task` (pid, uid, euid, signal_pending, wake_up, current)
+🟢 **安定**: `kernel::types::ARef<Task>` (参照カウント付きタスク参照)
+❌ **未実装**: kthread 生成, スケジューラパラメータ変更, mm_struct アクセス
+:::
+
+---
+
+Linux カーネルにおいて「プロセス」は最も基本的な抽象概念である。
+カーネルモジュールを書く際、私たちのコードは常に「あるプロセスのコンテキスト」で実行されている。
+`insmod` を実行したプロセス、`read()` を呼んだユーザプロセス、あるいはカーネルスレッド ── いずれの場合も、カーネルはそのタスクの情報を `task_struct` という巨大な構造体で管理している。
+
+この章では、`task_struct` の構造から始めて、プロセスの状態遷移、CFS スケジューラの仕組み、
+そして Linux 6.12 で導入された sched_ext による BPF スケジューラまでを概観する。
+最後に、Rust カーネルモジュールから `kernel::task::Task` を使ってタスク情報にアクセスする方法を学ぶ。
+
+## task_struct: プロセスの全て
+
+`task_struct` は Linux カーネルで最も重要な構造体の一つである。
+`include/linux/sched.h` に定義されており、フィールド数は約 700 に及ぶ。
+プロセスの ID、状態、メモリ空間、ファイルテーブル、スケジューリング情報、シグナル、セキュリティクレデンシャルなど、
+プロセスに関するあらゆる情報がこの一つの構造体に集約されている。
+
+### 主要フィールド
+
+```c
+struct task_struct {
+    volatile long state;        /* -1 unrunnable, 0 runnable, >0 stopped */
+    pid_t pid;                  /* プロセス ID */
+    pid_t tgid;                 /* スレッドグループ ID (= メインスレッドの PID) */
+    struct task_struct *parent; /* 親プロセス */
+    struct list_head children;  /* 子プロセスリスト */
+    struct mm_struct *mm;       /* メモリ空間 (カーネルスレッドでは NULL) */
+    struct files_struct *files; /* オープンファイルテーブル */
+    const struct cred *cred;    /* セキュリティクレデンシャル (UID, GID, capabilities) */
+    char comm[TASK_COMM_LEN];   /* プロセス名 (最大 16 バイト) */
+    /* ... 約 700 フィールド ... */
+};
+```
+
+各フィールドの役割を押さえておこう。
+
+- **`state`**: プロセスの現在の実行状態。後述する状態遷移図で詳しく扱う。
+- **`pid`**: カーネル内部で一意のタスク識別子。スレッドごとに異なる値を持つ。
+- **`tgid`**: スレッドグループ ID。ユーザ空間の `getpid()` が返す値はこちらである。
+- **`mm`**: プロセスのメモリ空間を表す `mm_struct` へのポインタ。カーネルスレッドでは `NULL` になる。
+- **`files`**: オープン中のファイルディスクリプタテーブル。`fork()` 時にコピーされる。
+- **`cred`**: UID、GID、capabilities などのセキュリティ情報。権限チェックに使われる。
+- **`comm`**: プロセス名。`ps` コマンドで表示される名前と同じものである。
+
+### current マクロ
+
+カーネルコードからは `current` マクロで「現在実行中のタスク」の `task_struct` にアクセスできる。
+これはアーキテクチャ依存の実装になっており、x86_64 では per-CPU 変数を `%gs` セグメントレジスタ経由で参照する。
+
+```c
+#include <linux/sched.h>
+
+/* モジュールの init 関数内で */
+pr_info("current process: %s (pid=%d)\n", current->comm, current->pid);
+```
+
+`current` は非常に高速にアクセスできるため、パフォーマンスを心配する必要はない。
+カーネルモジュール開発では、`current->pid` でデバッグログにプロセス情報を付加したり、
+`current->cred` で権限チェックを行ったりする場面が頻出する。
+
+### pid vs tgid
+
+Linux におけるスレッドの実装を理解するには、`pid` と `tgid` の違いを正確に把握する必要がある。
+
+Linux のスレッドは独立した「プロセス」として実装されている。
+`clone()` システムコールで `CLONE_THREAD` フラグを指定すると、
+新しい `task_struct` が作られるが、同じスレッドグループに属する。
+
+```
+プロセス (tgid=100)
+├── メインスレッド  (pid=100, tgid=100)
+├── ワーカースレッド (pid=101, tgid=100)
+└── ワーカースレッド (pid=102, tgid=100)
+```
+
+| システムコール | 返す値 | 対応フィールド |
+|---|---|---|
+| `getpid()` | スレッドグループ ID | `tgid` |
+| `gettid()` | タスク ID | `pid` |
+
+この設計により、ユーザ空間からは「プロセス」として見えるものが、
+カーネル内部では複数の `task_struct` として管理される。
+`/proc/<pid>/task/` ディレクトリを見ると、スレッドグループ内の各スレッドを確認できる。
+
+```bash
+# スレッドグループの確認
+ls /proc/$(pidof firefox)/task/
+```
+
+## プロセスの状態
+
+プロセスは以下の状態を遷移する。モジュール開発者がこの遷移を理解していないと、
+デッドロックや kill できないプロセスといった問題に直面することになる。
+
+```
+                    ┌─── wake_up() ───┐
+                    │                  │
+                    ▼                  │
+TASK_RUNNING ──→ TASK_INTERRUPTIBLE ──┘
+    │                  │
+    │                  │ (シグナルで起床可能)
+    │                  │
+    │            TASK_UNINTERRUPTIBLE
+    │                  │
+    │                  │ (シグナルで起床不可 = D state)
+    │                  │
+    ▼                  ▼
+TASK_STOPPED     EXIT_ZOMBIE ──→ EXIT_DEAD
+(SIGSTOP)        (親が wait していない)
+```
+
+| 状態 | 意味 | `ps` 表示 |
+|---|---|---|
+| `TASK_RUNNING` | 実行可能 (run queue 上) または CPU で実行中 | `R` |
+| `TASK_INTERRUPTIBLE` | sleep 中。シグナルで起床可能 | `S` |
+| `TASK_UNINTERRUPTIBLE` | sleep 中。シグナルで起床不可 | `D` |
+| `TASK_STOPPED` | `SIGSTOP` / `SIGTSTP` で停止中 | `T` |
+| `EXIT_ZOMBIE` | 終了したが親が `wait()` していない | `Z` |
+
+### モジュール開発で重要な状態遷移
+
+**`wait_event_interruptible()` と `TASK_INTERRUPTIBLE`**:
+
+デバイスドライバで「データが来るまで待つ」処理を書くとき、
+`wait_event_interruptible()` を使う。これはプロセスを `TASK_INTERRUPTIBLE` 状態に遷移させる。
+シグナル (`Ctrl+C` など) を受け取ると起床して `-ERESTARTSYS` を返す。
+
+```c
+/* データが利用可能になるまで待つ */
+ret = wait_event_interruptible(my_wq, data_available);
+if (ret == -ERESTARTSYS) {
+    /* シグナルを受けた — クリーンアップして返る */
+    return -EINTR;
+}
+```
+
+**Mutex 取得と `TASK_UNINTERRUPTIBLE`**:
+
+`mutex_lock()` は、ロックが取得できるまでプロセスを `TASK_UNINTERRUPTIBLE` 状態にする。
+この状態のプロセスは `ps` で `D` と表示され、`kill -9` でも停止できない。
+ロックが長時間保持されると、ユーザから「フリーズした」「kill できないプロセスがある」という報告を受けることになる。
+
+```c
+/* これは TASK_UNINTERRUPTIBLE になる */
+mutex_lock(&my_mutex);
+
+/* 可能であれば interruptible 版を使う */
+if (mutex_lock_interruptible(&my_mutex)) {
+    return -ERESTARTSYS;
+}
+```
+
+## コンテキストスイッチ
+
+コンテキストスイッチとは、CPU が実行するタスクを切り替える処理である。
+`schedule()` 関数が呼ばれると、スケジューラが次に実行すべきタスクを選択し、以下の処理が行われる。
+
+1. **レジスタの保存**: 現在のタスクの CPU レジスタ (汎用レジスタ、スタックポインタ、プログラムカウンタ) をスレッドの `thread_struct` に保存
+2. **ページテーブルの切り替え**: `mm_struct` が異なる場合、CR3 レジスタ (x86_64) を書き換えてアドレス空間を切り替え
+3. **レジスタの復帰**: 次のタスクの保存済みレジスタを復帰
+
+### voluntary vs involuntary
+
+コンテキストスイッチには 2 種類ある。
+
+| 種類 | トリガー | 例 |
+|---|---|---|
+| voluntary (自発的) | タスク自身が `schedule()` を呼ぶ | `mutex_lock()`, `wait_event()`, `msleep()` |
+| involuntary (強制的) | カーネルのプリエンプション | タイマー割り込みで時間切れ、より高優先度のタスクが起床 |
+
+カーネルのプリエンプションモデル (`CONFIG_PREEMPT`) によって、involuntary なスイッチの頻度が変わる。
+
+```bash
+# 現在のプリエンプション設定を確認
+cat /boot/config-$(uname -r) | grep PREEMPT
+```
+
+モジュール開発者にとって重要なのは、プリエンプションが有効な環境では
+**カーネルコードの途中でもコンテキストスイッチが発生しうる** という点である。
+per-CPU 変数へのアクセスなど、プリエンプションを禁止する必要がある場面では
+`preempt_disable()` / `preempt_enable()` を使う。
+
+```c
+preempt_disable();
+/* per-CPU 変数への安全なアクセス */
+this_cpu_inc(my_counter);
+preempt_enable();
+```
+
+## CFS スケジューラ
+
+CFS (Completely Fair Scheduler) は Linux 2.6.23 で Ingo Molnár によって導入された、
+デフォルトのプロセススケジューラである。その名の通り「完全に公平な」CPU 時間の分配を目指す。
+
+### 基本原理
+
+CFS の中心的な概念は **仮想実行時間 (vruntime)** である。
+
+- 各タスクは `vruntime` というカウンタを持つ
+- タスクが CPU を使うと、`vruntime` が増加する
+- スケジューラは常に **`vruntime` が最も小さいタスク** を次に実行する
+- これにより、全タスクが均等に CPU 時間を得る
+
+`vruntime` の管理には**赤黒木 (rb-tree)** が使われる。
+赤黒木の最左ノードが最小 `vruntime` のタスクであり、O(log n) で取得できる。
+
+```
+        [vruntime=50]
+       /              \
+  [vruntime=30]    [vruntime=80]
+  /          \
+[vruntime=10]  [vruntime=40]
+ ↑
+ 最小 vruntime = 次に実行
+```
+
+### nice 値と重み
+
+`nice` 値 (-20 から 19) は `vruntime` の進行速度に影響する。
+
+- **nice が低い (高優先度)**: `vruntime` の増加が遅い → CPU を多く使える
+- **nice が高い (低優先度)**: `vruntime` の増加が速い → CPU を少なく使う
+
+```bash
+# nice 値の確認
+ps -eo pid,ni,comm | head -20
+
+# nice 値を変更して実行
+nice -n 10 ./my_program
+renice -n -5 -p <pid>
+```
+
+具体的には、nice 値はカーネル内部で「重み (weight)」に変換され、
+`vruntime` の増分は `(実行時間 × NICE_0_LOAD) / weight` で計算される。
+nice が 1 つ下がると CPU 割当が約 10% 増える設計になっている。
+
+### スケジューリングクラス
+
+Linux のスケジューラはモジュラーな設計になっており、複数のスケジューリングクラスが優先度順に連結されている。
+
+| クラス | ポリシー | 用途 | 優先度 |
+|---|---|---|---|
+| Stop | — | CPU ホットプラグ等の内部用 | 最高 |
+| Deadline | `SCHED_DEADLINE` | 期限付きタスク (EDF) | ↑ |
+| Realtime | `SCHED_FIFO`, `SCHED_RR` | リアルタイムタスク | ↑ |
+| CFS | `SCHED_NORMAL`, `SCHED_BATCH` | 一般プロセス | ↓ |
+| Idle | `SCHED_IDLE` | 他に実行すべきタスクがない時のみ | 最低 |
+
+スケジューラは最も高い優先度のクラスから順に実行可能なタスクを探す。
+つまり、`SCHED_FIFO` のタスクが実行可能なら、`SCHED_NORMAL` のタスクは一切実行されない。
+
+### モジュール開発者が知るべきこと
+
+**kthread のスケジューリング**:
+
+`kthread_create()` で作成されるカーネルスレッドは、デフォルトで `SCHED_NORMAL` (CFS) ポリシーを使う。
+リアルタイム要件がある場合は `sched_setscheduler_nocheck()` でポリシーを変更できる。
+
+```c
+#include <linux/kthread.h>
+#include <linux/sched.h>
+#include <uapi/linux/sched/types.h>
+
+struct task_struct *task;
+struct sched_param param = { .sched_priority = 50 };
+
+task = kthread_create(my_thread_fn, NULL, "my_rt_thread");
+if (!IS_ERR(task)) {
+    sched_setscheduler_nocheck(task, SCHED_FIFO, &param);
+    wake_up_process(task);
+}
+```
+
+**プリエンプション制御**:
+
+```c
+/* プリエンプションを一時的に無効化 */
+preempt_disable();
+/* クリティカルセクション */
+preempt_enable();
+
+/* ネストも可能 (preempt_count で管理) */
+preempt_disable();
+  preempt_disable();
+  preempt_enable();
+preempt_enable();
+/* ← ここでプリエンプションが再有効化される */
+```
+
+`preempt_disable()` と `preempt_enable()` は必ずペアで使うこと。
+ペアがずれると `preempt_count` が不整合を起こし、
+プリエンプションが永久に無効化されたり、予期しないタイミングで有効化されたりする。
+
+## sched_ext: BPF スケジューラ
+
+**sched_ext** は Linux 6.12 で導入された新しいスケジューリングクラスである。
+ユーザ空間から BPF プログラムとしてスケジューリングポリシーを定義し、
+カーネルに動的にロードできる。
+
+### 背景と動機
+
+従来、スケジューリングポリシーを変更するにはカーネル本体を修正してリビルドする必要があった。
+sched_ext はこの制約を取り払い、以下を実現する。
+
+- カーネルを再起動せずにスケジューラを切り替え可能
+- ユーザ空間の開発ツール (Rust, C) でスケジューラを開発
+- プロダクション環境で安全にスケジューラを実験
+
+### 仕組み
+
+sched_ext は BPF プログラムが実装すべきフック (ops) を定義している。
+
+| フック | 役割 |
+|---|---|
+| `ops.select_cpu()` | タスクを実行する CPU を選択 |
+| `ops.enqueue()` | タスクを実行キューに追加 |
+| `ops.dequeue()` | タスクを実行キューから削除 |
+| `ops.dispatch()` | 次に実行するタスクを決定 |
+| `ops.running()` | タスクが CPU で実行を開始した時のコールバック |
+| `ops.stopping()` | タスクが CPU での実行を停止した時のコールバック |
+
+BPF プログラムがこれらのフックを実装し、`sched_ext` クラスに登録する。
+BPF プログラムがクラッシュした場合やタイムアウトした場合は、
+自動的にデフォルトのスケジューラにフォールバックするため安全性が担保されている。
+
+```bash
+# sched_ext が利用可能か確認
+ls /sys/kernel/sched_ext/
+
+# カーネルコンフィグの確認
+grep CONFIG_SCHED_CLASS_EXT /boot/config-$(uname -r)
+```
+
+### scx_rustland
+
+**scx_rustland** は Andrea Righi (Canonical) が開発した、Rust で書かれたユーザ空間スケジューラである。
+[sched-ext/scx](https://github.com/sched-ext/scx) リポジトリで公開されている。
+
+scx_rustland の特徴的なアーキテクチャは以下の通りである。
+
+1. **BPF 部分**: カーネル内で動作し、タスクの enqueue/dispatch をフック
+2. **Rust 部分**: ユーザ空間で動作し、スケジューリング判断を行う
+3. **BPF ring buffer**: カーネルとユーザ空間の間の通信チャネル
+
+```bash
+# scx ツール群のインストールと実行
+cargo install scx_rustland
+sudo scx_rustland
+```
+
+他にも `scx_layered` (レイヤーベースのスケジューラ)、`scx_rusty` (NUMA 対応) など、
+様々なスケジューラが開発されている。
+
+### モジュール開発者への意味
+
+sched_ext はカーネルモジュールではなく BPF プログラムとして実装されるため、
+本書で扱うカーネルモジュール開発とは直接的な関係は薄い。
+しかし、以下の点で間接的な影響がある。
+
+- **kthread のスケジューリング**: sched_ext が有効な環境では、カーネルスレッドのスケジューリングも sched_ext の影響を受ける場合がある
+- **レイテンシ特性の変化**: sched_ext スケジューラによって、割り込みハンドラからの復帰後のスケジューリングレイテンシが変わりうる
+- **デバッグ**: `/sys/kernel/sched_ext/` 以下で現在のスケジューラの状態を確認できる
+
+## Rust 側: kernel::task
+
+Rust カーネルモジュールからタスク情報にアクセスするには、`kernel::task::Task` を使用する。
+これは `task_struct` の安全な Rust ラッパーである。
+
+### 基本的な使い方
+
+```rust
+use kernel::task::Task;
+use kernel::prelude::*;
+
+fn show_current_task() {
+    // 現在のタスクへの参照を取得
+    let current = Task::current();
+
+    // タスク情報の表示
+    pr_info!("pid = {}\n", current.pid());
+}
+```
+
+`Task::current()` は現在の実行コンテキストのタスクへの参照を返す。
+C の `current` マクロに相当するが、Rust の所有権システムにより安全に管理される。
+
+### 公開 API
+
+`kernel::task::Task` が提供する主要なメソッドを以下に示す。
+
+| メソッド | 説明 | C での対応 |
+|---|---|---|
+| `Task::current()` | 現在のタスクへの参照 | `current` |
+| `pid()` | プロセス ID | `current->pid` |
+| `uid()` | UID | `current_uid()` |
+| `euid()` | 実効 UID | `current_euid()` |
+| `signal_pending()` | 保留シグナルの有無 | `signal_pending(current)` |
+| `wake_up()` | タスクを起床 | `wake_up_process()` |
+
+### タスクの参照カウント管理
+
+タスクへの参照を保存する場合、参照カウントを適切に管理する必要がある。
+Rust では `ARef<Task>` を使うことで、RAII パターンにより自動的に参照カウントが管理される。
+
+```rust
+use kernel::task::Task;
+use kernel::types::ARef;
+
+struct MyDevice {
+    // タスクへの参照を保持
+    // ARef はドロップ時に自動的に put_task_struct() を呼ぶ
+    owner: Option<ARef<Task>>,
+}
+```
+
+C では `get_task_struct()` / `put_task_struct()` を手動で呼ぶ必要があったが、
+Rust の `ARef<Task>` はこれを自動化する。参照カウントの不整合によるメモリリークや use-after-free を型システムレベルで防止できる。
+
+### 制限事項
+
+現時点 (Linux 6.x) の Rust バインディングには以下の制限がある。
+
+- スケジューラパラメータの変更 (`sched_setscheduler` 相当) は未実装
+- `kthread_create` 相当のカーネルスレッド生成 API は未実装
+- `mm_struct` へのアクセスは限定的
+- `task_struct` の全フィールドへのアクセスは提供されていない
+
+これらの機能が必要な場合は、unsafe ブロック内で C の関数を直接呼び出すか、
+必要な Rust バインディングを自作する必要がある。
+
+## よくある罠
+
+### 1. カーネルスレッド (kthread) の mm は NULL
+
+カーネルスレッドはユーザ空間のメモリ空間を持たない。
+`current->mm` が `NULL` であるため、ユーザ空間のアドレスにアクセスしようとすると
+カーネルパニックを引き起こす。
+
+```c
+/* 危険: kthread から呼ぶとクラッシュする */
+if (current->mm) {
+    /* ユーザ空間メモリへのアクセスはここでのみ安全 */
+    copy_from_user(buf, user_ptr, len);
+}
+```
+
+`copy_from_user()` / `copy_to_user()` は必ず `current->mm` が `NULL` でないことを前提としている。
+kthread からユーザ空間メモリにアクセスする必要がある場合は、
+`kthread_use_mm()` / `kthread_unuse_mm()` で一時的にメモリ空間を借用する。
+
+### 2. TASK_UNINTERRUPTIBLE (D state) が長時間続く
+
+`mutex_lock()` や特定の I/O 待ちは `TASK_UNINTERRUPTIBLE` 状態になる。
+この状態ではシグナルを受け付けないため、ユーザから見ると「kill できないプロセス」に見える。
+
+対策:
+- 可能な限り `mutex_lock_interruptible()` を使う
+- I/O タイムアウトを適切に設定する
+- `TASK_KILLABLE` (`TASK_UNINTERRUPTIBLE | TASK_WAKEKILL`) の使用を検討する
+
+### 3. current をポインタとして保存する
+
+`current` はマクロであり、コンテキストスイッチ後は異なるタスクを指す。
+`task_struct *` としてポインタを保存する場合は、参照カウントを取る必要がある。
+
+```c
+/* 間違い: 参照カウントなしで保存 */
+struct task_struct *saved = current;  /* ← 危険 */
+
+/* 正しい: 参照カウントを増やして保存 */
+struct task_struct *saved = get_task_struct(current);
+
+/* 使い終わったら解放 */
+put_task_struct(saved);
+```
+
+参照カウントを取らずにポインタを保存すると、対象のタスクが終了した後に
+解放済みメモリにアクセスする use-after-free が発生する。
+
+### 4. preempt_disable() と preempt_enable() のペアずれ
+
+```c
+void my_function(void)
+{
+    preempt_disable();
+
+    if (some_condition) {
+        return;  /* ← preempt_enable() を呼ばずに return! */
+    }
+
+    preempt_enable();
+}
+```
+
+この種のバグは `preempt_count` を狂わせ、プリエンプションが永久に無効化される。
+`goto` パターンを使ってクリーンアップパスを統一するのが定石である。
+
+```c
+void my_function(void)
+{
+    preempt_disable();
+
+    if (some_condition)
+        goto out;
+
+    /* 処理 */
+
+out:
+    preempt_enable();
+}
+```
+
+## 章末演習
+
+### 演習 1: insmod プロセスの情報を出力
+
+モジュールの `init` 関数で `current->pid`、`current->tgid`、`current->comm` を出力し、
+`insmod` コマンドを実行したプロセスの情報を確認せよ。
+
+```c
+static int __init my_init(void)
+{
+    pr_info("insmod called by: %s (pid=%d, tgid=%d)\n",
+            current->comm, current->pid, current->tgid);
+    return 0;
+}
+```
+
+`dmesg` の出力を確認し、以下の問いに答えよ。
+- `pid` と `tgid` は同じ値か？なぜか？
+- `comm` にはどのような値が表示されるか？
+
+### 演習 2: kthread でスレッドグループを確認
+
+`kthread_create()` でカーネルスレッドを 2 つ作成し、
+それぞれの `pid` と `tgid` を出力せよ。
+
+- 各 kthread の `tgid` は同じか、異なるか？
+- ユーザ空間のスレッド (`pthread_create`) との違いは何か？
+
+### 演習 3: スケジューリング統計の観察
+
+任意のプロセスについて `/proc/<pid>/sched` を読み、以下の値を観察せよ。
+
+```bash
+cat /proc/<pid>/sched
+```
+
+- `se.vruntime`: 仮想実行時間
+- `nr_switches`: コンテキストスイッチ回数
+- `nr_voluntary_switches`: 自発的スイッチ回数
+- `nr_involuntary_switches`: 強制的スイッチ回数
+
+CPU バウンドなプロセスと I/O バウンドなプロセスで、これらの値にどのような違いがあるか比較せよ。
+
+## 参考資料
+
+- [Scheduling (kernel.org)](https://docs.kernel.org/scheduler/)
+- [CFS Scheduler (kernel.org)](https://docs.kernel.org/scheduler/sched-design-CFS.html)
+- [sched_ext (kernel.org)](https://docs.kernel.org/scheduler/sched-ext.html)
+- [kernel::task (rustdoc)](https://rust.docs.kernel.org/kernel/task/)
+- Robert Love, "Linux Kernel Development" Ch 3-4
+- [sched_ext introduction (LWN)](https://lwn.net/Articles/922405/)
+- [scx_rustland (GitHub)](https://github.com/sched-ext/scx)

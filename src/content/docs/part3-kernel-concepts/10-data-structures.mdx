@@ -1,0 +1,920 @@
+---
+title: "カーネルデータ構造"
+description: "list_head, rbtree, XArray, hlist, IDR/IDA — カーネルの主要データ構造を学ぶ"
+---
+
+## この章で学ぶこと
+
+- 侵入型リンクドリスト (`list_head`) と `container_of` を使いこなす
+- 赤黒木 (`rbtree`) でキー順のデータ管理ができる
+- XArray でインデックスベースの高速検索ができる
+- `hlist` でハッシュテーブルを構築できる
+- IDR/IDA で整数 ID を動的割り当てできる
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::rbtree::RBTree<K, V>`
+🟡 **開発中**: `kernel::xarray::XArray` (API 変更の可能性あり)
+🟡 **開発中**: `kernel::list::List` (侵入型リストのパッチが投稿中)
+❌ **未実装**: hlist / hashtable, IDR の直接バインディング
+:::
+
+---
+
+Linux カーネルには汎用的なデータ構造のライブラリが組み込まれている。
+ユーザランドの C プログラムでは標準ライブラリにコンテナ型が存在しないため自作することが多いが、
+カーネルでは長年の実績を持つデータ構造が `<linux/*.h>` ヘッダとして提供されている。
+
+これらのデータ構造はカーネルのあらゆるサブシステムで使われており、
+モジュール開発者がこれを理解していることは必須条件である。
+本章ではカーネルの 5 大データ構造 ── `list_head`、`rbtree`、XArray、`hlist`、IDR/IDA ── を順に学ぶ。
+
+## 侵入型リンクドリスト (list_head)
+
+### 侵入型 (intrusive) とは何か
+
+一般的なリンクドリストは「リストノードがデータへのポインタを持つ」設計である。
+カーネルの `list_head` はこれとは逆で、「データ構造体の中にリストノードを埋め込む」設計を採る。
+これを **侵入型 (intrusive)** リンクドリストと呼ぶ。
+
+```c
+/* 一般的なリンクドリスト: ノードがデータを指す */
+struct node {
+    void *data;
+    struct node *next;
+};
+
+/* 侵入型リンクドリスト: データがノードを含む */
+struct my_device {
+    char name[32];
+    int id;
+    struct list_head list;  /* ← リストノードがデータの中にある */
+};
+```
+
+侵入型の利点は以下の通りである:
+
+- メモリ割り当てが 1 回で済む (データとノードが一体)
+- キャッシュ効率が良い
+- 1 つのデータを複数のリストに同時に所属させられる (`list_head` を複数埋め込むだけ)
+
+### struct list_head
+
+`list_head` は双方向循環リストの実装である。定義は驚くほど単純だ:
+
+```c title="include/linux/types.h"
+struct list_head {
+    struct list_head *next, *prev;
+};
+```
+
+次のポインタと前のポインタ、それだけである。
+データへのポインタは持たない ── その代わりに `container_of` マクロを使ってデータを逆算する。
+
+### 基本操作
+
+```c
+#include <linux/list.h>
+
+/* リストヘッドの宣言と初期化 */
+static LIST_HEAD(device_list);  /* next, prev とも自分自身を指す空リスト */
+
+/* 先頭に追加 */
+list_add(&dev->list, &device_list);
+
+/* 末尾に追加 */
+list_add_tail(&dev->list, &device_list);
+
+/* 削除 */
+list_del(&dev->list);
+
+/* リストが空か判定 */
+list_empty(&device_list);
+```
+
+### container_of マクロ
+
+`container_of` は侵入型データ構造の要である。
+`list_head` メンバのアドレスから、それを含む親構造体のアドレスを逆算する。
+
+```c title="include/linux/container_of.h"
+#define container_of(ptr, type, member) ({                \
+    void *__mptr = (void *)(ptr);                         \
+    ((type *)(__mptr - offsetof(type, member)));           \
+})
+```
+
+動作原理:
+
+1. `offsetof(type, member)` で構造体先頭から `member` までのバイトオフセットを取得
+2. `ptr` (メンバのアドレス) からオフセットを引く
+3. 結果が構造体先頭のアドレスになる
+
+```
+メモリレイアウト:
+┌──────────────────────────────────┐
+│ struct my_device                 │
+│  ┌──────────┐                    │
+│  │ name[32] │  offset 0          │
+│  ├──────────┤                    │
+│  │ id       │  offset 32         │
+│  ├──────────┤                    │
+│  │ list     │  offset 36  ← ptr が指す位置  │
+│  └──────────┘                    │
+└──────────────────────────────────┘
+  ↑
+  ptr - offsetof(struct my_device, list) = 構造体先頭
+```
+
+### イテレーション
+
+```c
+struct my_device *dev;
+
+/* 全要素を走査 */
+list_for_each_entry(dev, &device_list, list) {
+    pr_info("device: %s (id=%d)\n", dev->name, dev->id);
+}
+
+/* 走査中に要素を削除する場合は _safe 版を使う */
+struct my_device *tmp;
+list_for_each_entry_safe(dev, tmp, &device_list, list) {
+    if (dev->id == target_id) {
+        list_del(&dev->list);
+        kfree(dev);
+    }
+}
+```
+
+### 完全なコード例: デバイスリストの管理
+
+```c title="device_list_example.c"
+#include <linux/module.h>
+#include <linux/list.h>
+#include <linux/slab.h>
+
+struct my_device {
+    char name[32];
+    int id;
+    struct list_head list;
+};
+
+static LIST_HEAD(device_list);
+static int next_id;
+
+static struct my_device *create_device(const char *name)
+{
+    struct my_device *dev;
+
+    dev = kmalloc(sizeof(*dev), GFP_KERNEL);
+    if (!dev)
+        return NULL;
+
+    strscpy(dev->name, name, sizeof(dev->name));
+    dev->id = next_id++;
+    INIT_LIST_HEAD(&dev->list);
+
+    list_add_tail(&dev->list, &device_list);
+    pr_info("created device: %s (id=%d)\n", dev->name, dev->id);
+    return dev;
+}
+
+static void destroy_all_devices(void)
+{
+    struct my_device *dev, *tmp;
+
+    list_for_each_entry_safe(dev, tmp, &device_list, list) {
+        pr_info("destroying device: %s (id=%d)\n", dev->name, dev->id);
+        list_del(&dev->list);
+        kfree(dev);
+    }
+}
+
+static int __init mymod_init(void)
+{
+    create_device("sensor-a");
+    create_device("sensor-b");
+    create_device("actuator-c");
+
+    pr_info("--- device list ---\n");
+    {
+        struct my_device *dev;
+        list_for_each_entry(dev, &device_list, list) {
+            pr_info("  %s (id=%d)\n", dev->name, dev->id);
+        }
+    }
+    return 0;
+}
+
+static void __exit mymod_exit(void)
+{
+    destroy_all_devices();
+}
+
+module_init(mymod_init);
+module_exit(mymod_exit);
+MODULE_LICENSE("GPL");
+```
+
+## 赤黒木 (rbtree)
+
+### 概要
+
+赤黒木 (red-black tree) は自己平衡二分探索木の一種で、挿入・削除・検索が最悪 O(log n) で行える。
+カーネルでは以下のような場面で使われている:
+
+- **CFS スケジューラ**: `vruntime` をキーにタスクをソート (最小 vruntime のタスクを次に実行)
+- **VMA (Virtual Memory Area) 管理**: アドレス範囲でソートされた VMA を高速に検索 (Linux 6.1 以降は maple tree に移行)
+- **I/O スケジューラ**: リクエストのセクタ番号によるソート
+
+### 基本構造
+
+```c title="include/linux/rbtree.h"
+struct rb_node {
+    unsigned long __rb_parent_color;  /* 親ノードアドレス + 色 (1ビット) */
+    struct rb_node *rb_right;
+    struct rb_node *rb_left;
+};
+
+struct rb_root {
+    struct rb_node *rb_node;  /* ルートノードへのポインタ */
+};
+```
+
+`list_head` と同様に侵入型設計である。`rb_node` をデータ構造体に埋め込んで使う。
+
+### 挿入の手順
+
+rbtree への挿入はユーザが比較ロジックを書く必要がある。
+カーネルの rbtree は汎用的であるため、比較関数をコールバックとして登録するのではなく、
+挿入位置を自分で探すコードを書く設計になっている。
+
+```c
+static void my_rb_insert(struct rb_root *root, struct my_node *new)
+{
+    struct rb_node **link = &root->rb_node;
+    struct rb_node *parent = NULL;
+
+    /* 1. 挿入位置を探す (二分探索) */
+    while (*link) {
+        struct my_node *entry = rb_entry(*link, struct my_node, node);
+        parent = *link;
+
+        if (new->key < entry->key)
+            link = &(*link)->rb_left;
+        else if (new->key > entry->key)
+            link = &(*link)->rb_right;
+        else
+            return;  /* 重複キー: ここではスキップ */
+    }
+
+    /* 2. ノードをリンク */
+    rb_link_node(&new->node, parent, link);
+
+    /* 3. 赤黒木のバランスを修正 (色の回転) */
+    rb_insert_color(&new->node, root);
+}
+```
+
+### 完全なコード例: 整数キーで管理する簡易 rbtree
+
+```c title="rbtree_example.c"
+#include <linux/module.h>
+#include <linux/rbtree.h>
+#include <linux/slab.h>
+
+struct my_node {
+    int key;
+    int value;
+    struct rb_node node;
+};
+
+static struct rb_root my_tree = RB_ROOT;
+
+static struct my_node *my_rb_search(struct rb_root *root, int key)
+{
+    struct rb_node *n = root->rb_node;
+
+    while (n) {
+        struct my_node *entry = rb_entry(n, struct my_node, node);
+
+        if (key < entry->key)
+            n = n->rb_left;
+        else if (key > entry->key)
+            n = n->rb_right;
+        else
+            return entry;  /* 見つかった */
+    }
+    return NULL;  /* 見つからない */
+}
+
+static int my_rb_insert(struct rb_root *root, struct my_node *new)
+{
+    struct rb_node **link = &root->rb_node;
+    struct rb_node *parent = NULL;
+
+    while (*link) {
+        struct my_node *entry = rb_entry(*link, struct my_node, node);
+        parent = *link;
+
+        if (new->key < entry->key)
+            link = &(*link)->rb_left;
+        else if (new->key > entry->key)
+            link = &(*link)->rb_right;
+        else
+            return -EEXIST;  /* 重複キー */
+    }
+
+    rb_link_node(&new->node, parent, link);
+    rb_insert_color(&new->node, root);
+    return 0;
+}
+
+static void my_rb_free_all(struct rb_root *root)
+{
+    struct rb_node *n;
+
+    while ((n = rb_first(root))) {
+        struct my_node *entry = rb_entry(n, struct my_node, node);
+        rb_erase(n, root);
+        kfree(entry);
+    }
+}
+
+static int __init mymod_init(void)
+{
+    struct my_node *n;
+    struct rb_node *iter;
+    int keys[] = {10, 5, 20, 15, 3};
+    int i;
+
+    for (i = 0; i < ARRAY_SIZE(keys); i++) {
+        n = kmalloc(sizeof(*n), GFP_KERNEL);
+        if (!n)
+            goto fail;
+        n->key = keys[i];
+        n->value = keys[i] * 100;
+        my_rb_insert(&my_tree, n);
+    }
+
+    /* 昇順にイテレーション */
+    pr_info("--- rbtree contents (sorted) ---\n");
+    for (iter = rb_first(&my_tree); iter; iter = rb_next(iter)) {
+        n = rb_entry(iter, struct my_node, node);
+        pr_info("  key=%d, value=%d\n", n->key, n->value);
+    }
+
+    /* 検索 */
+    n = my_rb_search(&my_tree, 15);
+    if (n)
+        pr_info("found: key=%d, value=%d\n", n->key, n->value);
+
+    return 0;
+
+fail:
+    my_rb_free_all(&my_tree);
+    return -ENOMEM;
+}
+
+static void __exit mymod_exit(void)
+{
+    my_rb_free_all(&my_tree);
+}
+
+module_init(mymod_init);
+module_exit(mymod_exit);
+MODULE_LICENSE("GPL");
+```
+
+### Rust: kernel::rbtree::RBTree
+
+Rust カーネルでは `kernel::rbtree::RBTree` が提供されている。
+C 版と異なり、キーの比較は `Ord` トレイトにより自動的に行われるため、
+挿入位置を手動で探すコードを書く必要がない。
+
+```rust
+use kernel::rbtree::RBTree;
+use kernel::prelude::*;
+
+fn example() -> Result {
+    let mut tree = RBTree::new(GFP_KERNEL)?;
+
+    // 挿入
+    tree.try_create_and_insert(10, 100, GFP_KERNEL)?;
+    tree.try_create_and_insert(5, 50, GFP_KERNEL)?;
+    tree.try_create_and_insert(20, 200, GFP_KERNEL)?;
+
+    // 検索
+    if let Some(val) = tree.get(&10) {
+        pr_info!("found: {}\n", val);
+    }
+
+    // イテレーション (キー順)
+    for (key, val) in &tree {
+        pr_info!("key={}, val={}\n", key, val);
+    }
+
+    Ok(())
+}
+```
+
+## XArray
+
+### 概要
+
+XArray は Linux 4.20 で導入された、radix tree と IDR を統合する後継データ構造である。
+**整数インデックスからポインタへの高速マッピング** を提供し、以下の場面で使われている:
+
+- **ページキャッシュ**: `inode->i_mapping->i_pages` がファイルオフセット → `struct page` のマッピングに使用
+- **ファイルマッピング**: ページインデックスによる検索
+- **多くの旧 radix_tree ユーザ**: XArray への移行が進んでいる
+
+内部的には radix tree (基数木) をベースとしており、疎な配列を効率的に扱える。
+
+### 基本操作
+
+```c
+#include <linux/xarray.h>
+
+static DEFINE_XARRAY(my_xa);
+
+/* 格納: インデックス idx にポインタ ptr を格納 */
+void *old = xa_store(&my_xa, idx, ptr, GFP_KERNEL);
+
+/* 読み込み: インデックス idx からポインタを取得 */
+void *entry = xa_load(&my_xa, idx);
+
+/* 削除: インデックス idx のエントリを削除 */
+void *old = xa_erase(&my_xa, idx);
+
+/* イテレーション */
+unsigned long index;
+void *entry;
+xa_for_each(&my_xa, index, entry) {
+    pr_info("index=%lu, entry=%px\n", index, entry);
+}
+
+/* 解放 */
+xa_destroy(&my_xa);
+```
+
+### コード例
+
+```c title="xarray_example.c"
+#include <linux/module.h>
+#include <linux/xarray.h>
+#include <linux/slab.h>
+
+struct my_record {
+    int data;
+};
+
+static DEFINE_XARRAY(records);
+
+static int __init mymod_init(void)
+{
+    struct my_record *rec;
+    unsigned long index;
+    void *entry;
+    int i;
+
+    /* レコードを格納 */
+    for (i = 0; i < 5; i++) {
+        rec = kmalloc(sizeof(*rec), GFP_KERNEL);
+        if (!rec)
+            return -ENOMEM;
+        rec->data = i * 10;
+        xa_store(&records, i, rec, GFP_KERNEL);
+    }
+
+    /* 特定のインデックスを検索 */
+    rec = xa_load(&records, 3);
+    if (rec)
+        pr_info("records[3].data = %d\n", rec->data);
+
+    /* 全エントリを走査 */
+    xa_for_each(&records, index, entry) {
+        rec = entry;
+        pr_info("records[%lu].data = %d\n", index, rec->data);
+    }
+
+    return 0;
+}
+
+static void __exit mymod_exit(void)
+{
+    struct my_record *rec;
+    unsigned long index;
+
+    xa_for_each(&records, index, rec) {
+        xa_erase(&records, index);
+        kfree(rec);
+    }
+    xa_destroy(&records);
+}
+
+module_init(mymod_init);
+module_exit(mymod_exit);
+MODULE_LICENSE("GPL");
+```
+
+### Rust: kernel::xarray::XArray
+
+```rust
+use kernel::xarray::{XArray, flags};
+use kernel::prelude::*;
+
+fn example() -> Result {
+    let xa = XArray::new(flags::ALLOC)?;
+
+    // 格納
+    xa.store(0, some_value, GFP_KERNEL)?;
+
+    // 読み込み
+    let guard = xa.load(0);
+    if let Some(val) = guard {
+        pr_info!("found: {:?}\n", val);
+    }
+
+    Ok(())
+}
+```
+
+> **注意**: Rust の XArray バインディングは活発に開発中であり、API は今後変更される可能性がある。
+> 最新の状態は `rust/kernel/xarray.rs` を参照されたい。
+
+## ハッシュリスト (hlist)
+
+### 概要
+
+`hlist` (hash list) はハッシュテーブルに最適化されたリスト構造である。
+通常の `list_head` は `next` と `prev` の 2 ポインタを持つが、
+ハッシュテーブルのバケット配列ではほとんどのバケットが空であるため、
+バケットヘッダは 1 ポインタで済む方が望ましい。
+
+```c title="include/linux/types.h"
+struct hlist_head {
+    struct hlist_node *first;   /* ポインタ 1 つだけ → メモリ効率が良い */
+};
+
+struct hlist_node {
+    struct hlist_node *next, **pprev;
+};
+```
+
+`hlist_head` はポインタ 1 つ (8 バイト) であるのに対し、`list_head` は 2 つ (16 バイト) 必要である。
+バケット数が数千に及ぶハッシュテーブルではこの差が効いてくる。
+
+### カーネル提供のハッシュテーブルマクロ
+
+`<linux/hashtable.h>` には便利なマクロが用意されている:
+
+```c
+#include <linux/hashtable.h>
+
+/* 2^10 = 1024 バケットのハッシュテーブルを定義 */
+static DEFINE_HASHTABLE(my_ht, 10);
+
+/* 追加: hash_add(テーブル, &ノード, キーのハッシュ値) */
+hash_add(my_ht, &entry->hnode, hash_key);
+
+/* 検索: 同じバケット内の全要素を走査 */
+struct my_entry *e;
+hash_for_each_possible(my_ht, e, hnode, hash_key) {
+    if (e->key == target_key) {
+        /* 見つかった */
+    }
+}
+
+/* 削除 */
+hash_del(&entry->hnode);
+
+/* 全要素走査 */
+int bkt;
+struct my_entry *e;
+hash_for_each(my_ht, bkt, e, hnode) {
+    pr_info("key=%s, value=%d\n", e->key, e->value);
+}
+```
+
+### コード例: 文字列キーのハッシュテーブル
+
+```c title="hashtable_example.c"
+#include <linux/module.h>
+#include <linux/hashtable.h>
+#include <linux/slab.h>
+#include <linux/jhash.h>
+#include <linux/string.h>
+
+struct kv_entry {
+    char key[32];
+    int value;
+    struct hlist_node hnode;
+};
+
+/* 2^8 = 256 バケット */
+static DEFINE_HASHTABLE(kv_table, 8);
+
+static void kv_put(const char *key, int value)
+{
+    struct kv_entry *entry;
+    u32 hash;
+
+    entry = kmalloc(sizeof(*entry), GFP_KERNEL);
+    if (!entry)
+        return;
+
+    strscpy(entry->key, key, sizeof(entry->key));
+    entry->value = value;
+
+    hash = jhash(key, strlen(key), 0);
+    hash_add(kv_table, &entry->hnode, hash);
+}
+
+static struct kv_entry *kv_get(const char *key)
+{
+    struct kv_entry *entry;
+    u32 hash;
+
+    hash = jhash(key, strlen(key), 0);
+    hash_for_each_possible(kv_table, entry, hnode, hash) {
+        if (strcmp(entry->key, key) == 0)
+            return entry;
+    }
+    return NULL;
+}
+
+static void kv_free_all(void)
+{
+    struct kv_entry *entry;
+    struct hlist_node *tmp;
+    int bkt;
+
+    hash_for_each_safe(kv_table, bkt, tmp, entry, hnode) {
+        hash_del(&entry->hnode);
+        kfree(entry);
+    }
+}
+
+static int __init mymod_init(void)
+{
+    struct kv_entry *e;
+
+    hash_init(kv_table);
+
+    kv_put("Tokyo", 1400);
+    kv_put("Osaka", 880);
+    kv_put("Nagoya", 230);
+
+    e = kv_get("Osaka");
+    if (e)
+        pr_info("Osaka: population=%d万人\n", e->value);
+
+    return 0;
+}
+
+static void __exit mymod_exit(void)
+{
+    kv_free_all();
+}
+
+module_init(mymod_init);
+module_exit(mymod_exit);
+MODULE_LICENSE("GPL");
+```
+
+## IDR と IDA
+
+### IDR: 整数 ID → ポインタ のマッピング
+
+IDR (ID Radix tree) は、整数 ID を自動割り当てしつつ、その ID に対応するポインタを管理するデータ構造である。
+典型的な使用例はファイルディスクリプタ番号の管理だ:
+
+- `open()` でファイルを開くと、IDR が未使用の整数 ID (= fd 番号) を割り当て、`struct file *` を紐付ける
+- `read(fd, ...)` では、fd 番号で IDR を検索して `struct file *` を取得する
+- `close(fd)` で IDR から削除する
+
+内部的に XArray を使っている。
+
+```c
+#include <linux/idr.h>
+
+static DEFINE_IDR(my_idr);
+
+/* ID を自動割り当てして ptr を格納 */
+int id = idr_alloc(&my_idr, ptr, 0, 0, GFP_KERNEL);
+/* id >= 0: 割り当てられた ID, id < 0: エラー */
+/* 第3引数: 最小 ID, 第4引数: 最大 ID (0 = 制限なし) */
+
+/* ID から ptr を検索 */
+void *ptr = idr_find(&my_idr, id);
+
+/* ID を削除 */
+idr_remove(&my_idr, id);
+
+/* 全エントリの走査 */
+int id;
+void *ptr;
+idr_for_each_entry(&my_idr, ptr, id) {
+    pr_info("id=%d, ptr=%px\n", id, ptr);
+}
+
+/* 破棄 */
+idr_destroy(&my_idr);
+```
+
+### IDA: 整数 ID の割り当てのみ
+
+IDA (ID Allocator) は IDR のサブセットで、整数 ID の割り当てと解放だけを行う。
+ポインタの紐付けは不要で、「一意な整数 ID がほしい」だけの場面に適している。
+IDR よりメモリ効率が良い。
+
+```c
+#include <linux/idr.h>
+
+static DEFINE_IDA(my_ida);
+
+/* ID を自動割り当て */
+int id = ida_alloc(&my_ida, GFP_KERNEL);       /* 0 から割り当て */
+int id = ida_alloc_min(&my_ida, 1, GFP_KERNEL); /* 1 以上から割り当て */
+int id = ida_alloc_range(&my_ida, 100, 200, GFP_KERNEL); /* 100-200 の範囲 */
+
+/* ID を解放 */
+ida_free(&my_ida, id);
+
+/* 破棄 */
+ida_destroy(&my_ida);
+```
+
+### コード例: デバイス番号管理
+
+```c title="idr_ida_example.c"
+#include <linux/module.h>
+#include <linux/idr.h>
+#include <linux/slab.h>
+
+struct my_device {
+    int id;
+    char name[32];
+};
+
+static DEFINE_IDR(device_idr);
+
+static int register_device(const char *name)
+{
+    struct my_device *dev;
+    int id;
+
+    dev = kmalloc(sizeof(*dev), GFP_KERNEL);
+    if (!dev)
+        return -ENOMEM;
+
+    strscpy(dev->name, name, sizeof(dev->name));
+
+    id = idr_alloc(&device_idr, dev, 0, 0, GFP_KERNEL);
+    if (id < 0) {
+        kfree(dev);
+        return id;
+    }
+
+    dev->id = id;
+    pr_info("registered device: %s (id=%d)\n", dev->name, dev->id);
+    return id;
+}
+
+static void unregister_device(int id)
+{
+    struct my_device *dev = idr_find(&device_idr, id);
+    if (dev) {
+        pr_info("unregistering device: %s (id=%d)\n", dev->name, dev->id);
+        idr_remove(&device_idr, id);
+        kfree(dev);
+    }
+}
+
+static void unregister_all(void)
+{
+    struct my_device *dev;
+    int id;
+
+    idr_for_each_entry(&device_idr, dev, id) {
+        pr_info("cleanup device: %s (id=%d)\n", dev->name, dev->id);
+        kfree(dev);
+    }
+    idr_destroy(&device_idr);
+}
+
+static int __init mymod_init(void)
+{
+    int id1, id2, id3;
+    struct my_device *dev;
+
+    id1 = register_device("eth0");
+    id2 = register_device("wlan0");
+    id3 = register_device("lo");
+
+    /* ID で検索 */
+    dev = idr_find(&device_idr, id2);
+    if (dev)
+        pr_info("found by id %d: %s\n", id2, dev->name);
+
+    /* 1 つ削除 */
+    unregister_device(id1);
+
+    return 0;
+}
+
+static void __exit mymod_exit(void)
+{
+    unregister_all();
+}
+
+module_init(mymod_init);
+module_exit(mymod_exit);
+MODULE_LICENSE("GPL");
+```
+
+## Rust 側の対応
+
+| C データ構造 | Rust (kernel crate) | 状況 |
+|---|---|---|
+| `list_head` | (intrusive list は開発中) | `kernel::list::List` のパッチが投稿されている |
+| `rbtree` | `kernel::rbtree::RBTree` | 利用可能 |
+| XArray | `kernel::xarray::XArray` | 利用可能 |
+| IDR | XArray 経由で代替 | IDR 自体の Rust バインディングはない |
+| `hlist` / hashtable | ─ | 今のところバインディングなし |
+
+Rust カーネルの侵入型リストについては、`list_head` の安全な抽象化が難しいため設計に時間がかかっている。
+主な課題は以下の通りである:
+
+- 侵入型リストのノードは複数のリストに所属しうるため、所有権モデルが複雑
+- `list_head` は自己参照構造であり、`Pin` が必要
+- `container_of` の逆算が unsafe を要求する
+
+## よくある罠
+
+### 1. list_for_each_entry 中に list_del
+
+```c
+/* NG: 走査中にノードを削除すると next ポインタが壊れる */
+list_for_each_entry(dev, &device_list, list) {
+    list_del(&dev->list);  /* 次のイテレーションで不正なポインタを参照 */
+    kfree(dev);
+}
+
+/* OK: _safe 版は事前に next を保存する */
+list_for_each_entry_safe(dev, tmp, &device_list, list) {
+    list_del(&dev->list);
+    kfree(dev);
+}
+```
+
+### 2. rbtree の挿入でキー比較を間違える
+
+比較関数で `<` と `>` を逆にすると、木の構造が壊れて検索が正しく動作しない。
+カーネルには rbtree の整合性チェック機構はないため、テスト時に昇順イテレーション (`rb_first` → `rb_next`) で順序を確認すべきである。
+
+### 3. XArray の xa_store で GFP フラグを忘れる
+
+```c
+/* NG: GFP フラグを指定しないとコンパイルエラー */
+xa_store(&my_xa, idx, ptr);
+
+/* OK */
+xa_store(&my_xa, idx, ptr, GFP_KERNEL);  /* プロセスコンテキスト */
+xa_store(&my_xa, idx, ptr, GFP_ATOMIC);  /* 割込コンテキスト */
+```
+
+XArray は内部でメモリ割り当てを行う可能性があるため、GFP フラグの指定が必須である。
+割込コンテキストでは `GFP_ATOMIC` を使うことを忘れないこと。
+
+### 4. IDR の ID 範囲制限を忘れる
+
+```c
+/* 意図: 1〜255 の範囲で ID を割り当てたい */
+int id = idr_alloc(&my_idr, ptr, 0, 0, GFP_KERNEL);
+/* 間違い! 第3引数 (start) = 0, 第4引数 (end) = 0 で制限なし */
+
+/* 正しい */
+int id = idr_alloc(&my_idr, ptr, 1, 256, GFP_KERNEL);
+/* start=1, end=256 (排他的上限) → 1〜255 の範囲 */
+```
+
+`idr_alloc` の第 4 引数 `end` は **排他的上限** (exclusive upper bound) であることに注意。
+`end = 256` で最大 ID は 255 となる。
+
+## 章末演習
+
+1. **list_head**: 構造体 `struct student { char name[32]; int score; struct list_head list; }` を定義し、5 人分のデータをリストに追加・走査・削除するモジュールを作成せよ。
+2. **rbtree**: 上記の `struct student` を `score` をキーにした rbtree に格納し、昇順に出力するモジュールを作成せよ。同点の場合の処理も考慮すること。
+3. **XArray**: プロセス ID をインデックスとして `task_struct` の `comm` フィールドを記録する XArray を実装し、`xa_for_each` で走査するモジュールを作成せよ。
+4. **hlist**: 上記の `struct student` を `name` のハッシュでハッシュテーブルに格納し、名前で検索するモジュールを作成せよ。
+5. **IDR**: 仮想的なデバイスを IDR で管理し、登録・検索・削除の各操作を実装せよ。ID の範囲を 1〜100 に制限すること。
+
+## 参考資料
+
+- [Linked Lists (kernel.org)](https://www.kernel.org/doc/html/latest/core-api/kernel-api.html#linked-lists) — `list_head` API リファレンス
+- [Red-black Trees (rbtree) in the Linux Kernel (kernel.org)](https://www.kernel.org/doc/html/latest/core-api/rbtree.html) — rbtree の詳細なドキュメント
+- [XArray (kernel.org)](https://www.kernel.org/doc/html/latest/core-api/xarray.html) — XArray API と設計の解説
+- [ID Allocation (kernel.org)](https://www.kernel.org/doc/html/latest/core-api/idr.html) — IDR/IDA リファレンス
+- [Hashtable (kernel.org)](https://www.kernel.org/doc/html/latest/core-api/hashtable.html) — hlist ベースのハッシュテーブル API
+- `include/linux/list.h`, `include/linux/rbtree.h`, `include/linux/xarray.h`, `include/linux/hashtable.h`, `include/linux/idr.h` — 各データ構造のヘッダファイル (実装の理解に最適)

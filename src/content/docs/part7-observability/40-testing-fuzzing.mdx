@@ -1,0 +1,1679 @@
+---
+title: "カーネルテストとファジング"
+description: "kselftest, syzkaller, sparse, Coccinelle, KernelCI, perf, fault injection — カーネルコードの品質保証"
+---
+
+## この章で学ぶこと
+
+- kselftest フレームワークでカーネル機能の回帰テストを書き、実行できるようになる
+- syzkaller のアーキテクチャを理解し、カスタムモジュールに対するファジングを設定できる
+- sparse, smatch, Coccinelle, Clang Static Analyzer による静的解析を使いこなす
+- perf のサブコマンド群を用いてカーネルコードのパフォーマンスを計測・可視化する
+- fault injection でエラーパスの網羅的テストを行う手法を習得する
+- kmemleak によるメモリリーク検出の仕組みを理解する
+- kdump / kexec / crash によるクラッシュダンプ解析のワークフローを把握する
+- Magic SysRq をデバッグに活用できるようになる
+- KernelCI, 0-day bot, LKFT によるカーネル CI/CD の全体像を知る
+- GPIO mockup, IIO dummy, UML を使ったハードウェアシミュレーションテストを理解する
+
+:::note[Rust API ステータス]
+🟢 **安定**: KUnit テスト (doctest → KUnit 自動変換), `make LLVM=1 rusttest`
+この章の他のツール (syzkaller, sparse, Coccinelle, perf) は C 基盤であり Rust コードにも適用可能。
+:::
+
+---
+
+[Ch 23](/part7-observability/23-debug-tracing/) では oops 解析、KASAN/KCSAN/UBSAN、ftrace、kprobe、eBPF を扱った。
+[Ch 29](/part8-practice/29-upstream/) では KUnit と doctest によるユニットテストを解説した。
+
+本章はそれらの **外側** にあるテスト・品質保証の全領域をカバーする。
+カーネル開発における品質保証は単一のツールでは達成できない。
+ユニットテスト、回帰テスト、ファジング、静的解析、動的解析、パフォーマンスプロファイリング、
+障害注入、メモリリーク検出、クラッシュダンプ解析、そして CI/CD パイプライン。
+これらを組み合わせて初めて、カーネルコードの信頼性が担保される。
+
+---
+
+## 40.1 kselftest: カーネル回帰テスト
+
+### フレームワークの概要
+
+kselftest はカーネルのユーザ空間回帰テストフレームワークである。
+`tools/testing/selftests/` 配下にサブシステムごとのテストが配置されている。
+
+```
+tools/testing/selftests/
+├── Makefile           # 全体のビルド/実行制御
+├── kselftest.h        # テスト用ヘルパーマクロ
+├── kselftest_harness.h # テストハーネス (FIXTURE, TEST 等)
+├── bpf/               # eBPF テスト
+├── cgroup/             # cgroup テスト
+├── clone3/             # clone3 syscall テスト
+├── futex/              # futex テスト
+├── gpio/               # GPIO テスト
+├── ipc/                # IPC テスト
+├── kcmp/               # kcmp syscall テスト
+├── kvm/                # KVM テスト
+├── memfd/              # memfd テスト
+├── net/                # ネットワークテスト
+├── seccomp/            # seccomp テスト
+├── timers/             # タイマーテスト
+└── ...                 # その他多数
+```
+
+### TAP 出力フォーマット
+
+kselftest は **TAP (Test Anything Protocol)** 形式で結果を出力する。
+TAP は言語非依存のテスト結果プロトコルであり、CI システムとの連携に適している。
+
+```
+TAP version 13
+1..4
+ok 1 test_basic_allocation
+ok 2 test_aligned_allocation
+not ok 3 test_oversized_allocation # FAIL: expected ENOMEM
+ok 4 test_free_null # SKIP: not applicable on this config
+```
+
+各行の意味:
+
+| 要素 | 説明 |
+|---|---|
+| `1..4` | テスト総数の宣言 |
+| `ok N` | テスト N が成功 |
+| `not ok N` | テスト N が失敗 |
+| `# SKIP` | テストがスキップされた (条件不一致等) |
+| `# TODO` | 既知の未実装テスト |
+
+### テストの書き方
+
+kselftest テストは C プログラムとして記述する。
+`kselftest_harness.h` を使うと、構造化されたテストが書ける。
+
+```c
+/* tools/testing/selftests/my_subsystem/my_test.c */
+#include "../kselftest_harness.h"
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <unistd.h>
+
+/* FIXTURE: テスト間で共有するセットアップ/ティアダウン */
+FIXTURE(my_device) {
+    int fd;
+};
+
+FIXTURE_SETUP(my_device) {
+    self->fd = open("/dev/my_device", O_RDWR);
+    ASSERT_GE(self->fd, 0) {
+        TH_LOG("Cannot open /dev/my_device: %m");
+    }
+}
+
+FIXTURE_TEARDOWN(my_device) {
+    close(self->fd);
+}
+
+/* TEST_F: FIXTURE を使うテスト */
+TEST_F(my_device, read_returns_data) {
+    char buf[64];
+    ssize_t n = read(self->fd, buf, sizeof(buf));
+    ASSERT_GT(n, 0);
+}
+
+TEST_F(my_device, ioctl_get_version) {
+    unsigned int version = 0;
+    int ret = ioctl(self->fd, MY_IOCTL_GET_VERSION, &version);
+    ASSERT_EQ(ret, 0);
+    ASSERT_GT(version, 0);
+}
+
+/* スタンドアロンテスト (FIXTURE なし) */
+TEST(simple_sanity) {
+    ASSERT_EQ(1 + 1, 2);
+}
+
+TEST_HARNESS_MAIN
+```
+
+`kselftest_harness.h` が提供する主なマクロ:
+
+| マクロ | 用途 |
+|---|---|
+| `TEST(name)` | 独立したテストケース |
+| `FIXTURE(name)` | テスト間で共有する状態の定義 |
+| `FIXTURE_SETUP(name)` | テスト前のセットアップ |
+| `FIXTURE_TEARDOWN(name)` | テスト後のクリーンアップ |
+| `TEST_F(fixture, name)` | FIXTURE を使うテストケース |
+| `ASSERT_EQ(a, b)` | `a == b` を検証 (失敗でテスト中断) |
+| `ASSERT_NE(a, b)` | `a != b` を検証 |
+| `ASSERT_GT(a, b)` | `a > b` を検証 |
+| `EXPECT_EQ(a, b)` | `a == b` を検証 (失敗してもテスト継続) |
+| `TH_LOG(fmt, ...)` | テストログの出力 |
+| `TEST_HARNESS_MAIN` | main 関数の生成 |
+
+### Makefile の構造
+
+テストディレクトリには `Makefile` を配置する:
+
+```makefile
+# tools/testing/selftests/my_subsystem/Makefile
+TEST_GEN_PROGS := my_test
+TEST_GEN_PROGS += another_test
+
+# シェルスクリプトベースのテスト
+TEST_PROGS := run_integration_test.sh
+
+# 依存ヘッダ
+TEST_GEN_PROGS_EXTENDED := helper_program
+
+# カーネルヘッダへのパス
+CFLAGS += -I$(top_srcdir)/usr/include
+
+include ../lib.mk
+```
+
+### テストの実行
+
+```bash
+# 特定のサブシステムのテストだけ実行
+make -C tools/testing/selftests TARGETS=my_subsystem run_tests
+
+# 複数サブシステムを同時に
+make -C tools/testing/selftests \
+    TARGETS="net timers cgroup" run_tests
+
+# 全テストを実行 (非常に時間がかかる)
+make -C tools/testing/selftests run_tests
+
+# インストールしてからリモートマシンで実行
+make -C tools/testing/selftests install INSTALL_PATH=/path/to/output
+# /path/to/output/run_kselftest.sh を対象マシンにコピーして実行
+```
+
+### QEMU 上での実行
+
+開発中のカーネルでは QEMU 上でテストを実行することが多い:
+
+```bash
+# kselftest をビルドしてインストール
+make -C tools/testing/selftests install INSTALL_PATH=./kselftest-install
+
+# initramfs に kselftest を含めて QEMU で起動
+# (initramfs の作成方法はプロジェクトによって異なる)
+qemu-system-x86_64 \
+    -kernel arch/x86/boot/bzImage \
+    -initrd initramfs-with-selftests.img \
+    -append "console=ttyS0" \
+    -nographic
+```
+
+---
+
+## 40.2 syzkaller: カバレッジ誘導カーネルファジング
+
+### 概要
+
+syzkaller は Google が開発したカーネル専用のカバレッジ誘導ファザーである。
+システムコールの引数をランダムに生成・変異させ、カーネルのクラッシュやバグを自動的に発見する。
+
+Linux カーネルのバグの多くは syzkaller によって発見されており、
+[syzbot](https://syzkaller.appspot.com/) は発見したバグを自動でメーリングリストに報告する。
+2026 年 4 月時点で、syzbot が報告したバグは数千件に上り、
+そのうちの大部分が修正されている。
+
+### アーキテクチャ
+
+syzkaller は 3 つのコンポーネントから構成される。
+
+```
+┌──────────────────────────────────────────────────────┐
+│                  ホストマシン                          │
+│                                                       │
+│  ┌─────────────┐     ┌──────────────────────────┐    │
+│  │ syz-manager │────→│     コーパス DB           │    │
+│  │  (Go)       │     │  (入力プログラムの集合)    │    │
+│  └──────┬──────┘     └──────────────────────────┘    │
+│         │                                             │
+│         │ VM 管理 (QEMU/GCE/etc.)                     │
+│         ▼                                             │
+│  ┌─────────────────────────────────────────────┐     │
+│  │           仮想マシン (複数)                    │     │
+│  │  ┌────────────┐     ┌────────────────────┐  │     │
+│  │  │ syz-fuzzer │────→│   syz-executor     │  │     │
+│  │  │  (Go)      │     │   (C, ユーザ空間)   │  │     │
+│  │  └────────────┘     └────────────────────┘  │     │
+│  │                            │                  │     │
+│  │                            ▼                  │     │
+│  │                     ┌────────────┐           │     │
+│  │                     │   Kernel   │           │     │
+│  │                     │ (KCOV有効) │           │     │
+│  │                     └────────────┘           │     │
+│  └─────────────────────────────────────────────┘     │
+└──────────────────────────────────────────────────────┘
+```
+
+| コンポーネント | 言語 | 役割 |
+|---|---|---|
+| **syz-manager** | Go | VM の起動・管理、コーパスの管理、クラッシュの収集・重複排除、Web UI の提供 |
+| **syz-fuzzer** | Go | VM 内で動作。プログラムの生成・変異、カバレッジフィードバックの収集 |
+| **syz-executor** | C | VM 内で動作。生成されたプログラム (システムコール列) を実際に実行する |
+
+### syzlang: システムコール記述言語
+
+syzkaller はシステムコールのインターフェースを **syzlang** という独自の記述言語で定義する。
+これにより、ファザーは各引数の型と制約を理解した上で意味のある入力を生成できる。
+
+```syzlang
+# ファイルディスクリプタの型を定義
+resource fd[int32]: 0xffffffffffffffff
+
+# open システムコールの記述
+open(file ptr[in, filename], flags flags[open_flags], mode flags[open_mode]) fd
+
+# flags の定義
+open_flags = O_RDONLY, O_WRONLY, O_RDWR, O_CREAT, O_EXCL, O_TRUNC, O_APPEND
+open_mode = S_IRUSR, S_IWUSR, S_IXUSR, S_IRGRP, S_IWGRP
+
+# ioctl の記述 (デバイス固有)
+ioctl$MY_DEV_SET_MODE(fd fd, cmd const[MY_IOCTL_SET_MODE], arg ptr[in, my_mode])
+
+my_mode {
+    mode    int32[0:3]     # 0 から 3 の範囲
+    flags   int32
+    name    array[int8, 32] # 32 バイトの配列
+}
+
+# read/write の記述
+read$MY_DEV(fd fd, buf ptr[out, array[int8]], len bytesize[buf])
+write$MY_DEV(fd fd, buf ptr[in, array[int8]], len bytesize[buf])
+```
+
+syzlang の主な型:
+
+| 型 | 説明 |
+|---|---|
+| `int8`, `int16`, `int32`, `int64` | 整数型 |
+| `intN[min:max]` | 範囲制約付き整数 |
+| `ptr[in, type]` | 入力ポインタ |
+| `ptr[out, type]` | 出力ポインタ |
+| `ptr[inout, type]` | 入出力ポインタ |
+| `flags[name]` | フラグ集合 |
+| `const[value]` | 固定値 |
+| `resource` | リソース (fd 等) の依存関係 |
+| `array[type, N]` | 固定長配列 |
+| `array[type]` | 可変長配列 |
+| `bytesize[field]` | 他フィールドのバイトサイズ |
+| `filename` | ファイルパス (ファザーが自動生成) |
+
+### バグ発見のメカニズム
+
+syzkaller がバグを効率的に見つけるメカニズムは以下の通りである。
+
+**1. カバレッジフィードバック (KCOV)**
+
+カーネルを `CONFIG_KCOV=y` でビルドすると、コンパイラが各基本ブロックにカバレッジ計装を挿入する。
+syz-executor は `ioctl(fd, KCOV_ENABLE, ...)` でカバレッジ収集を開始し、
+実行後にどの基本ブロックが新たに到達されたかを syz-fuzzer に報告する。
+
+**2. コーパス管理と変異**
+
+新しいカバレッジを生み出したプログラムはコーパスに追加される。
+次の反復では、コーパスから選ばれたプログラムに対して以下の変異が適用される。
+
+- 引数値のランダム変更
+- システムコールの追加・削除・入れ替え
+- リソース (fd 等) の依存関係を考慮した変異
+- 複数のコーパスエントリのスプライシング (結合)
+
+**3. バグ検出**
+
+syzkaller は以下の方法でバグを検出する。
+
+| 検出方法 | 説明 |
+|---|---|
+| カーネル oops / panic | dmesg に `BUG:` や `Oops:` が出現 |
+| KASAN レポート | use-after-free, out-of-bounds |
+| KCSAN レポート | データ競合 |
+| UBSAN レポート | 未定義動作 |
+| ハングアップ | VM が応答しなくなった場合 |
+| RCU stall | RCU のコールバックが滞留 |
+
+### syzkaller のセットアップ
+
+以下は、カスタムカーネルモジュールに対して syzkaller を実行するための手順である。
+
+**ステップ 1: カーネルの設定**
+
+```bash
+# 必須のデバッグオプション
+scripts/config --enable KCOV
+scripts/config --enable KCOV_INSTRUMENT_ALL
+scripts/config --enable DEBUG_INFO
+scripts/config --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+scripts/config --enable KASAN
+scripts/config --enable KASAN_GENERIC
+
+# 推奨オプション
+scripts/config --enable KCSAN
+scripts/config --enable UBSAN
+scripts/config --enable CONFIGFS_FS
+scripts/config --enable SECURITYFS
+scripts/config --enable DEBUG_KMEMLEAK
+
+# ネットワーク (syz-manager との通信用)
+scripts/config --enable VIRTIO_NET
+scripts/config --enable NET_9P
+scripts/config --enable NET_9P_VIRTIO
+scripts/config --enable 9P_FS
+
+make LLVM=1 olddefconfig
+make LLVM=1 -j$(nproc)
+```
+
+**ステップ 2: syzkaller のビルド**
+
+```bash
+# Go のインストール (1.21 以上が必要)
+# syzkaller のクローンとビルド
+git clone https://github.com/google/syzkaller.git
+cd syzkaller
+make
+```
+
+**ステップ 3: VM イメージの作成**
+
+```bash
+# Debian ベースのイメージを作成 (syzkaller 付属スクリプト)
+sudo apt-get install debootstrap
+cd syzkaller/tools
+./create-image.sh
+# これにより stretch.img と stretch.id_rsa が生成される
+```
+
+**ステップ 4: カスタムモジュール用の syzlang 記述**
+
+自作のキャラクタデバイスドライバをファジングする場合:
+
+```syzlang
+# sys/linux/my_driver.txt
+
+include <linux/ioctl.h>
+include <my_driver_uapi.h>
+
+resource fd_mydrv[fd]
+
+openat$mydrv(fd const[AT_FDCWD], file ptr[in, string["/dev/my_driver"]],
+             flags flags[open_flags], mode const[0]) fd_mydrv
+
+read$mydrv(fd fd_mydrv, buf ptr[out, array[int8]], len bytesize[buf])
+write$mydrv(fd fd_mydrv, buf ptr[in, array[int8]], len bytesize[buf])
+
+ioctl$mydrv_set_mode(fd fd_mydrv, cmd const[0x4d01],
+                     arg ptr[in, mydrv_config])
+ioctl$mydrv_get_status(fd fd_mydrv, cmd const[0x4d02],
+                       arg ptr[out, mydrv_status])
+
+close$mydrv(fd fd_mydrv)
+
+mydrv_config {
+    mode    int32[0:3]
+    timeout int32[0:10000]
+    flags   int32
+}
+
+mydrv_status {
+    state       int32
+    error_count int32
+    uptime_ms   int64
+}
+```
+
+syzlang ファイルを追加したら、syzkaller を再ビルドする:
+
+```bash
+cd syzkaller
+make generate   # syzlang → Go コードの生成
+make
+```
+
+**ステップ 5: 設定ファイル**
+
+```json
+{
+    "target": "linux/amd64",
+    "http": "127.0.0.1:56741",
+    "workdir": "/home/user/syzkaller-workdir",
+    "kernel_obj": "/home/user/linux",
+    "image": "/home/user/syzkaller/tools/stretch.img",
+    "sshkey": "/home/user/syzkaller/tools/stretch.id_rsa",
+    "syzkaller": "/home/user/syzkaller",
+    "procs": 4,
+    "type": "qemu",
+    "vm": {
+        "count": 4,
+        "kernel": "/home/user/linux/arch/x86/boot/bzImage",
+        "cpu": 2,
+        "mem": 2048
+    },
+    "enable_syscalls": [
+        "openat$mydrv",
+        "read$mydrv",
+        "write$mydrv",
+        "ioctl$mydrv_set_mode",
+        "ioctl$mydrv_get_status",
+        "close$mydrv"
+    ]
+}
+```
+
+**ステップ 6: 実行**
+
+```bash
+./bin/syz-manager -config my_config.json
+# Web UI: http://127.0.0.1:56741
+```
+
+Web UI ではカバレッジの推移、発見されたクラッシュ、再現プログラムなどが確認できる。
+
+### Rust モジュールへのファジング
+
+Rust で書いたカーネルモジュールも同じ方法でファジングできる。
+カーネルから見れば Rust モジュールも通常のカーネルモジュールであり、
+デバイスファイルやシステムコールインターフェースは同一だからである。
+
+注意点:
+
+- Rust のパニックはカーネル oops に変換されるため、syzkaller が検出できる
+- KASAN は Rust コード内の `unsafe` ブロックにも有効である
+- `kernel::error::Result` でエラーを返す正常パスは syzkaller では検出対象にならないが、fault injection と組み合わせることでエラーパスのテストが可能になる
+
+---
+
+## 40.3 静的解析ツール
+
+### sparse: カーネル専用の型チェッカー
+
+sparse は Linus Torvalds が作成したカーネル専用の軽量静的解析ツールである。
+C 言語の標準を超えた**カーネル固有のアノテーション**を解析し、
+通常のコンパイラでは検出できないバグを見つける。
+
+#### 検出できる問題
+
+| カテゴリ | アノテーション | 検出する問題 |
+|---|---|---|
+| アドレス空間 | `__user`, `__kernel`, `__iomem` | ユーザ空間ポインタの直接デリファレンス |
+| エンディアン | `__be16`, `__le32` 等 | ホストバイトオーダーとの混用 |
+| ビット幅 | `__bitwise` | 異なるビット幅型の混合演算 |
+| ロック | `__acquires()`, `__releases()` | ロックの獲得/解放の不均衡 |
+| シンボル | `static` 宣言漏れ | ファイルスコープであるべき関数の外部リンケージ |
+
+#### 実行方法
+
+```bash
+# 全ソースコードに対して sparse を実行
+make C=1 LLVM=1
+
+# 変更されたファイルのみチェック (インクリメンタル)
+make C=2 LLVM=1
+
+# 特定のファイルのみ
+make C=1 LLVM=1 drivers/my_driver/core.o
+
+# 警告を増やす
+make C=1 LLVM=1 CF="-Wsparse-all"
+```
+
+#### 典型的な警告と対処法
+
+**1. __user ポインタの不正使用**
+
+```c
+/* BAD: ユーザ空間ポインタを直接デリファレンス */
+static ssize_t my_read(struct file *f, char __user *buf,
+                       size_t count, loff_t *pos)
+{
+    char *data = get_data();
+    memcpy(buf, data, count);  /* sparse 警告! */
+    return count;
+}
+
+/* GOOD: copy_to_user を使用 */
+static ssize_t my_read(struct file *f, char __user *buf,
+                       size_t count, loff_t *pos)
+{
+    char *data = get_data();
+    if (copy_to_user(buf, data, count))
+        return -EFAULT;
+    return count;
+}
+```
+
+sparse 出力:
+
+```
+warning: incorrect type in argument 1 (different address spaces)
+   expected void *
+   got char [noderef] __user *buf
+```
+
+**2. エンディアンの混用**
+
+```c
+/* BAD: ネットワークバイトオーダーとホストバイトオーダーの混用 */
+struct my_header {
+    __be32 src_addr;
+    __be32 dst_addr;
+};
+
+void process(struct my_header *hdr) {
+    u32 addr = hdr->src_addr;        /* sparse 警告! */
+    if (addr == 0x0a000001) { ... }  /* 間違った比較 */
+}
+
+/* GOOD: 変換関数を使用 */
+void process(struct my_header *hdr) {
+    u32 addr = be32_to_cpu(hdr->src_addr);  /* OK */
+    if (addr == 0x0a000001) { ... }
+}
+```
+
+**3. ロックの不均衡**
+
+```c
+void my_func(struct mutex *lock) __acquires(lock) __releases(lock)
+{
+    mutex_lock(lock);
+    if (error_condition)
+        return;          /* sparse 警告: lock を解放せずにリターン */
+    mutex_unlock(lock);
+}
+```
+
+### smatch: フロー解析ベースの静的解析
+
+smatch は Dan Carpenter が開発したカーネル向け静的解析ツールである。
+sparse よりも高度なフロー解析を行い、以下のようなバグを検出する。
+
+| 検出カテゴリ | 例 |
+|---|---|
+| NULL ポインタデリファレンス | 戻り値の NULL チェック漏れ |
+| 整数オーバーフロー | `kmalloc(n * sizeof(*p))` での乗算オーバーフロー |
+| ロックバグ | 異なるパスでのロック取得/解放の不一致 |
+| エラーコードの不正 | `ERR_PTR()` の戻り値を `IS_ERR()` でチェックせずに使用 |
+| ユーザ入力の未検証 | `copy_from_user` 後の値を検証せずにインデックスとして使用 |
+
+```bash
+# smatch のインストールと実行
+git clone https://repo.or.cz/smatch.git
+cd smatch && make
+cd /path/to/linux
+
+# smatch による解析
+make CHECK=/path/to/smatch/smatch C=1 LLVM=1
+
+# smatch の全チェックを有効化
+make CHECK="/path/to/smatch/smatch -p=kernel" C=1 LLVM=1
+```
+
+smatch は cross-function analysis (関数間解析) が可能であり、
+例えば関数 A が返すポインタが NULL になりうることを関数 B の呼び出し側で検出できる。
+この能力は sparse にはない。
+
+### Coccinelle: セマンティックパッチ
+
+Coccinelle は **SmPL (Semantic Patch Language)** を用いてソースコードのパターンマッチングと
+自動変換を行うツールである。正規表現による文字列置換と異なり、
+**C 言語の構文と意味を理解した上で**変換を行う点が特徴である。
+
+#### SmPL の基本構文
+
+SmPL はパッチ形式で記述する。`-` が削除行、`+` が追加行、
+その他はマッチングパターンである。
+
+**例 1: kfree 後の NULL 代入の追加**
+
+```cocci
+// scripts/coccinelle/free/kfree.cocci (簡略化)
+@@
+expression E;
+@@
+  kfree(E);
++ E = NULL;
+```
+
+このパッチは、`kfree(E)` の呼び出しの直後に `E = NULL;` を追加する。
+use-after-free の防止策として有効である。
+
+**例 2: 非推奨 API の置換**
+
+```cocci
+// pci_alloc_consistent → dma_alloc_coherent への移行
+@@
+expression dev, size, handle;
+@@
+- pci_alloc_consistent(dev, size, handle)
++ dma_alloc_coherent(&dev->dev, size, handle, GFP_KERNEL)
+```
+
+**例 3: エラー処理パターンの検出**
+
+```cocci
+// kmalloc の戻り値を検証せずに使用しているコードを検出
+@@
+expression E;
+expression size;
+@@
+  E = kmalloc(size, ...);
+* /* E の NULL チェックなしに E を使用 */
+  ... when != if (E == NULL) { ... }
+      when != if (!E) { ... }
+      when != if (IS_ERR(E)) { ... }
+  E->...
+```
+
+`*` は report モードで「この行に問題がある」と報告するために使用される。
+
+**例 4: カスタムモジュールの API 移行**
+
+自分のプロジェクトで API を変更する場合にも有用である:
+
+```cocci
+// old_api_init(x, y) → new_api_init(x, y, DEFAULT_FLAGS) への移行
+@@
+expression x, y;
+@@
+- old_api_init(x, y)
++ new_api_init(x, y, DEFAULT_FLAGS)
+```
+
+#### メタ変数と制約
+
+SmPL では変数に型制約を付けることができる:
+
+```cocci
+@@
+type T;
+T *p;
+expression E;
+@@
+  p = kmalloc(
+-   sizeof(T)
++   sizeof(*p)
+  , E);
+```
+
+これは `kmalloc(sizeof(struct my_struct), ...)` を
+`kmalloc(sizeof(*p), ...)` に変換する。
+型名が変わってもコードが追従するため、保守性が向上する。
+
+#### 実行方法
+
+```bash
+# カーネル組み込みの全チェックを report モードで実行
+make coccicheck MODE=report
+
+# patch モードで自動修正を適用
+make coccicheck MODE=patch
+
+# context モードで変更箇所の前後を表示
+make coccicheck MODE=context
+
+# 特定の SmPL ファイルを指定
+make coccicheck COCCI=scripts/coccinelle/api/kfree.cocci MODE=report
+
+# 特定ディレクトリに限定
+make coccicheck M=drivers/my_driver/ MODE=report
+
+# 自作の SmPL スクリプトを適用
+spatch --sp-file my_rule.cocci --dir drivers/my_driver/
+```
+
+カーネルツリーの `scripts/coccinelle/` には多数の SmPL スクリプトが同梱されている:
+
+```
+scripts/coccinelle/
+├── api/           # API 使用の正しさチェック
+│   ├── alloc/     # メモリアロケーション関連
+│   ├── kfree.cocci
+│   └── ...
+├── free/          # 解放関連の問題
+├── iterators/     # イテレータの誤用
+├── locks/         # ロック関連
+├── misc/          # その他
+└── null/          # NULL ポインタ関連
+```
+
+### Clang Static Analyzer (scan-build)
+
+Clang Static Analyzer はシンボリック実行に基づく静的解析ツールである。
+カーネルのビルドシステムと組み合わせて使用できる。
+
+```bash
+# scan-build でカーネルをビルド (HTML レポートを生成)
+scan-build make LLVM=1 -j$(nproc) 2>&1 | tee scan-build.log
+
+# 特定ディレクトリのみ
+scan-build make LLVM=1 drivers/my_driver/
+
+# 結果は /tmp/scan-build-XXXX/ に HTML として出力される
+# ブラウザで開いて確認
+```
+
+Clang Static Analyzer は以下を検出する:
+
+| チェッカー | 検出対象 |
+|---|---|
+| `core.NullDereference` | NULL ポインタデリファレンス |
+| `core.DivideZero` | ゼロ除算 |
+| `unix.Malloc` | メモリリーク、二重解放 |
+| `security.insecureAPI` | 安全でない API の使用 |
+
+sparse や smatch と比べてカーネル固有の知識は持たないが、
+一般的な C のバグパターンを高精度で検出する。
+
+### 静的解析ツールの比較
+
+| ツール | 強み | カーネル固有知識 | 速度 |
+|---|---|---|---|
+| **sparse** | `__user`, エンディアン, ロックアノテーション | 非常に高い | 高速 |
+| **smatch** | フロー解析, 関数間解析, 整数オーバーフロー | 高い | 中程度 |
+| **Coccinelle** | パターンベースの検出と自動修正 | 中程度 | 低速 |
+| **Clang SA** | シンボリック実行, パス感度の高い解析 | 低い | 低速 |
+
+**推奨ワークフロー:** 日常的には `make C=1` (sparse) を使い、パッチ送信前に
+`make coccicheck` を実行する。smatch と Clang SA は定期的な深堀り調査に使う。
+
+---
+
+## 40.4 perf: パフォーマンスプロファイリング
+
+[Ch 23](/part7-observability/23-debug-tracing/) では perf の概要を紹介した。
+ここではサブコマンドごとに詳細な使い方を解説する。
+
+### ハードウェア PMU カウンタ
+
+perf はCPU の **PMU (Performance Monitoring Unit)** ハードウェアカウンタを利用する。
+現代の CPU は数百種のハードウェアイベントを計測でき、perf はそれらを統一的な
+インターフェースで操作する。
+
+主要なハードウェアイベント:
+
+| イベント | 意味 |
+|---|---|
+| `cycles` | CPU サイクル数 |
+| `instructions` | 実行命令数 |
+| `cache-references` | キャッシュアクセス数 |
+| `cache-misses` | キャッシュミス数 |
+| `branch-instructions` | 分岐命令数 |
+| `branch-misses` | 分岐予測ミス数 |
+| `L1-dcache-load-misses` | L1 データキャッシュのロードミス |
+| `LLC-load-misses` | LLC (Last Level Cache) のロードミス |
+
+### perf stat: 集約統計
+
+`perf stat` はプログラム全体の実行に対する集約的な統計を出力する。
+
+```bash
+# 特定コマンドの統計
+sudo perf stat insmod my_module.ko
+
+# 出力例:
+#  Performance counter stats for 'insmod my_module.ko':
+#
+#          12.345 ms   task-clock        # 0.891 CPUs utilized
+#               4     context-switches
+#               1     cpu-migrations
+#             892     page-faults
+#      48,123,456     cycles            # 3.899 GHz
+#      32,456,789     instructions      # 0.67  insn per cycle (IPC)
+#       5,678,901     branches          # 460.120 M/sec
+#         234,567     branch-misses     # 4.13%
+#
+#       0.013856 s    elapsed
+
+# システム全体を一定時間計測
+sudo perf stat -a sleep 5
+
+# 特定のイベントを指定
+sudo perf stat -e cycles,instructions,cache-misses,LLC-load-misses \
+    insmod my_module.ko
+
+# 詳細統計
+sudo perf stat -d insmod my_module.ko
+
+# 反復実行して統計の安定性を確認
+sudo perf stat -r 10 insmod my_module.ko
+```
+
+**IPC (Instructions Per Cycle)** はコードの効率性を示す重要な指標である。
+IPC が低い場合、キャッシュミスやメモリアクセスの遅延が原因であることが多い。
+
+| IPC | 解釈 |
+|---|---|
+| > 2.0 | 非常に効率的 (計算集約的コード) |
+| 1.0 - 2.0 | 一般的 |
+| < 1.0 | メモリバウンドの可能性が高い |
+| < 0.5 | 深刻なメモリアクセスボトルネック |
+
+### perf record / perf report: サンプリングプロファイリング
+
+`perf record` は定期的にサンプリングを行い、どの関数が CPU 時間を消費しているかを記録する。
+
+```bash
+# カーネルモジュールのロードをプロファイリング (コールチェーン付き)
+sudo perf record -g insmod my_module.ko
+
+# 特定の PID をプロファイリング
+sudo perf record -g -p $(pidof my_daemon) -- sleep 10
+
+# システム全体をプロファイリング
+sudo perf record -g -a -- sleep 30
+
+# サンプリング周波数を指定 (デフォルトは 4000 Hz)
+sudo perf record -g -F 999 -a -- sleep 10
+
+# dwarf フレームポインタでコールチェーンを取得
+sudo perf record --call-graph dwarf -a -- sleep 10
+```
+
+結果の確認:
+
+```bash
+sudo perf report
+
+# 出力例 (TUI インターフェース):
+#  Overhead  Shared Object   Symbol
+#  ........  ..............  ............................
+#    25.30%  [kernel]        [k] copy_user_enhanced_fast_string
+#    12.45%  [my_module]     [k] my_driver_process_data
+#     8.67%  [kernel]        [k] __alloc_pages
+#     6.23%  [kernel]        [k] page_fault
+#     4.56%  libc.so.6       [.] __memcpy_avx_unaligned
+
+# stdio 出力 (スクリプト処理向き)
+sudo perf report --stdio
+
+# コールチェーンを展開
+sudo perf report --call-graph=callee
+```
+
+### フレームグラフ
+
+フレームグラフは Brendan Gregg が考案した可視化手法であり、
+プロファイリング結果をスタックトレースの集約として描画する。
+
+```bash
+# perf データを収集
+sudo perf record -g -F 99 -a -- sleep 30
+
+# Brendan Gregg の FlameGraph ツールを使用
+git clone https://github.com/brendangregg/FlameGraph.git
+
+# perf スクリプトデータを変換
+sudo perf script | ./FlameGraph/stackcollapse-perf.pl > collapsed.txt
+
+# SVG フレームグラフを生成
+./FlameGraph/flamegraph.pl collapsed.txt > flamegraph.svg
+
+# ブラウザで flamegraph.svg を開く
+```
+
+フレームグラフの読み方:
+
+| 要素 | 意味 |
+|---|---|
+| 横幅 | その関数が CPU 上にいた時間の割合 (広いほど多い) |
+| 縦方向 | コールスタックの深さ (下が呼び出し元、上が呼び出し先) |
+| 色 | デフォルトではランダム (意味なし)。赤/青でカーネル/ユーザを区別する設定も可能 |
+
+カーネルモジュールのホットスポットを特定するには、
+フレームグラフ内でモジュール名 (`[my_module]`) を検索すると効果的である。
+
+### perf probe: 動的トレーシング
+
+`perf probe` は kprobe を perf のイベントとして登録する。
+ftrace の kprobe と同じ仕組みだが、perf のサンプリング基盤と統合されるため、
+プロファイリングと組み合わせた解析が可能になる。
+
+```bash
+# 関数の入口にプローブを追加
+sudo perf probe --add my_driver_read
+
+# 引数付きプローブ (ソースコード参照)
+sudo perf probe --add 'my_driver_read count'
+
+# 戻り値のプローブ
+sudo perf probe --add 'my_driver_read%return $retval'
+
+# プローブでサンプリング
+sudo perf record -e probe:my_driver_read -a -- sleep 10
+sudo perf report
+
+# プローブの一覧と削除
+sudo perf probe --list
+sudo perf probe --del my_driver_read
+```
+
+---
+
+## 40.5 fault injection: エラーパスのテスト
+
+### 課題: エラーパスのテスト困難性
+
+カーネルコードでは多くの関数呼び出しがエラーを返す可能性がある。
+`kmalloc` がメモリ不足で NULL を返す場合、`request_irq` が失敗する場合など。
+しかし、通常の実行ではこれらのエラーパスはほとんど実行されない。
+
+fault injection はカーネルに**意図的にエラーを注入**する仕組みであり、
+エラーパスの正しさをテストするために不可欠である。
+
+### カーネルコンフィグ
+
+```bash
+scripts/config --enable FAULT_INJECTION
+scripts/config --enable FAULT_INJECTION_DEBUG_FS
+scripts/config --enable FAIL_SLAB           # kmalloc/kmem_cache_alloc の失敗
+scripts/config --enable FAIL_PAGE_ALLOC     # ページアロケーションの失敗
+scripts/config --enable FAIL_MAKE_REQUEST   # ブロック I/O リクエストの失敗
+scripts/config --enable FAIL_IO_TIMEOUT     # I/O タイムアウトの注入
+scripts/config --enable FAIL_FUTEX          # futex 操作の失敗
+
+make LLVM=1 olddefconfig
+make LLVM=1 -j$(nproc)
+```
+
+### debugfs 制御インターフェース
+
+fault injection は `/sys/kernel/debug/fail_*/` を通じて制御する。
+
+```bash
+# slab allocator の fault injection を設定
+cd /sys/kernel/debug/fail_slab
+
+# 確率: 100 回に 1 回失敗させる (値は分母)
+echo 100 > probability
+
+# 間隔: 最低 10 回の成功を保証してから次の失敗を注入
+echo 10 > interval
+
+# スペース: 残りメモリが N ページ以上ある場合のみ失敗させる (0 で無制限)
+echo 0 > space
+
+# 回数制限: 最大 100 回まで失敗を注入 (-1 で無制限)
+echo 100 > times
+
+# 有効化
+echo 1 > task-filter  # 現在のタスクにのみ適用
+```
+
+### スタックトレースフィルタリング
+
+特定の関数からのアロケーションだけを失敗させることができる:
+
+```bash
+# スタックトレースフィルタを設定
+cd /sys/kernel/debug/fail_slab
+
+# スタックの深さ (何フレーム遡って確認するか)
+echo 5 > stacktrace-depth
+
+# 特定のモジュールからのアロケーションのみ失敗させる
+echo "my_module" > require-start
+echo "" > require-end
+echo "!should_not_fail" > reject-start  # この関数からは除外
+```
+
+### 実践例: モジュールのエラーパステスト
+
+```bash
+#!/bin/bash
+# test_error_paths.sh - モジュールのエラーパスを網羅的にテスト
+
+MODULE="my_module"
+DEBUGFS="/sys/kernel/debug/fail_slab"
+
+# テスト 1: probe 中のメモリ割り当て失敗
+echo "=== Test: allocation failure during probe ==="
+echo 5 > $DEBUGFS/probability
+echo 0 > $DEBUGFS/interval
+echo 1 > $DEBUGFS/times        # 1 回だけ失敗
+echo Y > $DEBUGFS/task-filter
+
+# bash のプロセスに対して fault injection を有効化
+echo 1 > /proc/self/make-it-fail
+
+insmod ${MODULE}.ko
+RESULT=$?
+
+# fault injection を無効化
+echo 0 > /proc/self/make-it-fail
+echo 0 > $DEBUGFS/times
+
+if [ $RESULT -ne 0 ]; then
+    echo "PASS: module correctly handled allocation failure"
+else
+    echo "WARNING: module loaded despite allocation failure"
+    rmmod $MODULE
+fi
+
+# カーネルログを確認 (oops がないこと)
+dmesg | tail -20
+```
+
+### Rust モジュールとの関連
+
+Rust モジュールでは `kernel::error::Result` を通じたエラーハンドリングが強制されるため、
+C モジュールと比べてエラーパスのハンドリング漏れが起きにくい。
+しかし、エラーパスの**ロジック**が正しいかは別問題であり、
+fault injection によるテストは依然として重要である。
+
+```rust
+// Rust モジュールのエラーパスの例
+impl kernel::Module for MyModule {
+    fn init(_module: &'static ThisModule) -> Result<Self> {
+        // kmalloc が失敗した場合 → Err(ENOMEM) が返る
+        let buf = KVec::<u8>::with_capacity(4096, GFP_KERNEL)?;
+
+        // ここに到達 = アロケーション成功
+        // fault injection で ? の後のクリーンアップが正しいか検証できる
+        let irq = request_irq(...)?;  // これも失敗させてテスト可能
+
+        Ok(Self { buf, irq })
+    }
+}
+```
+
+fault injection で `kmalloc` を失敗させると、`KVec::with_capacity` が `Err(ENOMEM)` を返し、
+`?` により `init` が即座にエラーリターンする。
+このとき、既にアロケートしたリソースが正しく解放されるかを確認する。
+
+---
+
+## 40.6 kmemleak: メモリリーク検出
+
+### 仕組み
+
+kmemleak はカーネル内のメモリリークを検出するツールである。
+ガベージコレクタに似たスキャンアルゴリズムを使用する。
+
+1. `kmalloc`, `vmalloc` 等のアロケーションを追跡し、割り当てられたメモリの一覧を保持する
+2. 定期的にカーネルメモリ全体をスキャンし、各割り当てへの参照が存在するかを確認する
+3. どこからも参照されていない割り当てを「orphan (孤児)」としてリークの疑いがあると報告する
+
+### 有効化と使用方法
+
+```bash
+# カーネルコンフィグ
+scripts/config --enable DEBUG_KMEMLEAK
+scripts/config --set-val DEBUG_KMEMLEAK_DEFAULT_OFF 0  # ブート時から有効
+
+make LLVM=1 olddefconfig
+make LLVM=1 -j$(nproc)
+```
+
+```bash
+# スキャンを手動で実行
+echo scan > /sys/kernel/debug/kmemleak
+
+# 結果を確認
+cat /sys/kernel/debug/kmemleak
+
+# 出力例:
+# unreferenced object 0xffff888100a5c000 (size 4096):
+#   comm "insmod", pid 1234, jiffies 4294967890 (age 120.456s)
+#   hex dump (first 32 bytes):
+#     00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00  ................
+#   backtrace:
+#     [<ffffffff81234567>] kmalloc_trace+0x28/0x40
+#     [<ffffffffa0001234>] my_driver_init+0x34/0x80 [my_module]
+#     [<ffffffff81123456>] do_one_initcall+0x46/0x200
+
+# 結果をクリア
+echo clear > /sys/kernel/debug/kmemleak
+
+# kmemleak を無効化
+echo off > /sys/kernel/debug/kmemleak
+```
+
+### 自動スキャン間隔の設定
+
+```bash
+# スキャン間隔を 60 秒に設定 (デフォルト 600 秒)
+echo scan=60 > /sys/kernel/debug/kmemleak
+```
+
+### 偽陽性への対処
+
+kmemleak は保守的なスキャンを行うが、偽陽性が発生することがある。
+例えば、ポインタが XOR エンコードされている場合や、ポインタがアラインメントされていない
+位置に格納されている場合、kmemleak はそれを参照として認識できない。
+
+カーネルコード側で偽陽性を抑制するには:
+
+```c
+/* このアロケーションを kmemleak の追跡から除外 */
+ptr = kmalloc(size, GFP_KERNEL);
+kmemleak_not_leak(ptr);
+
+/* 間接参照 (ポインタが構造体の奥深くにある) を明示 */
+kmemleak_no_scan(ptr);
+```
+
+---
+
+## 40.7 kdump / kexec / crash: クラッシュダンプ解析
+
+### 概要
+
+カーネルパニックが発生した場合、通常は再起動してしまうため原因調査が困難である。
+**kdump** はパニック時にメモリダンプを採取する仕組みであり、
+**kexec** (カーネル間ジャンプ) を利用して実現される。
+
+### 動作原理
+
+```
+通常のカーネル (1st kernel)
+    ↓ パニック発生!
+    ↓ kexec で「キャプチャカーネル」(2nd kernel) にジャンプ
+キャプチャカーネル (2nd kernel)
+    ↓ 予約済みメモリ領域で起動 (1st kernel のメモリを破壊しない)
+    ↓ /proc/vmcore 経由で 1st kernel のメモリダンプにアクセス
+    ↓ makedumpfile でダンプを圧縮・フィルタリングして保存
+    ↓ 再起動
+```
+
+### セットアップ
+
+```bash
+# カーネルコンフィグ
+scripts/config --enable KEXEC
+scripts/config --enable CRASH_DUMP
+scripts/config --enable PROC_VMCORE
+
+# ブートパラメータでキャプチャカーネル用メモリを予約
+# GRUB の場合: /etc/default/grub の GRUB_CMDLINE_LINUX に追加
+GRUB_CMDLINE_LINUX="crashkernel=256M"
+
+# kdump サービスの設定 (Debian/Ubuntu)
+sudo apt-get install kdump-tools
+sudo systemctl enable kdump-tools
+
+# キャプチャカーネルのロード (手動)
+sudo kexec -p /boot/vmlinuz-$(uname -r) \
+    --initrd=/boot/initrd.img-$(uname -r) \
+    --append="root=/dev/sda1 single irqpoll maxcpus=1 reset_devices"
+```
+
+### makedumpfile: ダンプの圧縮とフィルタリング
+
+フルメモリダンプは巨大 (数十 GB) になるため、makedumpfile で圧縮・フィルタリングする。
+
+```bash
+# ダンプレベル (何を含めるか)
+#   1: ゼロページを除外
+#   2: キャッシュページを除外
+#   4: ユーザ空間ページを除外
+#   8: フリーページを除外
+
+# レベル 31 (= 1+2+4+8+16): カーネルのコアデータのみ
+makedumpfile -l -d 31 /proc/vmcore /var/crash/vmcore.dump
+
+# 圧縮形式を指定
+makedumpfile -l --compress zstd /proc/vmcore /var/crash/vmcore.dump
+```
+
+### crash ユーティリティ: 事後解析
+
+`crash` は kdump で採取したダンプファイルを解析するツールである。
+GDB ライクなインターフェースで、パニック時のカーネルの状態を調査できる。
+
+```bash
+# crash の起動
+sudo crash vmlinux /var/crash/vmcore.dump
+
+# 基本コマンド
+crash> bt          # パニック時のバックトレース
+crash> log         # カーネルログ (dmesg 相当)
+crash> ps          # パニック時の全プロセス一覧
+crash> vm          # メモリマップ
+crash> files       # オープンファイル一覧
+crash> mod         # ロード済みモジュール
+crash> dis -l <addr>  # 逆アセンブル (ソースコード付き)
+crash> struct task_struct <addr>  # 構造体の中身を表示
+crash> kmem -i     # メモリ使用量のサマリ
+
+# 特定のタスクのスタックを表示
+crash> bt -p       # パニック時のタスクのバックトレース
+crash> bt <pid>    # 特定 PID のバックトレース
+
+# 変数の内容を表示
+crash> p jiffies
+crash> p *(struct my_device *)0xffff888100a5c000
+```
+
+---
+
+## 40.8 Magic SysRq
+
+### 概要
+
+Magic SysRq は、カーネルがハングアップした場合でも
+(割り込みが生きている限り) カーネルに直接コマンドを送る仕組みである。
+
+### 有効化
+
+```bash
+# カーネルコンフィグ
+scripts/config --enable MAGIC_SYSRQ
+
+# 実行時の有効化 (ビットマスクで制御)
+echo 1 > /proc/sys/kernel/sysrq      # 全機能を有効化
+echo 176 > /proc/sys/kernel/sysrq    # 特定機能のみ有効化
+```
+
+### キーの一覧
+
+物理キーボードでは `Alt + SysRq + <キー>` で入力する。
+リモート環境やスクリプトでは `/proc/sysrq-trigger` に書き込む。
+
+| キー | 機能 | `/proc/sysrq-trigger` |
+|---|---|---|
+| `b` | 即座に再起動 (sync なし) | `echo b > /proc/sysrq-trigger` |
+| `c` | カーネルクラッシュを強制 (kdump のテストに使用) | `echo c > /proc/sysrq-trigger` |
+| `d` | 保持中の全ロックを表示 | `echo d > /proc/sysrq-trigger` |
+| `e` | init 以外の全プロセスに SIGTERM を送信 | `echo e > /proc/sysrq-trigger` |
+| `f` | OOM killer を手動で起動 | `echo f > /proc/sysrq-trigger` |
+| `h` | ヘルプを表示 | `echo h > /proc/sysrq-trigger` |
+| `i` | init 以外の全プロセスに SIGKILL を送信 | `echo i > /proc/sysrq-trigger` |
+| `l` | 全 CPU のバックトレースを表示 | `echo l > /proc/sysrq-trigger` |
+| `m` | メモリ情報を表示 | `echo m > /proc/sysrq-trigger` |
+| `o` | システム電源オフ | `echo o > /proc/sysrq-trigger` |
+| `p` | 現在のレジスタとフラグを表示 | `echo p > /proc/sysrq-trigger` |
+| `s` | マウント済み全ファイルシステムの sync | `echo s > /proc/sysrq-trigger` |
+| `t` | 全タスクの情報を表示 | `echo t > /proc/sysrq-trigger` |
+| `u` | 全ファイルシステムを読み取り専用で再マウント | `echo u > /proc/sysrq-trigger` |
+| `w` | uninterruptible 状態のタスクを表示 | `echo w > /proc/sysrq-trigger` |
+
+### 安全な再起動手順 (REISUB)
+
+システムがハングした場合の安全な再起動手順として **REISUB** (「busier」の逆) が知られている:
+
+```
+R - Raw モードに切り替え (キーボード制御をカーネルに渡す)
+E - 全プロセスに SIGTERM
+I - 全プロセスに SIGKILL
+S - ファイルシステムの sync
+U - 読み取り専用で再マウント
+B - 再起動
+```
+
+各ステップの間に数秒待つ。スクリプトで自動化する場合:
+
+```bash
+echo r > /proc/sysrq-trigger; sleep 1
+echo e > /proc/sysrq-trigger; sleep 5
+echo i > /proc/sysrq-trigger; sleep 3
+echo s > /proc/sysrq-trigger; sleep 2
+echo u > /proc/sysrq-trigger; sleep 2
+echo b > /proc/sysrq-trigger
+```
+
+### デバッグでの活用
+
+| シナリオ | 使用するキー |
+|---|---|
+| システムがハングして原因を調べたい | `l` (全 CPU バックトレース) + `t` (全タスク) + `w` (D 状態タスク) |
+| kdump の動作確認 | `c` (クラッシュ強制) |
+| OOM 状態の調査 | `m` (メモリ情報) + `f` (OOM killer 手動起動) |
+| デッドロックの調査 | `d` (ロック一覧) + `l` (バックトレース) |
+| 安全にシャットダウンしたい | `s` + `u` + `o` |
+
+---
+
+## 40.9 CI/CD: カーネル開発の自動テスト
+
+### KernelCI (Linux Foundation)
+
+[KernelCI](https://kernelci.org/) は Linux Foundation が運営する分散型 CI システムである。
+
+**特徴:**
+
+- 複数のハードウェアラボ (ARM, x86, RISC-V 等) で実カーネルをテスト
+- linux-next, mainline, stable ツリーを継続的にビルド・テスト
+- kselftest, LTP (Linux Test Project) を自動実行
+- ブートテスト: 各アーキテクチャでカーネルが起動するかを確認
+- テスト結果は [dashboard.kernelci.org](https://dashboard.kernelci.org/) で公開
+
+### 0-day bot (Intel)
+
+0-day bot は Intel が運営する自動パッチテストシステムである。
+
+**動作:**
+
+1. メーリングリストに投稿されたパッチを自動的に取得
+2. 数百のカーネルコンフィグでビルドテストを実行
+3. 静的解析 (sparse, smatch, Coccinelle) を適用
+4. コンパイルエラーや警告があれば、パッチ投稿者にメールで報告
+
+パッチを送信すると、数時間以内に 0-day bot からのフィードバックがメールで届く。
+これは非常に有用であり、レビュアの負担を大幅に軽減している。
+
+### LKFT (Linaro Kernel Functional Testing)
+
+[LKFT](https://lkft.linaro.org/) は Linaro が運営する ARM 向けのテスト基盤である。
+
+**特徴:**
+
+- stable カーネルの回帰テストに特化
+- LTP, kselftest を ARM/ARM64 実機で実行
+- テスト結果は [qa-reports.linaro.org](https://qa-reports.linaro.org/) で公開
+
+### 自前の CI: out-of-tree Rust モジュール向け
+
+out-of-tree の Rust カーネルモジュールに対して CI を構築する場合の構成例:
+
+```yaml
+# .github/workflows/kernel-test.yml
+name: Kernel Module CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        kernel: ["6.14", "6.15", "6.16"]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 \
+            llvm clang lld \
+            libelf-dev \
+            sparse
+
+      - name: Download and configure kernel
+        run: |
+          wget https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-${{ matrix.kernel }}.tar.xz
+          tar xf linux-${{ matrix.kernel }}.tar.xz
+          cd linux-${{ matrix.kernel }}
+          make LLVM=1 defconfig
+          scripts/config --enable RUST
+          scripts/config --enable KUNIT
+          scripts/config --enable RUST_KERNEL_DOCTESTS
+          make LLVM=1 olddefconfig
+
+      - name: Build kernel with module
+        run: |
+          cd linux-${{ matrix.kernel }}
+          # out-of-tree モジュールのビルド
+          make LLVM=1 M=$GITHUB_WORKSPACE/my_module
+
+      - name: Static analysis (sparse)
+        run: |
+          cd linux-${{ matrix.kernel }}
+          make C=1 LLVM=1 M=$GITHUB_WORKSPACE/my_module
+
+      - name: Run KUnit tests
+        run: |
+          cd linux-${{ matrix.kernel }}
+          ./tools/testing/kunit/kunit.py run \
+            --make_options LLVM=1 \
+            --arch x86_64 \
+            --kconfig_add CONFIG_RUST=y
+```
+
+### CI での静的解析の統合
+
+```bash
+#!/bin/bash
+# ci/check-quality.sh
+
+set -e
+
+echo "=== sparse ==="
+make C=1 LLVM=1 M=my_module/ 2>&1 | tee sparse.log
+if grep -q "warning:" sparse.log; then
+    echo "FAIL: sparse warnings found"
+    exit 1
+fi
+
+echo "=== Coccinelle ==="
+make coccicheck M=my_module/ MODE=report 2>&1 | tee cocci.log
+if [ -s cocci.log ]; then
+    echo "FAIL: Coccinelle issues found"
+    exit 1
+fi
+
+echo "=== checkpatch ==="
+git format-patch -1 | xargs scripts/checkpatch.pl --strict
+```
+
+---
+
+## 40.10 ハードウェアシミュレーション
+
+実ハードウェアなしでドライバをテストするための仕組みをカーネルは複数提供している。
+
+### CONFIG_GPIO_MOCKUP: 仮想 GPIO
+
+```bash
+# カーネルコンフィグ
+scripts/config --enable GPIO_MOCKUP
+
+# モジュールとしてビルド
+make LLVM=1 -j$(nproc)
+
+# ロード: 4 つの GPIO ラインを持つ 2 チップを作成
+sudo modprobe gpio-mockup gpio_mockup_ranges=0,4,4,8
+
+# GPIO チップが作成されたことを確認
+ls /sys/class/gpio/
+# gpiochip0  gpiochip4  ...
+
+# libgpiod で操作 (gpioset/gpioget コマンド)
+sudo gpioset gpiochip0 0=1    # GPIO 0 を HIGH に
+sudo gpioget gpiochip0 0      # GPIO 0 の値を読み取り
+
+# debugfs から mockup の状態を確認
+cat /sys/kernel/debug/gpio
+```
+
+GPIO mockup は GPIO ドライバや GPIO を使用するドライバのテストに不可欠である。
+実際の GPIO コントローラがなくても、gpiolib のインターフェースを通じた
+正しい動作を検証できる。
+
+### CONFIG_IIO_DUMMY: 仮想 IIO デバイス
+
+IIO (Industrial I/O) サブシステムのダミーデバイスである。
+加速度センサーや温度センサーのドライバ開発で使用する。
+
+```bash
+# カーネルコンフィグ
+scripts/config --enable IIO_DUMMY
+scripts/config --enable IIO_DUMMY_EVGEN
+
+# ロード
+sudo modprobe iio_dummy
+sudo modprobe iio_dummy_evgen
+
+# configfs 経由でダミーデバイスを作成
+sudo mkdir /sys/kernel/config/iio/devices/dummy/my_accel
+
+# IIO デバイスの確認
+ls /sys/bus/iio/devices/
+# iio:device0
+
+# チャネルの値を読み取り
+cat /sys/bus/iio/devices/iio\:device0/in_voltage0_raw
+```
+
+### UML (User Mode Linux)
+
+UML は Linux カーネルをユーザ空間プロセスとして実行する仕組みである。
+ハードウェアエミュレーション (QEMU) なしでカーネルコードをテストできる。
+
+```bash
+# UML カーネルのビルド
+make ARCH=um LLVM=1 defconfig
+scripts/config --enable RUST    # Rust サポート (UML でも利用可能)
+make ARCH=um LLVM=1 -j$(nproc)
+
+# UML カーネルの実行
+./linux rootfstype=hostfs rw init=/bin/bash
+
+# UML 内でモジュールをロード
+insmod /path/to/my_module.ko
+```
+
+UML の利点:
+
+| 特性 | UML | QEMU |
+|---|---|---|
+| 起動速度 | 非常に高速 (数秒) | 遅い (数十秒) |
+| デバッグ | 通常の GDB でデバッグ可能 | GDB remote protocol が必要 |
+| ハードウェアエミュレーション | 不可 (ネットワーク程度) | 多様なデバイスをエミュレーション可能 |
+| 用途 | ロジックのテスト、高速な開発サイクル | ドライバテスト、完全なシステムテスト |
+| 割り込み | シグナルで模擬 | 仮想割り込みコントローラ |
+
+KUnit はデフォルトで UML を使用してテストを実行する。
+`./tools/testing/kunit/kunit.py run` は内部的に UML カーネルをビルド・実行している。
+
+---
+
+## よくある罠
+
+1. **kselftest を root 以外で実行する** --- 多くの selftest はカーネルインターフェースへのアクセスに root 権限を必要とする。`sudo` を忘れないこと。
+
+2. **syzkaller の KCOV を忘れる** --- `CONFIG_KCOV=y` がないと syzkaller はカバレッジフィードバックを得られず、ほぼランダムなファジングになる。効率が桁違いに落ちる。
+
+3. **sparse の `C=1` と `C=2` を混同する** --- `C=1` は全ソースファイルに対して sparse を実行する。`C=2` は再コンパイルが必要なファイルのみ。インクリメンタルな開発では `C=2` が効率的だが、CI では `C=1` を使うべきである。
+
+4. **Coccinelle を patch モードでいきなり実行する** --- まず `MODE=report` で問題箇所を確認し、内容を理解してから `MODE=patch` を適用すること。
+
+5. **perf record のサンプリング周波数が高すぎる** --- デフォルトの 4000 Hz でもオーバーヘッドが発生する。カーネルモジュールのプロファイリングでは 999 Hz 程度で十分なことが多い。
+
+6. **fault injection の確率を高く設定しすぎる** --- 確率が高すぎるとカーネル全体が不安定になり、テスト対象以外の箇所でクラッシュする。`task-filter` やスタックトレースフィルタリングで対象を絞ること。
+
+7. **kmemleak の結果を鵜呑みにする** --- kmemleak は保守的なスキャンを行うため偽陽性がある。ポインタが XOR エンコードされている場合やアラインメントされていない位置に格納されている場合は検出できない。
+
+8. **kdump のキャプチャカーネル用メモリが不足** --- `crashkernel=128M` では不十分な場合がある。特に大量のメモリを搭載したシステムでは `crashkernel=256M` 以上を推奨する。
+
+9. **UML でデバイスドライバをテストしようとする** --- UML はハードウェアをエミュレートしないため、デバイスドライバのテストには適さない。ロジックのテストや KUnit には最適だが、ドライバの I/O テストには QEMU を使うこと。
+
+10. **CI でカーネルバージョンを固定する** --- カーネルの内部 API は変更されるため、複数バージョンでのビルドテストが必要である。CI のマトリクスビルドを活用すること。
+
+---
+
+## 章末演習
+
+### 演習 1: kselftest の作成
+
+自作のキャラクタデバイスに対する kselftest を作成せよ。
+
+1. `tools/testing/selftests/my_driver/` ディレクトリを作成する
+2. `kselftest_harness.h` を使って FIXTURE ベースのテストを書く
+3. デバイスの open, read, write, ioctl をテストする
+4. `make -C tools/testing/selftests TARGETS=my_driver run_tests` で実行する
+
+### 演習 2: sparse の活用
+
+以下のコードに対して `make C=1` を実行し、sparse の警告を全て修正せよ。
+
+```c
+static ssize_t buggy_write(struct file *f, const char __user *buf,
+                           size_t count, loff_t *pos)
+{
+    char *kbuf = kmalloc(count, GFP_KERNEL);
+    memcpy(kbuf, buf, count);          /* 問題 1 */
+    __be32 val = *(u32 *)kbuf;         /* 問題 2 */
+    pr_info("value: %u\n", val);       /* 問題 3 */
+    kfree(kbuf);
+    return count;
+}
+```
+
+### 演習 3: Coccinelle セマンティックパッチ
+
+以下の要件を満たす SmPL スクリプトを作成せよ。
+
+1. `kmalloc` の戻り値が NULL チェックされていない箇所を検出する
+2. `pr_err` を `dev_err` に変換する (ただし `struct device *dev` が利用可能な関数のみ)
+
+### 演習 4: perf プロファイリング
+
+1. `perf stat` で自作モジュールの insmod 時の IPC を計測せよ
+2. `perf record -g` で呼び出しチェーンを取得し、`perf report` で確認せよ
+3. フレームグラフを生成し、ホットスポットを特定せよ
+
+### 演習 5: fault injection
+
+`CONFIG_FAIL_SLAB=y` を有効にしたカーネルで、自作モジュールの `init` 関数中の
+`kmalloc` を失敗させよ。モジュールが oops せずにエラーリターンすることを確認せよ。
+
+### 演習 6: kdump テスト
+
+1. `crashkernel=256M` でカーネルを起動する
+2. kexec でキャプチャカーネルをロードする
+3. `echo c > /proc/sysrq-trigger` でクラッシュを強制する
+4. 再起動後、`crash` ユーティリティでダンプを解析し、パニック時のバックトレースを確認する
+
+### 演習 7: syzkaller セットアップ
+
+syzkaller を用いて自作のキャラクタデバイスドライバをファジングする環境を構築せよ。
+
+1. syzlang でデバイスの ioctl インターフェースを記述する
+2. KCOV, KASAN を有効にしたカーネルをビルドする
+3. VM イメージを作成し、syzkaller を実行する
+4. 1 時間以上のファジングを行い、カバレッジの推移を Web UI で確認する
+
+---
+
+## 参考資料
+
+### 公式ドキュメント
+
+- [kselftest (kernel.org)](https://docs.kernel.org/dev-tools/kselftest.html) --- kselftest フレームワークの公式ドキュメント
+- [Fault injection (kernel.org)](https://docs.kernel.org/fault-injection/fault-injection.html) --- fault injection の設定と使用方法
+- [kmemleak (kernel.org)](https://docs.kernel.org/dev-tools/kmemleak.html) --- メモリリーク検出ツール
+- [Sparse (kernel.org)](https://docs.kernel.org/dev-tools/sparse.html) --- sparse の使用方法
+- [Coccinelle (kernel.org)](https://docs.kernel.org/dev-tools/coccinelle.html) --- セマンティックパッチツール
+- [perf tutorial (kernel.org)](https://docs.kernel.org/admin-guide/perf/index.html) --- perf の公式チュートリアル
+- [kdump (kernel.org)](https://docs.kernel.org/admin-guide/kdump/kdump.html) --- カーネルクラッシュダンプの設定
+- [Magic SysRq (kernel.org)](https://docs.kernel.org/admin-guide/sysrq.html) --- SysRq キーの一覧と使用方法
+
+### ツール
+
+- [syzkaller (GitHub)](https://github.com/google/syzkaller) --- Google のカーネルファザー
+- [syzbot dashboard](https://syzkaller.appspot.com/) --- syzkaller が自動発見したバグの一覧
+- [smatch (repo.or.cz)](https://repo.or.cz/smatch.git) --- フロー解析ベースの静的解析
+- [Coccinelle (GitHub)](https://github.com/coccinelle/coccinelle) --- セマンティックパッチツール
+- [FlameGraph (GitHub)](https://github.com/brendangregg/FlameGraph) --- フレームグラフ生成ツール
+- [crash utility (GitHub)](https://github.com/crash-utility/crash) --- クラッシュダンプ解析ツール
+
+### CI/CD
+
+- [KernelCI](https://kernelci.org/) --- Linux Foundation の分散型 CI
+- [LKFT (Linaro)](https://lkft.linaro.org/) --- ARM 向けカーネルテスト基盤
+- [KernelCI dashboard](https://dashboard.kernelci.org/) --- テスト結果ダッシュボード
+
+### 解説記事
+
+- [perf examples (Brendan Gregg)](https://www.brendangregg.com/perf.html) --- perf の実践例集
+- [Flame Graphs (Brendan Gregg)](https://www.brendangregg.com/flamegraphs.html) --- フレームグラフの解説
+- [Finding bugs with syzkaller (LWN)](https://lwn.net/Articles/677764/) --- syzkaller の解説記事
+- [Coccinelle: A Program Matching and Transformation Tool (LWN)](https://lwn.net/Articles/380835/) --- Coccinelle の概要
+
+### 関連する章
+
+- [Ch 23: デバッグ・トレーシング・eBPF](/part7-observability/23-debug-tracing/) --- oops, KASAN, ftrace, kprobe, eBPF
+- [Ch 29: upstream への道](/part8-practice/29-upstream/) --- KUnit, doctest, checkpatch

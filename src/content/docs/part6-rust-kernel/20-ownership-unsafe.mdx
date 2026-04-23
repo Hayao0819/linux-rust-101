@@ -1,0 +1,667 @@
+---
+title: "Ch 15. 所有権・unsafe・Safety Contract"
+description: "RAII, // SAFETY:, Arc, ARef — Rust の所有権システムがカーネル安全性をどう支えるか"
+---
+
+## この章で学ぶこと
+
+- 所有権と借用のルールがカーネルコードでどう実践されるか理解する
+- RAII パターンによるロック解放・`kfree`・デバイス登録解除を説明できる
+- `unsafe` の 4 つの役割を正確に区別できる
+- `// SAFETY:` コメントの 3 層ドキュメント作法を身につける
+- `kernel::sync::Arc` と `std::sync::Arc` の違いを説明できる
+- `ARef<T>` と `AlwaysRefCounted` の役割を理解する
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::sync::Arc<T>`, `kernel::sync::UniqueArc<T>`, `kernel::sync::ArcBorrow<'a, T>`
+🟢 **安定**: `kernel::types::ARef<T>`, `kernel::types::AlwaysRefCounted`
+🟢 **安定**: `kernel::alloc::KBox<T>` (RAII — Drop で kfree)
+:::
+
+## 前提
+
+- [Ch 8](/part3-kernel-concepts/08-memory/) (メモリ管理), [Ch 9](/part3-kernel-concepts/09-concurrency/) (並行性) を完了している
+- Rust の所有権・借用・ライフタイムの基本概念を知っている
+
+## 所有権のおさらい — カーネル視点
+
+Rust の所有権ルールはたった 3 つである:
+
+1. すべての値にはちょうど 1 つの **所有者** がいる
+2. 所有者がスコープを抜けると値は **Drop** される
+3. 任意の時点で `&mut T` が 1 つ、**または** `&T` が複数 — 両方は同時に存在できない
+
+ユーザランドでは「メモリリーク = 性能問題」程度で済む場合もある。
+しかしカーネルでは意味が根本的に異なる:
+
+| リソース | 解放忘れの結果 |
+|---|---|
+| `kmalloc` で確保したメモリ | カーネルメモリリーク → 最終的に OOM |
+| `mutex_lock` で取得したロック | **永久デッドロック** → システム全体がハング |
+| `register_chrdev` で登録したデバイス | `/dev/` にゴミが残る → 再ロード不可 |
+| `request_irq` で登録した割り込みハンドラ | モジュール解放後にハンドラが呼ばれる → **カーネルパニック** |
+
+**所有権 + RAII はカーネルにおいて「正しさ」と「安全性」の両方を保証する仕組みである。**
+
+## RAII — Drop がすべてを片付ける
+
+RAII (Resource Acquisition Is Initialization) は「リソースの取得をオブジェクトの初期化に、解放を Drop に結びつける」パターンである。
+
+### C のクリーンアップ: goto チェーン
+
+C カーネルコードでは、エラー処理に `goto` チェーンを使う:
+
+```c title="C: 典型的な goto チェーン"
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_device *dev;
+    int ret;
+
+    dev = kzalloc(sizeof(*dev), GFP_KERNEL);
+    if (!dev)
+        return -ENOMEM;
+
+    ret = clk_prepare_enable(dev->clk);
+    if (ret)
+        goto err_free;
+
+    ret = request_irq(dev->irq, my_handler, 0, "my", dev);
+    if (ret)
+        goto err_clk;
+
+    ret = misc_register(&dev->miscdev);
+    if (ret)
+        goto err_irq;
+
+    return 0;
+
+err_irq:
+    free_irq(dev->irq, dev);
+err_clk:
+    clk_disable_unprepare(dev->clk);
+err_free:
+    kfree(dev);
+    return ret;
+}
+```
+
+このパターンには以下の問題がある:
+
+- `goto` ラベルの **順序を間違える** とリソースリーク or 二重解放
+- 新しいリソースを追加するたびに **すべてのエラーパスを更新** する必要がある
+- コンパイラはチェーンの正しさを **一切検証しない**
+
+### Rust の RAII: Drop が自動解放
+
+```rust title="Rust: RAII による自動クリーンアップ"
+fn probe(pdev: &mut PlatformDevice) -> Result {
+    // KBox: Drop で kfree
+    let dev = KBox::new(MyDevice::new(), GFP_KERNEL)?;
+
+    // ClkGuard: Drop で clk_disable_unprepare
+    let _clk = dev.clk.prepare_enable()?;
+
+    // IrqRegistration: Drop で free_irq
+    let _irq = irq::Registration::register(dev.irq, handler)?;
+
+    // MiscRegistration: Drop で misc_deregister
+    let _misc = miscdev::Registration::new()?;
+
+    Ok(())
+    // エラー時: ? で早期リターン → 構築済みオブジェクトが逆順に Drop
+}
+```
+
+`?` で早期リターンすると、その時点までに構築されたオブジェクトが**逆順に自動 Drop** される。C の `goto` チェーンと等価だが、コンパイラが正しさを保証する。
+
+### C ⇔ Rust RAII 対比表
+
+| C パターン | Rust 対応 | Drop で行われること |
+|---|---|---|
+| `kfree(p)` | `KBox<T>` の Drop | `kfree` を呼ぶ |
+| `mutex_unlock(&m)` | `Guard<'_, T>` の Drop | `mutex_unlock` を呼ぶ |
+| `free_irq(irq, dev)` | `irq::Registration` の Drop | `free_irq` を呼ぶ |
+| `misc_deregister(&dev)` | `miscdev::Registration` の Drop | `misc_deregister` を呼ぶ |
+| `clk_disable_unprepare(clk)` | クロック Guard の Drop | `clk_disable_unprepare` を呼ぶ |
+| `put_device(dev)` | `ARef<Device>` の Drop | `put_device` を呼ぶ |
+
+### Drop の実装例
+
+```rust title="カスタム Drop の例"
+struct IrqGuard {
+    irq: u32,
+    dev_id: *mut core::ffi::c_void,
+}
+
+impl Drop for IrqGuard {
+    fn drop(&mut self) {
+        // SAFETY: irq と dev_id は register 時に検証済みであり、
+        // IrqGuard が存在する間は有効である。
+        unsafe { bindings::free_irq(self.irq, self.dev_id) };
+    }
+}
+```
+
+## unsafe の 4 つの役割
+
+`unsafe` は「危険だから使うな」ではない。**「コンパイラが検証できない不変条件を、人間が保証する」** という宣言である。
+
+カーネルでは `unsafe` を避けて通ることは不可能である。C API を呼び出すだけでも `unsafe` が必要だからである。重要なのは `unsafe` を**最小限に、正しい根拠とともに**使うことである。
+
+### 役割 1: 生ポインタのデリファレンス
+
+```rust title="生ポインタの参照外し"
+let ptr: *const u32 = some_c_function();
+
+// コンパイルエラー: unsafe なしには参照外しできない
+// let val = *ptr;
+
+// SAFETY: some_c_function は non-null のアラインされたポインタを返すことが
+// ドキュメントで保証されている。ポインタの有効期間はデバイスの生存期間中である。
+let val = unsafe { *ptr };
+```
+
+### 役割 2: unsafe 関数の呼び出し
+
+```rust title="unsafe fn の呼び出し"
+// SAFETY: reg_offset は有効なレジスタ範囲 (0..=0xFF) 内であり、
+// self.base は ioremap 済みの有効なアドレスを指す。
+unsafe { bindings::iowrite32(value, self.base.wrapping_add(reg_offset)) };
+```
+
+### 役割 3: mutable static 変数へのアクセス
+
+```rust title="mutable static へのアクセス"
+static mut COUNTER: u32 = 0;
+
+fn increment() {
+    // SAFETY: この関数は single-threaded な init 時にのみ呼ばれ、
+    // 他のスレッドからの同時アクセスはない。
+    unsafe { COUNTER += 1 };
+}
+```
+
+> **注意:** カーネルコードで `static mut` を使うことはほぼない。代わりに `Mutex<T>` や `SpinLock<T>` でデータを保護する。
+
+### 役割 4: unsafe trait の実装
+
+```rust title="unsafe trait の実装"
+/// # Safety
+///
+/// このトレイトの実装者は、`table()` が返すポインタが
+/// モジュールのライフタイム中ずっと有効であることを保証しなければならない。
+unsafe trait DeviceTableProvider {
+    fn table() -> *const bindings::of_device_id;
+}
+
+// SAFETY: OF_TABLE は static で定義されており、
+// モジュールのライフタイム中ずっと有効である。
+unsafe impl DeviceTableProvider for MyDriver {
+    fn table() -> *const bindings::of_device_id {
+        OF_TABLE.as_ptr()
+    }
+}
+```
+
+### 4 つの役割のまとめ
+
+| 役割 | 何を保証するか | カーネルでの頻出場面 |
+|---|---|---|
+| 生ポインタ参照外し | ポインタが有効・アライン済み・エイリアス違反なし | MMIO レジスタアクセス、C 構造体のフィールド読み書き |
+| unsafe fn 呼び出し | 関数の前提条件を満たしている | C バインディング (`bindings::*`) の呼び出し |
+| mutable static | データ競合がない | ほぼ使わない (Mutex/SpinLock を使う) |
+| unsafe trait impl | トレイトの不変条件を満たす | `Module`, `Driver` などの基盤トレイト |
+
+## 3 層ドキュメント: Safety Contract
+
+Linux カーネルの Rust コードには、安全性に関する 3 層のドキュメント規約がある。これは単なるスタイルガイドではなく、**コードレビューで必須のチェック項目** である。
+
+### 第 1 層: `# Invariants` — 型の不変条件
+
+型が**常に満たすべき条件**を、型定義の doc コメントに書く。
+
+```rust title="# Invariants の例"
+/// デバイスの登録状態を管理する。
+///
+/// # Invariants
+///
+/// `inner` は `bindings::misc_register()` で正常に登録されたデバイスを指す。
+/// 登録解除は `Drop` でのみ行われる。
+struct MiscRegistration {
+    inner: bindings::miscdevice,
+}
+```
+
+`# Invariants` は「この型のインスタンスが存在する限り、以下が真である」という宣言である。
+コンストラクタがこの不変条件を **確立** し、メソッドが **維持** し、Drop が **解消** する。
+
+### 第 2 層: `# Safety` — 関数の事前条件
+
+`unsafe fn` の呼び出し元が**満たすべき条件**を、関数の doc コメントに書く。
+
+```rust title="# Safety の例"
+/// 指定されたレジスタオフセットから 32 ビット値を読み出す。
+///
+/// # Safety
+///
+/// - `offset` は 0 以上かつレジスタ領域のサイズ未満でなければならない。
+/// - `self.base` は有効な ioremap 済みアドレスを指していなければならない。
+unsafe fn read_reg(&self, offset: usize) -> u32 {
+    // SAFETY: 呼び出し元が offset の有効性を保証している。
+    // self.base は new() で ioremap 済みであり、# Invariants で保証される。
+    unsafe { bindings::ioread32(self.base.wrapping_add(offset)) }
+}
+```
+
+### 第 3 層: `// SAFETY:` — unsafe ブロックの正当化
+
+個々の `unsafe {}` ブロックの **直前** に、なぜこの操作が安全であるかを書く。
+
+```rust title="// SAFETY: の例"
+fn enable_device(&self) -> Result {
+    // SAFETY: self.dev は probe() で初期化された有効なデバイスポインタであり、
+    // # Invariants により self の存続中は有効である。
+    // pm_runtime_get_sync は GFP_KERNEL コンテキストから呼ばれている。
+    let ret = unsafe { bindings::pm_runtime_get_sync(self.dev) };
+    if ret < 0 {
+        return Err(Error::from_errno(ret));
+    }
+    Ok(())
+}
+```
+
+### 3 層の関係
+
+```
+┌──────────────────────────────────────────┐
+│  # Invariants (型)                       │
+│  「この型が存在する限り、X が真である」   │
+│                                          │
+│   ┌──────────────────────────────────┐   │
+│   │  # Safety (unsafe fn)            │   │
+│   │  「呼び出し元は Y を保証せよ」    │   │
+│   │                                  │   │
+│   │   ┌──────────────────────────┐   │   │
+│   │   │  // SAFETY: (ブロック)   │   │   │
+│   │   │  「ここで Y が成り立つ   │   │   │
+│   │   │   理由は Z である」      │   │   │
+│   │   └──────────────────────────┘   │   │
+│   └──────────────────────────────────┘   │
+└──────────────────────────────────────────┘
+```
+
+- `# Invariants` は **型** のレベル — 型のライフタイム全体にわたる保証
+- `# Safety` は **関数** のレベル — 呼び出し元への要求
+- `// SAFETY:` は **ブロック** のレベル — 要求を満たしている根拠
+
+`// SAFETY:` コメントは `# Safety` の条件に**対応** していなければならない。レビュアは `# Safety` の各条件が `// SAFETY:` で言及されているかをチェックする。
+
+### 実例: Binder ドライバ
+
+カーネルツリーの `rust/kernel/sync/arc.rs` から実際のコードを見てみよう:
+
+```rust title="rust/kernel/sync/arc.rs (抜粋・簡略化)"
+/// # Invariants
+///
+/// The reference count on an instance of [`Arc`] is always non-zero.
+/// The object pointed to by [`Arc`] is always pinned.
+
+// ...
+
+/// Constructs a new reference counted instance of `T`.
+pub fn new(contents: T, flags: Flags) -> Result<Self, AllocError> {
+    let inner = KBox::new(
+        ArcInner {
+            refcount: Opaque::new(new_refcount()),
+            data: contents,
+        },
+        flags,
+    )?;
+
+    let inner = KBox::into_raw(inner);
+
+    // SAFETY: We just created a new instance with a refcount of 1,
+    // so it satisfies the invariant that the refcount is non-zero.
+    Ok(unsafe { Self::from_inner(inner) })
+}
+```
+
+## kernel::sync::Arc vs std::sync::Arc
+
+カーネルの `Arc` はユーザランドの `std::sync::Arc` とは大きく異なる。同じ名前だが別物と考えたほうがよい。
+
+### 違い一覧
+
+| 特性 | `std::sync::Arc` | `kernel::sync::Arc` |
+|---|---|---|
+| 参照カウント型 | `usize` (アトミック) | `refcount_t` (カーネル提供) |
+| オーバーフロー | UB (実質的に不到達) | **飽和** — `REFCOUNT_MAX` で止まりリークを選ぶ |
+| `Weak` 参照 | あり | **なし** |
+| Pin 保証 | なし | **常に Pinned** (`Arc<T>` は `Pin<Arc<T>>` 相当) |
+| メモリ割当て | `Global` アロケータ (infallible) | **fallible** — `Arc::new(val, GFP_KERNEL)?` |
+| Drop 時の deallocator | `Global::dealloc` | `kfree` |
+
+### refcount_t の飽和動作
+
+C カーネルの `refcount_t` は use-after-free を防ぐために**飽和セマンティクス**を持つ:
+
+```
+refcount = REFCOUNT_MAX の場合:
+  inc → 何もしない (カウントは REFCOUNT_MAX のまま)
+  dec → 何もしない (解放されない)
+  → メモリリークするが、use-after-free よりはるかに安全
+```
+
+`std::sync::Arc` の参照カウントは `usize` であり、オーバーフローすると理論上は use-after-free になりうる (ただし `usize::MAX` 回の clone が必要なので実際には起きない)。
+
+カーネルでは「リーク > use-after-free」という方針であり、`refcount_t` はこの方針を型レベルで強制する。
+
+### Weak がない理由
+
+`std::sync::Arc` の `Weak` は循環参照を破るために存在する。
+カーネルの `Arc` に `Weak` がない理由は:
+
+1. カーネルのオブジェクトライフタイムは**明示的に管理**される (ドライバモデル、kobject 階層)
+2. `Weak` のアップグレード (`upgrade()`) は `Option<Arc<T>>` を返す — カーネルコードでは成功を前提にしたい場面が多い
+3. `Weak` 用の別カウンタが必要になり、`refcount_t` との整合が複雑になる
+
+### fallible allocation
+
+```rust title="Arc の生成は常に fallible"
+// std: パニックする可能性がある
+let a = std::sync::Arc::new(MyStruct::new());
+
+// kernel: Result を返す — メモリ不足時は Err(AllocError)
+let a = Arc::new(MyStruct::new(), GFP_KERNEL)?;
+```
+
+カーネルでは「メモリ確保に失敗したら panic」は許されない。すべての確保は `Result` を返す。
+
+## ArcBorrow と UniqueArc
+
+### ArcBorrow\<'a, T\>
+
+`ArcBorrow` は `Arc<T>` への**参照カウントを増やさない借用**である。
+C で言えば「`Arc` のポインタを借りるが `refcount_inc` しない」に相当する。
+
+```rust title="ArcBorrow の利用"
+fn process(dev: ArcBorrow<'_, MyDevice>) {
+    // 参照カウントを増やさずに MyDevice にアクセスできる
+    // ライフタイム 'a により、元の Arc が生きている間のみ有効
+    pr_info!("processing device: {}\n", dev.name());
+}
+
+fn caller(dev: &Arc<MyDevice>) {
+    // Arc から ArcBorrow を作成
+    process(dev.as_arc_borrow());
+}
+```
+
+**用途:** 関数に `Arc` を渡すが所有権の移転も参照カウント増加も不要な場合。ライフタイムで安全性を保証するため、`unsafe` は不要である。
+
+### UniqueArc\<T\>
+
+`UniqueArc` は**参照カウントが 1 であることが型レベルで保証された Arc**である。
+
+```rust title="UniqueArc で安全に初期化"
+// UniqueArc は参照カウント = 1 を保証する
+// → &mut T を安全に取得できる
+let mut u: UniqueArc<MyDevice> = UniqueArc::new(
+    MyDevice::default(),
+    GFP_KERNEL,
+)?;
+
+// 参照カウント = 1 なので &mut が安全
+u.name = "my_device";
+u.irq = 42;
+
+// 初期化完了 → Arc に変換 (所有権を手放す)
+let shared: Arc<MyDevice> = u.into();
+```
+
+**用途:** `Arc<T>` は共有なので `&mut T` が取れない。初期化フェーズでフィールドを設定するために `UniqueArc` を経由する。
+
+### Arc 系の型の使い分け
+
+```
+UniqueArc<T>  ──初期化完了──→  Arc<T>  ──借用──→  ArcBorrow<'a, T>
+  (唯一の所有者)              (共有所有)         (一時的な参照)
+  (&mut T が取れる)           (& T のみ)         (refcount 不変)
+```
+
+## ARef\<T\> と AlwaysRefCounted
+
+### 問題: C 側で参照カウントされる型
+
+カーネルには `struct device`, `struct file`, `struct cred` など、**C 側で独自の参照カウント** を持つ型が大量にある。これらは `kobject` や専用の `kref` で管理されており、`kernel::sync::Arc` の `refcount_t` とは別物である。
+
+```c title="C: device の参照カウント"
+struct device *dev = get_device(some_dev);  /* refcount++ */
+/* ... dev を使う ... */
+put_device(dev);                            /* refcount-- → 0 なら解放 */
+```
+
+### AlwaysRefCounted トレイト
+
+```rust title="AlwaysRefCounted の定義"
+/// # Safety
+///
+/// - `inc_ref` は参照カウントを正確に 1 増やさなければならない。
+/// - `dec_ref` は参照カウントを正確に 1 減らし、0 になったら
+///   オブジェクトを解放しなければならない。
+pub unsafe trait AlwaysRefCounted {
+    /// 参照カウントを 1 増やす。
+    fn inc_ref(&self);
+
+    /// 参照カウントを 1 減らす。
+    ///
+    /// # Safety
+    ///
+    /// 呼び出し元は、減算後もオブジェクトが有効であるか、
+    /// これが最後の参照であることを保証しなければならない。
+    unsafe fn dec_ref(obj: NonNull<Self>);
+}
+```
+
+### ARef\<T\>
+
+`ARef<T>` は `AlwaysRefCounted` を実装した型 `T` のスマートポインタである。`Arc` と似ているが、**C 側の参照カウント機構を使う**。
+
+```rust title="ARef の利用例"
+// ARef<Device> → Drop で put_device を呼ぶ
+fn register_device(dev: ARef<Device>) -> Result {
+    // dev を使う — Deref で &Device にアクセスできる
+    pr_info!("registering: {}\n", dev.name());
+
+    // register に成功したら dev の所有権を移す
+    // (失敗したら ARef の Drop で put_device)
+    Ok(())
+}
+```
+
+`ARef` の Drop は `T::dec_ref()` を呼ぶ。つまり `put_device`, `fput`, `put_cred` などが自動的に呼ばれる。
+
+### Device に対する AlwaysRefCounted 実装
+
+```rust title="Device の AlwaysRefCounted (簡略化)"
+// SAFETY: get_device / put_device は Device の参照カウントを
+// 正確に 1 ずつ増減させ、0 になったら解放する。
+unsafe impl AlwaysRefCounted for Device {
+    fn inc_ref(&self) {
+        // SAFETY: self が存在する限り、ポインタは有効である。
+        unsafe { bindings::get_device(self.as_raw()) };
+    }
+
+    unsafe fn dec_ref(obj: NonNull<Self>) {
+        // SAFETY: obj は有効な Device ポインタである。
+        unsafe { bindings::put_device(obj.as_ptr().cast()) };
+    }
+}
+```
+
+### Arc vs ARef の使い分け
+
+| | `Arc<T>` | `ARef<T>` |
+|---|---|---|
+| 参照カウント | Rust 側 (`refcount_t`) | C 側 (kobject, kref 等) |
+| 対象 | Rust で定義した型 | C で定義された型のラッパー |
+| 生成 | `Arc::new(val, flags)?` | C 関数から受け取る / `ARef::from_raw()` |
+| Drop | `kfree` 相当 | `dec_ref` → `put_device` 等 |
+| 例 | `Arc<MyRustDriver>` | `ARef<Device>`, `ARef<File>` |
+
+## C と Rust のクリーンアップパターン比較
+
+実際のドライバ probe を例に、C と Rust のクリーンアップパターンを詳細に比較する。
+
+### C: 手動クリーンアップ
+
+```c title="C: probe のエラーハンドリング"
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_dev *dev;
+    struct resource *res;
+    int ret;
+
+    dev = devm_kzalloc(&pdev->dev, sizeof(*dev), GFP_KERNEL);
+    if (!dev)
+        return -ENOMEM;
+
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    dev->base = devm_ioremap_resource(&pdev->dev, res);
+    if (IS_ERR(dev->base))
+        return PTR_ERR(dev->base);   /* devm が kfree を処理 */
+
+    dev->clk = devm_clk_get(&pdev->dev, NULL);
+    if (IS_ERR(dev->clk))
+        return PTR_ERR(dev->clk);
+
+    ret = clk_prepare_enable(dev->clk);
+    if (ret)
+        return ret;                   /* ← clk_disable は? devm じゃない! */
+
+    ret = misc_register(&dev->miscdev);
+    if (ret)
+        goto err_clk;
+
+    platform_set_drvdata(pdev, dev);
+    return 0;
+
+err_clk:
+    clk_disable_unprepare(dev->clk);
+    return ret;
+}
+```
+
+問題点:
+
+- `devm_*` と非 `devm_*` が混在 — 解放責任が不明瞭
+- `clk_prepare_enable` は `devm` 版がない (v6.x 時点) — 手動管理が必要
+- `goto` のラベルと対応するリソースの関係が**暗黙的**
+
+### Rust: RAII による自動クリーンアップ
+
+```rust title="Rust: probe の RAII パターン (概念的な疑似コード)"
+fn probe(pdev: &mut PlatformDevice) -> Result {
+    let base = pdev.ioremap_resource(0)?;     // Drop で iounmap
+    let clk = pdev.clk_get(None)?;            // Drop で clk_put
+    let _clk_en = clk.prepare_enable()?;      // Drop で clk_disable_unprepare
+    let _misc = MiscRegistration::register()?; // Drop で misc_deregister
+
+    // すべて成功 → 所有権をドライバ構造体に移す
+    Ok(())
+
+    // 任意の ? で失敗した場合:
+    // その時点までに構築されたオブジェクトが逆順に Drop される
+    // → C の goto チェーンと同等だが、コンパイラが保証する
+}
+```
+
+## よくある罠
+
+1. **`// SAFETY:` を書かずに `unsafe` ブロックを使う** — `clippy::undocumented_unsafe_blocks` 警告が出る。カーネルの CI でもチェックされ、レビューで reject される。
+
+2. **`// SAFETY:` に "this is safe" とだけ書く** — 意味がない。**具体的にどの前提条件がなぜ満たされているか** を書く必要がある。
+
+3. **`Arc::new` の結果を `?` で処理しない** — `Result<Arc<T>, AllocError>` が返るので、`?` を忘れるとコンパイルエラーになる。ただし `let _ = Arc::new(...)` のように明示的に無視するとリソースリークになる。
+
+4. **`Arc<T>` を C 側の参照カウント型に使おうとする** — `Device` や `File` などは C 側に参照カウントがある。`ARef<T>` を使う。
+
+5. **`unsafe` ブロックを大きく取りすぎる** — `unsafe` ブロックは最小限の範囲に限定する。安全なコードまで `unsafe` に入れると、不変条件の検証が曖昧になる。
+
+6. **Drop の順序に依存するが、フィールドの宣言順序を気にしない** — Rust の構造体フィールドは**宣言順に Drop** される。リソース A が B に依存する場合、B を先に (上に) 宣言する必要がある。
+
+```rust title="Drop 順序の罠"
+struct MyDevice {
+    // irq_handler が device を参照する場合...
+    device: ARef<Device>,     // ← 先に Drop される!
+    irq_handler: IrqGuard,    // ← 後に Drop — device はもう無効!
+}
+
+struct MyDevice {
+    // 正しい順序: irq を先に Drop してから device を解放
+    irq_handler: IrqGuard,    // ← 先に Drop される
+    device: ARef<Device>,     // ← 後に Drop — OK
+}
+```
+
+## 章末演習
+
+### 演習 1: `// SAFETY:` コメントの分析
+
+カーネルソースツリーの `rust/kernel/sync/arc.rs` を開き、以下の問いに答えよ。
+
+1. `Arc::from_inner` 関数の `# Safety` セクションには何が書かれているか?
+2. `Arc::new` の中にある `// SAFETY:` コメントは、`from_inner` の `# Safety` のどの条件に対応しているか?
+3. `Arc` の `# Invariants` を読み、`Drop` 実装がその不変条件を最後にどう処理しているか説明せよ。
+
+### 演習 2: RAII ラッパーの設計
+
+以下の C API に対する Rust RAII ラッパーを設計せよ (コンパイルは不要。型と Drop の設計を書くこと):
+
+```c
+// リソースの取得
+struct my_resource *my_resource_alloc(int id);
+
+// リソースの解放 — alloc で取得した resource を解放する
+void my_resource_free(struct my_resource *res);
+```
+
+要件:
+- `# Invariants` を書くこと
+- `new` を `unsafe` にするか safe にするか判断し、根拠を書くこと
+- `Drop` で `my_resource_free` を呼ぶこと
+
+### 演習 3: Arc vs ARef の判断
+
+以下のシナリオそれぞれについて、`Arc` と `ARef` のどちらを使うべきか答え、理由を述べよ:
+
+1. Rust で新しく定義した `struct DriverState { counter: u32, name: CString }` を複数のコールバック間で共有したい
+2. C 側の `struct device` へのポインタを probe から受け取り、他の関数に渡したい
+3. Binder ドライバで Rust 側の `Process` 構造体を複数スレッドから参照したい
+
+### 演習 4: unsafe ブロックの最小化
+
+以下のコードの `unsafe` ブロックを最小化し、適切な `// SAFETY:` コメントを付けよ:
+
+```rust
+unsafe {
+    let ptr = bindings::kmalloc(256, bindings::GFP_KERNEL);
+    if ptr.is_null() {
+        return Err(ENOMEM);
+    }
+    core::ptr::write_bytes(ptr as *mut u8, 0, 256);
+    let slice = core::slice::from_raw_parts_mut(ptr as *mut u8, 256);
+    slice[0] = 42;
+    bindings::kfree(ptr);
+}
+```
+
+## 参考資料
+
+- [Rust for Linux — Coding Guidelines: Safety Documentation](https://rust.docs.kernel.org/coding-guidelines.html)
+- [kernel::sync::Arc (rustdoc)](https://rust.docs.kernel.org/kernel/sync/struct.Arc.html)
+- [kernel::types::ARef (rustdoc)](https://rust.docs.kernel.org/kernel/types/struct.ARef.html)
+- [kernel::types::AlwaysRefCounted (rustdoc)](https://rust.docs.kernel.org/kernel/types/trait.AlwaysRefCounted.html)
+- [The Rustonomicon — Unsafe](https://doc.rust-lang.org/nomicon/meet-safe-and-unsafe.html)
+- [LWN: Rust's safety contracts](https://lwn.net/Articles/960367/)
+- [refcount_t in the kernel (kernel.org)](https://docs.kernel.org/core-api/refcount-vs-atomic.html)

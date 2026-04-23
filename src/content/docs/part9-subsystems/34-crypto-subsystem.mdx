@@ -1,0 +1,1248 @@
+---
+title: "カーネル暗号サブシステム"
+description: "Crypto API, AES/ChaCha20, dm-crypt, dm-verity, IMA, TPM, WireGuard, Kernel Keyring — セキュリティエンジニアのための暗号基盤"
+---
+
+## この章で学ぶこと
+
+- Kernel Crypto API の 3 層アーキテクチャ (アルゴリズム / テンプレート / ドライバ) を理解する
+- 対称暗号 (AES, ChaCha20)、ハッシュ関数 (SHA-256, BLAKE2b)、AEAD の使い分けを把握する
+- カーネル乱数生成器 (CRNG) の設計と `getrandom()` の位置づけを理解する
+- dm-crypt / LUKS, dm-verity, fs-verity によるストレージ保護の仕組みを学ぶ
+- IMA / TPM によるシステム完全性検証の全体像を把握する
+- WireGuard が Crypto API をバイパスする設計判断の背景を理解する
+- kTLS, Kernel Keyring, モジュール署名など実践的な暗号基盤を知る
+---
+
+Linux カーネルは汎用 OS としてあらゆる場面で暗号処理を必要とする。
+ディスク暗号化、ネットワーク通信の保護、ファイル完全性検証、モジュール署名、乱数生成 — これらすべてがカーネル空間の暗号サブシステムによって支えられている。
+この章では、カーネル暗号基盤の全体像を体系的に解説する。
+
+## Crypto API アーキテクチャ
+
+### 3 層モデル: アルゴリズム / テンプレート / ドライバ
+
+カーネル Crypto API は以下の 3 層で構成される。
+
+```
+┌─────────────────────────────────────────────────────────┐
+│                    呼び出し側                            │
+│         (dm-crypt, IPsec, WireGuard, fscrypt ...)       │
+├─────────────────────────────────────────────────────────┤
+│              テンプレート層 (Template)                    │
+│    ブロック暗号モード (cbc, xts, gcm, ccm ...)           │
+│    HMAC, CMAC, authenc, rfc4106 ...                     │
+├─────────────────────────────────────────────────────────┤
+│           アルゴリズム層 (Algorithm)                      │
+│    単一ブロック暗号 (aes, chacha20, sm4 ...)             │
+│    ハッシュ関数 (sha256, sha3-256, blake2b-256 ...)     │
+├─────────────────────────────────────────────────────────┤
+│              ドライバ層 (Driver)                          │
+│   aes-generic    aes-aesni    aes-ce    aes-neonbs     │
+│   sha256-generic sha256-ni    sha256-ce                 │
+│   (ソフトウェア実装)  (ハードウェア加速実装)               │
+└─────────────────────────────────────────────────────────┘
+```
+
+**アルゴリズム (Algorithm)** は暗号プリミティブそのものである。
+AES、SHA-256 などの「何を計算するか」を定義する。
+
+**テンプレート (Template)** はアルゴリズムを組み合わせて実用的な構成を作る。
+`cbc(aes)` は AES を CBC モードで動かし、`hmac(sha256)` は SHA-256 で HMAC を構成する。
+テンプレートは入れ子にできる。例えば `authenc(hmac(sha256),cbc(aes))` は認証付き暗号化を構成する。
+
+**ドライバ (Driver)** はアルゴリズムの具体的な実装である。
+同じアルゴリズムに対して、ジェネリック (純 C) 実装とハードウェア加速実装の両方が存在しうる。
+
+### Transform の取得
+
+呼び出し側は文字列でアルゴリズムを指定し、transform ハンドルを取得する。
+
+```c
+#include <crypto/skcipher.h>
+
+struct crypto_skcipher *tfm;
+
+/* "cbc(aes)" を要求 — AES を CBC モードで使いたい */
+tfm = crypto_alloc_skcipher("cbc(aes)", 0, 0);
+if (IS_ERR(tfm)) {
+    pr_err("Failed to allocate skcipher: %ld\n", PTR_ERR(tfm));
+    return PTR_ERR(tfm);
+}
+
+/* 鍵を設定 */
+err = crypto_skcipher_setkey(tfm, key, key_len);
+
+/* 使い終わったら解放 */
+crypto_free_skcipher(tfm);
+```
+
+`crypto_alloc_skcipher()` の第 2・第 3 引数は型 (type) とマスク (mask) で、通常は `0, 0` を指定する。
+カーネルは登録されている全ドライバの中から、指定アルゴリズム名に合致し、最も高い優先度 (priority) を持つ実装を自動選択する。
+
+### 優先度ベースのドライバ選択
+
+各ドライバは登録時に優先度を申告する。
+
+| ドライバ | 優先度 | 備考 |
+|---|---|---|
+| `aes-generic` | 100 | 純 C 実装、全アーキテクチャで動作 |
+| `aes-aesni` | 300 | x86 AES-NI 命令使用 |
+| `aes-ce` | 300 | ARM Crypto Extensions 使用 |
+
+AES-NI 対応 CPU 上で `crypto_alloc_skcipher("cbc(aes)", 0, 0)` を呼ぶと、カーネルは自動的に `aes-aesni` ドライバを選択する。
+ハードウェア加速が使えない環境では `aes-generic` にフォールバックする。
+
+呼び出し側はドライバの違いを意識する必要がない。これが Crypto API の抽象化の核心である。
+
+```bash
+# 登録されているアルゴリズムとドライバの一覧
+cat /proc/crypto
+
+# 出力例 (抜粋):
+# name         : cbc(aes)
+# driver       : cbc-aes-aesni
+# module       : aesni_intel
+# priority     : 400
+# ...
+# name         : cbc(aes)
+# driver       : cbc(aes-generic)
+# module       : kernel
+# priority     : 100
+```
+
+### 同期 API と非同期 API
+
+Crypto API は操作の性質に応じて 2 種類のインターフェースを提供する。
+
+| 種別 | API 名 | 用途 | コールバック |
+|---|---|---|---|
+| 同期 | `skcipher` | 対称暗号 (ソフトウェア実装向け) | 不要 |
+| 同期 | `shash` | ハッシュ関数 (ソフトウェア実装向け) | 不要 |
+| 非同期 | `akcipher` | 公開鍵暗号 | 必要 |
+| 非同期 | `ahash` | ハッシュ関数 (ハードウェアオフロード向け) | 必要 |
+| 非同期 | `aead` | 認証付き暗号化 | 必要 |
+
+同期 API は関数呼び出しが完了した時点で結果が得られる。
+非同期 API はハードウェアアクセラレータへのオフロードを前提とし、完了コールバック (`crypto_req_done`) で結果を受け取る。
+
+```c
+/* 同期ハッシュ (shash) の使用例 */
+#include <crypto/hash.h>
+
+int calc_sha256(const u8 *data, size_t len, u8 *digest)
+{
+    struct crypto_shash *tfm;
+    SHASH_DESC_ON_STACK(desc, tfm);
+    int err;
+
+    tfm = crypto_alloc_shash("sha256", 0, 0);
+    if (IS_ERR(tfm))
+        return PTR_ERR(tfm);
+
+    desc->tfm = tfm;
+    err = crypto_shash_digest(desc, data, len, digest);
+
+    crypto_free_shash(tfm);
+    return err;
+}
+```
+
+```c
+/* 非同期ハッシュ (ahash) の使用例 */
+#include <crypto/hash.h>
+
+struct ahash_request *req;
+struct crypto_ahash *tfm;
+DECLARE_CRYPTO_WAIT(wait);
+
+tfm = crypto_alloc_ahash("sha256", 0, 0);
+req = ahash_request_alloc(tfm, GFP_KERNEL);
+
+ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
+                           crypto_req_done, &wait);
+ahash_request_set_crypt(req, sg, digest, len);
+
+err = crypto_wait_req(crypto_ahash_digest(req), &wait);
+```
+
+非同期 API は `crypto_ahash_digest()` が `-EINPROGRESS` を返す可能性がある。
+`crypto_wait_req()` はこれを待ち合わせるヘルパーである。
+
+## 対称暗号
+
+### AES: カーネルの主力暗号
+
+AES (Advanced Encryption Standard) はカーネル全体で最も多用される対称暗号である。
+dm-crypt、IPsec、WireGuard 以外の VPN、Wi-Fi (WPA2/WPA3)、fscrypt — あらゆる場面で使われる。
+
+ブロックサイズは 128 ビット固定で、鍵長は 128 / 192 / 256 ビットを選択できる。
+カーネルでは 256 ビット鍵が最も一般的に使用される。
+
+#### AES-NI ハードウェア加速 (x86)
+
+Intel が 2010 年以降の CPU に搭載した AES-NI (AES New Instructions) は、AES の暗号化・復号をハードウェアで実行する命令セットである。
+`AESENC`, `AESDEC`, `AESKEYGENASSIST` などの専用命令により、ソフトウェア実装の数倍から 10 倍以上の性能を達成する。
+
+カーネルモジュール `aesni_intel` がこの加速を提供する。
+
+#### ARM Crypto Extensions (ARM CE)
+
+ARM v8 以降の CPU は Crypto Extensions を持ち、AES、SHA-1、SHA-256 などの暗号操作をハードウェアで加速する。
+カーネルモジュール `aes-ce-cipher` および `aes-arm-ce` が対応する。
+
+#### Kernel FPU の保存・復元
+
+AES-NI と ARM CE は SIMD / FPU レジスタを使用する。
+カーネルコードからこれらの命令を使う場合、**現在のプロセスの FPU 状態を保存・復元しなければならない**。
+
+```c
+#include <asm/fpu/api.h>
+
+void aes_encrypt_with_ni(...)
+{
+    /* FPU コンテキストを保存し、カーネルでの使用を開始 */
+    kernel_fpu_begin();
+
+    /* ここで AES-NI 命令を使用可能 */
+    /* ... SIMD レジスタを使う暗号処理 ... */
+
+    /* FPU コンテキストを復元 — ユーザプロセスの FPU 状態を壊さない */
+    kernel_fpu_end();
+}
+```
+
+`kernel_fpu_begin()` / `kernel_fpu_end()` はプリエンプションを無効化する。
+そのため、この区間は**できるだけ短く**保つ必要がある。
+大量のデータを処理する場合は、チャンク単位で begin/end を繰り返すべきである。
+
+:::caution[割込コンテキストでの FPU 使用]
+割込コンテキストでは `kernel_fpu_begin()` を呼べない場合がある。
+softirq から暗号処理を呼ぶ dm-crypt や IPsec では、非同期 API を使ってワーカースレッドに処理を委譲する設計が採用されている。
+:::
+
+### ChaCha20: ストリーム暗号
+
+ChaCha20 は Daniel J. Bernstein が設計したストリーム暗号であり、AES-NI のないデバイスでもソフトウェアで高速に動作する。
+
+カーネルでの主な用途は以下のとおりである。
+
+- **CRNG (カーネル乱数生成器)** — ChaCha20 ベースの CSPRNG (Linux 4.8 以降)
+- **WireGuard** — ChaCha20-Poly1305 を AEAD として使用
+- **Adiantum** — AES ハードウェアを持たないデバイス向けディスク暗号化
+
+ChaCha20 の特徴は以下のとおりである。
+
+- 256 ビット鍵 + 96 ビット nonce + 32 ビットカウンタ
+- ブロック暗号ではなくストリーム暗号 — パディング不要
+- SIMD なしでも高速 (ARMv7 など低価格デバイス向け)
+- タイミング攻撃に対する耐性 — テーブルルックアップを使わない設計
+
+## ハッシュ関数
+
+### SHA-256: 最も広く使われるハッシュ
+
+SHA-256 はカーネル全体で最も多用されるハッシュ関数である。
+dm-verity、fs-verity、IMA、モジュール署名、x.509 証明書検証など、完全性検証のあらゆる場面で使われる。
+
+出力は 256 ビット (32 バイト) 固定であり、衝突耐性は 128 ビットセキュリティレベルである。
+
+```c
+#include <crypto/sha2.h>
+
+/* 簡易的な SHA-256 計算 (同期 API) */
+u8 digest[SHA256_DIGEST_SIZE];  /* 32 バイト */
+struct crypto_shash *tfm;
+SHASH_DESC_ON_STACK(desc, tfm);
+
+tfm = crypto_alloc_shash("sha256", 0, 0);
+desc->tfm = tfm;
+crypto_shash_digest(desc, data, data_len, digest);
+crypto_free_shash(tfm);
+```
+
+x86 では SHA-NI (SHA New Instructions) による加速が利用可能で、`sha256-ni` ドライバが提供する。
+ARM CE でも同様にハードウェア加速が利用できる。
+
+### SHA-3 (Keccak)
+
+SHA-3 は SHA-2 とは異なる設計 (スポンジ構造) に基づくハッシュ関数である。
+NIST が 2015 年に標準化した。
+カーネルでは `sha3-256`, `sha3-512` として利用可能である。
+
+SHA-2 に脆弱性が発見された場合の代替として位置づけられているが、現時点では SHA-2 に既知の実用的な攻撃は存在しない。
+カーネルでの利用は限定的である。
+
+### BLAKE2b
+
+BLAKE2b は ChaCha の設計者 Daniel J. Bernstein らが関与した高速ハッシュ関数である。
+SHA-256 よりも高速でありながら、同等以上のセキュリティ強度を持つ。
+
+カーネルでの主な用途は以下のとおりである。
+
+- **CRNG のエントロピー抽出** — Linux 5.17 以降、SHA-1 から BLAKE2s に置き換えられた
+- **WireGuard** — MAC と鍵導出に BLAKE2s を使用
+
+`blake2b-256` としてカーネル Crypto API に登録されている。
+
+### shash vs ahash
+
+ハッシュ関数の API には同期版 (`shash`) と非同期版 (`ahash`) の 2 種類がある。
+
+```
+shash (Synchronous Hash)          ahash (Asynchronous Hash)
+┌──────────────────┐              ┌──────────────────────┐
+│ crypto_shash_    │              │ crypto_ahash_        │
+│   init()         │              │   init()             │
+│   update()       │              │   update()           │
+│   final()        │              │   final()            │
+│   digest()       │ ←──単純──→   │   digest()           │
+│                  │              │   + コールバック通知   │
+│ ブロッキング     │              │ ノンブロッキング      │
+│ CPU 実装向け     │              │ HW アクセラレータ向け │
+└──────────────────┘              └──────────────────────┘
+```
+
+**shash** はソフトウェア実装に適している。呼び出しが完了した時点で結果が得られる。
+スタック上にディスクリプタを確保できる (`SHASH_DESC_ON_STACK`) ため、動的メモリ割り当てが不要である。
+
+**ahash** はハードウェアアクセラレータやオフロードエンジンに適している。
+処理の完了はコールバックで通知される。
+`scatterlist` を入力として取るため、ページ跨ぎのデータにも対応できる。
+
+一般的に、カーネルモジュール開発者は **shash** を使えば十分である。
+ahash は dm-crypt や IPsec などの高スループット要件がある場合に使う。
+
+## AEAD: 認証付き暗号化
+
+AEAD (Authenticated Encryption with Associated Data) は暗号化と認証 (改ざん検知) を一体化した暗号方式である。
+
+### GCM (Galois/Counter Mode)
+
+AES-GCM は最も広く使われる AEAD であり、TLS 1.2/1.3、IPsec で標準的に使用される。
+
+- AES-CTR による暗号化 + GHASH による認証
+- AES-NI + PCLMULQDQ 命令による加速が可能
+- 128 ビット認証タグ
+
+```c
+#include <crypto/aead.h>
+
+struct crypto_aead *tfm;
+tfm = crypto_alloc_aead("gcm(aes)", 0, 0);
+crypto_aead_setkey(tfm, key, key_len);
+crypto_aead_setauthsize(tfm, 16);  /* 128-bit tag */
+```
+
+### CCM (Counter with CBC-MAC)
+
+AES-CCM は Wi-Fi (WPA2 CCMP) で使用される AEAD である。
+GCM と異なり、GHASH ではなく CBC-MAC を認証に使う。
+GCM と比較してパフォーマンスは劣るが、より少ないハードウェアリソースで実装できる。
+
+### ChaCha20-Poly1305
+
+ChaCha20 による暗号化と Poly1305 による認証を組み合わせた AEAD である。
+WireGuard、TLS 1.3 で使用される。
+
+AES-NI のない環境 (古い ARM デバイスなど) では AES-GCM よりも高速である。
+タイミング攻撃への耐性が高いという利点もある。
+
+```c
+struct crypto_aead *tfm;
+tfm = crypto_alloc_aead("rfc7539(chacha20,poly1305)", 0, 0);
+```
+
+## 乱数生成
+
+### カーネル CRNG
+
+Linux カーネルは ChaCha20 ベースの CSPRNG (暗号学的に安全な疑似乱数生成器) を内蔵している。
+Linux 4.8 以降、従来のエントロピープールベースの設計から ChaCha20 ベースの CRNG に置き換えられた。
+
+```
+エントロピー源                  CRNG (ChaCha20)
+┌─────────────────┐            ┌─────────────────────────┐
+│ 割込タイミング   │──seed───→ │                          │
+│ ディスク I/O     │           │  ChaCha20 鍵 (256 bit)   │
+│ CPU ジッター     │           │       ↓                  │
+│ RDRAND/RDSEED   │           │  ChaCha20 ストリーム生成  │──→ 乱数出力
+│ (HW RNG)        │           │       ↓                  │
+│ ネットワーク     │           │  鍵の再シード (定期的)    │
+└─────────────────┘            └─────────────────────────┘
+```
+
+CRNG の主要な設計原則は以下のとおりである。
+
+- **Forward secrecy**: 乱数生成後に鍵を消去 (fast key erasure)
+- **再シード**: エントロピーが蓄積されるたびに CRNG を再シードする
+- **NUMA 対応**: CPU ごとに独立した CRNG インスタンスを持ち、ロック競合を回避
+
+### エントロピー収集
+
+カーネルはさまざまなソースからエントロピーを収集する。
+
+| ソース | 仕組み | 備考 |
+|---|---|---|
+| 割込タイミング | IRQ 到着時のタイムスタンプ差分 | 最も基本的なソース |
+| ディスク I/O | 完了タイミングの揺らぎ | HDD では有効、SSD では揺らぎが小さい |
+| CPU ジッター | `jitterentropy` ドライバ | CPU の実行時間の揺らぎを利用 |
+| RDRAND/RDSEED | Intel/AMD の HW RNG 命令 | 高品質だがバックドアの懸念あり |
+| TPM RNG | TPM 内蔵の乱数生成器 | ブート初期に有効 |
+
+Linux 5.17 以降、エントロピー抽出のハッシュ関数が SHA-1 から **BLAKE2s** に変更された。
+BLAKE2s はより高速であり、SHA-1 の既知の弱点 (衝突攻撃) も回避できる。
+
+### /dev/random と /dev/urandom の統一
+
+歴史的に Linux には 2 つの乱数デバイスが存在した。
+
+| デバイス | 従来の動作 (5.18 より前) | 現在の動作 (5.18 以降) |
+|---|---|---|
+| `/dev/random` | エントロピープールが空になるとブロック | CRNG シード後はブロックしない |
+| `/dev/urandom` | 決してブロックしない (未シードでも) | 同上 |
+
+Linux 5.6 で `/dev/random` のブロッキング動作が変更され、CRNG が初期化済みであればブロックしなくなった。
+Linux 5.18 ではさらに両者の動作が実質的に統一された。
+
+つまり、現在のカーネルでは `/dev/random` と `/dev/urandom` に**機能的な違いはない**。
+
+### getrandom() システムコール
+
+`getrandom()` はカーネル乱数を取得する**推奨インターフェース**である。
+
+```c
+#include <sys/random.h>
+
+/* フラグなし: CRNG 初期化まではブロック、初期化後はノンブロッキング */
+ssize_t ret = getrandom(buf, buf_len, 0);
+
+/* GRND_NONBLOCK: CRNG 未初期化なら EAGAIN を返す */
+ret = getrandom(buf, buf_len, GRND_NONBLOCK);
+
+/* GRND_RANDOM: /dev/random と同等 (現在は意味がほぼない) */
+ret = getrandom(buf, buf_len, GRND_RANDOM);
+```
+
+`getrandom()` が `/dev/urandom` の `read()` より推奨される理由は以下のとおりである。
+
+- ファイルディスクリプタが不要 — `chroot` 環境や fd が枯渇した状況でも使える
+- CRNG 未初期化の検出 — フラグなしの場合、初期化完了までブロックする
+- ファイルシステム攻撃への耐性 — `/dev/urandom` のシンボリックリンク置き換え攻撃を回避
+
+カーネルモジュール内では `get_random_bytes()` を使う。
+
+```c
+#include <linux/random.h>
+
+u8 key[32];
+get_random_bytes(key, sizeof(key));
+/* key には暗号学的に安全な乱数が格納される */
+```
+
+## dm-crypt / LUKS: フルディスク暗号化
+
+### dm-crypt の仕組み
+
+dm-crypt は Device Mapper サブシステム上に構築されたブロックデバイス暗号化レイヤである。
+書き込みデータをカーネル Crypto API で暗号化し、読み出し時に復号する。
+ユーザ空間からは通常のブロックデバイスとして見える。
+
+```
+ユーザ空間
+  ↓ write("hello")
+/dev/mapper/cryptroot  (平文)
+  ↓
+dm-crypt (カーネル)
+  ↓ Crypto API で暗号化
+/dev/sda2  (暗号文)
+```
+
+### AES-XTS モード
+
+ディスク暗号化では **AES-XTS** (XEX-based Tweaked-codebook mode with ciphertext Stealing) が標準モードである。
+
+XTS モードの特徴は以下のとおりである。
+
+- セクタ番号を tweak として使用 — 同じ平文でも異なるセクタでは異なる暗号文になる
+- 並列化可能 — マルチコアでの高速処理に適する
+- CBC と異なり、1 ビットの破損が同一セクタ内に限定される
+
+LUKS2 のデフォルト暗号スイートは `aes-xts-plain64` (256 ビット XTS 鍵 = 2 x 128 ビット AES 鍵) である。
+
+```bash
+# LUKS2 で暗号化パーティションを作成
+cryptsetup luksFormat --type luks2 /dev/sda2
+
+# デフォルトの暗号スイートを確認
+cryptsetup luksDump /dev/sda2 | grep Cipher
+# Cipher name:   aes
+# Cipher mode:   xts-plain64
+
+# 開く (復号マッピングを作成)
+cryptsetup luksOpen /dev/sda2 cryptroot
+
+# /dev/mapper/cryptroot を通常のブロックデバイスとして使用
+mkfs.ext4 /dev/mapper/cryptroot
+mount /dev/mapper/cryptroot /mnt
+```
+
+### Adiantum: AES ハードウェアなしのデバイス向け
+
+Adiantum は Google が設計したワイドブロック暗号モードであり、AES ハードウェアアクセラレーションを持たない低価格デバイス (安価なスマートフォン、IoT デバイス) 向けに設計された。
+Linux 5.0 でカーネルに追加された。
+
+内部的には ChaCha20 と Poly1305 を使用するため、SIMD なしでも高速に動作する。
+Android Go エディションのデバイスなど、AES-NI / ARM CE のない環境での dm-crypt に使われる。
+
+```bash
+# Adiantum を使用した dm-crypt 設定
+cryptsetup open --type plain --cipher xchacha20,adiantum \
+    --key-size 256 /dev/sda2 cryptroot
+```
+
+### cryptsetup ユーザ空間ツール
+
+`cryptsetup` は dm-crypt / LUKS の管理ツールである。
+鍵スロット管理、パスフレーズ変更、ヘッダバックアップなどの操作を提供する。
+
+LUKS2 の重要な機能として以下がある。
+
+- 最大 32 個の鍵スロット — 複数パスフレーズ / 復旧鍵をサポート
+- **Argon2id** 鍵導出関数 — メモリハード関数によるブルートフォース耐性
+- JSON メタデータ — 柔軟なヘッダ構造
+- オンラインでの暗号化変換 — 既存のパーティションを暗号化可能
+
+## dm-verity: ブロックレベル完全性検証
+
+### 概要
+
+dm-verity は Device Mapper 上のターゲットであり、ブロックデバイスの読み出し時に各ブロックの完全性をハッシュで検証する。
+書き込みは許可しない**読み取り専用**のターゲットである。
+
+改ざんされたブロックを読み出そうとすると I/O エラーが返される。
+Android Verified Boot の中核技術として広く使用されている。
+
+### Merkle ツリー構造
+
+dm-verity はデータブロックのハッシュを Merkle ツリー (ハッシュツリー) として構成する。
+
+```
+                    ルートハッシュ (trust anchor)
+                    /                \
+               Hash(H0+H1)       Hash(H2+H3)
+              /          \       /          \
+          H0=Hash(B0)  H1=Hash(B1)  H2=Hash(B2)  H3=Hash(B3)
+              |            |            |            |
+           Block 0     Block 1     Block 2     Block 3
+           (4 KB)      (4 KB)      (4 KB)      (4 KB)
+
+  ルートハッシュだけを信頼すれば、全ブロックの完全性を検証できる
+
+  検証の流れ (Block 2 を読む場合):
+  1. Block 2 のハッシュ H2 を計算
+  2. H2 と H3 を連結してハッシュし、Hash(H2+H3) と比較
+  3. Hash(H0+H1) と Hash(H2+H3) を連結してハッシュし、
+     ルートハッシュと比較
+  → いずれかの比較が一致しなければ改ざん検知
+```
+
+Merkle ツリーの性質として以下が重要である。
+
+- **ルートハッシュの信頼性だけで全データを検証できる** — ルートハッシュはブートローダや別パーティションに格納する
+- ブロックの読み出し時にツリーをたどるため、**全ブロックを事前に読む必要がない**
+- ツリーの深さは log2(ブロック数) なので、オーバーヘッドは小さい
+
+### Android Verified Boot
+
+Android は dm-verity を使って system パーティションと vendor パーティションの完全性を検証する。
+
+1. ビルド時に system/vendor パーティションの Merkle ツリーとルートハッシュを計算
+2. ルートハッシュを vbmeta パーティションに署名付きで格納
+3. ブート時にブートローダが vbmeta の署名を検証
+4. カーネルが dm-verity を設定し、ルートハッシュを引き渡す
+5. 以降、system/vendor の読み出しは全て dm-verity が検証
+
+これにより、root 化された端末やマルウェアによるシステムパーティションの改ざんを検出できる。
+
+### Linux 6.19: ハッシュ性能の大幅改善
+
+Linux 6.19 では Eric Biggers (Google) が dm-verity のハッシュ処理にマルチバッファハッシュ最適化を導入した。
+2-way interleaved SHA-256 ハッシュにより、データブロックのハッシュ計算を並行実行する。
+
+効果は以下のとおりである。
+
+- **一部の CPU ではハッシュ性能がほぼ 2 倍**
+- コールドキャッシュでの dm-verity 読み出しスループットが arm64 / x86_64 で**約 35% 向上**
+- 最適化対象はデータブロックのみ (Merkle ツリーブロックは対象外)
+
+この最適化は `sha256_finup_2x()` という新しい API を使い、2 つのデータブロックの SHA-256 計算をインターリーブして実行する。
+CPU のパイプラインを効率的に活用し、メモリレイテンシを隠蔽する手法である。
+
+## fs-verity: ファイルレベル完全性検証
+
+### 概要
+
+fs-verity はファイルシステムレベルで個別ファイルの完全性を検証する仕組みである。
+dm-verity がブロックデバイス全体を対象とするのに対し、fs-verity は個々のファイルを対象とする。
+
+対応ファイルシステムは **ext4**, **f2fs**, **btrfs** である。
+
+### 動作原理
+
+1. ユーザ空間が `ioctl(FS_IOC_ENABLE_VERITY)` を呼び、ファイルの Merkle ツリーを構築
+2. ファイルは**読み取り専用**になる (書き込み不可)
+3. 以降、ファイルの読み出し時に各ページがハッシュ検証される
+4. 破損データの読み出しは `EIO` を返す
+
+```bash
+# fs-verity を有効化
+fsverity enable --hash-alg=sha256 /path/to/file
+
+# ダイジェストを確認
+fsverity measure /path/to/file
+# sha256:abc123... /path/to/file
+```
+
+### dm-verity との使い分け
+
+| 項目 | dm-verity | fs-verity |
+|---|---|---|
+| 対象 | ブロックデバイス全体 | 個別ファイル |
+| 書き込み | 不可 (読み取り専用) | 対象ファイルのみ不可 |
+| Merkle ツリー | 別パーティションに格納 | ファイルシステム内に格納 |
+| 用途 | OS パーティション保護 | APK 署名検証、パッケージ検証 |
+| Android | system/vendor パーティション | 個別 APK ファイル |
+
+Android では dm-verity でシステムパーティション全体を保護し、fs-verity で個別 APK の完全性を検証するという二段構えを取っている。
+
+## IMA (Integrity Measurement Architecture)
+
+### 概要
+
+IMA はカーネルの完全性検証フレームワークであり、ファイルの実行・読み込み時にハッシュを計測し、TPM に記録する。
+リモートアテステーション (遠隔からシステムの完全性を検証する仕組み) の基盤となる。
+
+### 3 つのモード
+
+IMA は 3 つのモードで動作する。
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                    IMA の 3 モード                             │
+├──────────────┬──────────────────┬────────────────────────────┤
+│  Measurement │    Appraisal     │         Audit              │
+│  (計測)       │    (評価)        │       (監査)               │
+├──────────────┼──────────────────┼────────────────────────────┤
+│ ファイルの    │ ファイルの       │ ファイルの                  │
+│ ハッシュを    │ ハッシュを       │ ハッシュを                  │
+│ 計測リストに  │ 保存された       │ 監査ログに                  │
+│ 記録          │ 参照値と比較     │ 記録                       │
+│              │                  │                            │
+│ TPM PCR に   │ 一致しなければ   │ ausearch で                │
+│ 拡張          │ 実行拒否         │ 検索可能                   │
+│              │                  │                            │
+│ リモート      │ ローカルの       │ コンプライアンス            │
+│ アテステー    │ 完全性保護       │ 監査                       │
+│ ション向け    │                  │                            │
+└──────────────┴──────────────────┴────────────────────────────┘
+```
+
+**Measurement (計測)**: ファイルが読み込まれるたびにハッシュを計算し、カーネル内の計測リスト (`/sys/kernel/security/ima/ascii_runtime_measurements`) に追記する。TPM が存在する場合、ハッシュは TPM の PCR (Platform Configuration Register) に extend される。リモートアテステーションでは、この計測リストと TPM の PCR 値を検証者に提示する。
+
+**Appraisal (評価)**: ファイルのハッシュまたは署名を `security.ima` 拡張属性に保存された参照値と比較する。一致しない場合、ファイルの実行やライブラリのロードを拒否する。
+
+**Audit (監査)**: ファイルのハッシュをカーネル監査サブシステム (`audit`) に記録する。`ausearch` コマンドで検索可能であり、コンプライアンス監査に使用される。
+
+### TPM PCR Extension
+
+IMA の計測は TPM の PCR に extend される。PCR extend の動作は以下のとおりである。
+
+```
+PCR の extend 操作:
+  PCR_new = Hash(PCR_old || measurement)
+
+  PCR は一方向にしか更新できない (リセット不可)
+  → 計測の順序と内容が TPM にバインドされる
+  → リモートアテステーションで「何が実行されたか」を証明できる
+```
+
+デフォルトでは PCR 10 が IMA に使用される。
+
+```bash
+# IMA の計測リストを確認
+cat /sys/kernel/security/ima/ascii_runtime_measurements
+
+# 出力例:
+# 10 abc123... ima-ng sha256:def456... /usr/bin/bash
+# 10 789012... ima-ng sha256:345678... /usr/lib/libc.so.6
+# ...
+```
+
+### ポリシールール
+
+IMA のポリシーはどのファイルを計測・評価対象にするかを定義する。
+
+```bash
+# /etc/ima-policy の例
+
+# 実行されるすべてのファイルを計測
+measure func=BPRM_CHECK
+
+# ライブラリのロードを計測
+measure func=FILE_MMAP mask=MAY_EXEC
+
+# カーネルモジュールのロードを評価 (署名必須)
+appraise func=MODULE_CHECK appraise_type=imasig
+
+# ファームウェアのロードを評価
+appraise func=FIRMWARE_CHECK appraise_type=imasig
+
+# root が開くファイルを監査
+audit func=FILE_CHECK mask=MAY_READ uid=0
+```
+
+ポリシーの `func` フィールドは IMA フックの種類を指定する。
+
+| func | 対象操作 |
+|---|---|
+| `BPRM_CHECK` | `execve()` によるプログラム実行 |
+| `FILE_MMAP` | `mmap()` による実行可能マッピング |
+| `MODULE_CHECK` | カーネルモジュールのロード |
+| `FIRMWARE_CHECK` | ファームウェアのロード |
+| `FILE_CHECK` | 一般的なファイルオープン |
+| `KEXEC_KERNEL_CHECK` | kexec によるカーネルロード |
+
+```bash
+# IMA を有効にするカーネルパラメータ
+# (ブートローダの設定に追加)
+ima_policy=tcb                   # 計測ポリシー
+ima_appraise=enforce             # 評価を強制
+ima_hash=sha256                  # ハッシュアルゴリズム
+```
+
+### IMA 計測フロー
+
+```
+プログラム実行 (execve)
+      │
+      ▼
+ LSM フック (security_bprm_check)
+      │
+      ▼
+ IMA ポリシー照合
+ ┌────────────────────┐
+ │ func=BPRM_CHECK に │
+ │ 一致するか?         │
+ └────────┬───────────┘
+          │ Yes
+          ▼
+ ファイル内容のハッシュ計算
+ (SHA-256)
+          │
+          ▼
+ ┌────────────────────────────────────────────┐
+ │  Measurement: 計測リストに追加 + TPM extend │
+ │  Appraisal:   security.ima と比較           │
+ │  Audit:       監査ログに記録                │
+ └────────────────────────────────────────────┘
+          │
+          │ (Appraisal 失敗の場合)
+          ▼
+    実行拒否 (-EACCES)
+```
+
+## TPM (Trusted Platform Module) 2.0
+
+### 概要
+
+TPM はハードウェアセキュリティモジュールであり、暗号鍵の安全な生成・保管と、プラットフォームの完全性計測を担う。
+TPM 2.0 はほぼすべての現代の PC、サーバ、および多くの組込みデバイスに搭載されている。
+
+### カーネルの TPM サポート
+
+カーネルは `/dev/tpm0` (直接アクセス) と `/dev/tpmrm0` (リソースマネージャ経由) のデバイスノードを提供する。
+
+```bash
+# TPM の存在確認
+ls /dev/tpm*
+# /dev/tpm0  /dev/tpmrm0
+
+# TPM のバージョン確認
+cat /sys/class/tpm/tpm0/tpm_version_major
+# 2
+```
+
+### CONFIG_TCG_TPM2_HMAC
+
+`CONFIG_TCG_TPM2_HMAC` は TPM 2.0 との通信を HMAC セッションで保護するオプションである。
+Linux 6.10 でデフォルト有効として追加されたが、一部の TPM (Intel PTT の古いバージョンなど) でドライバ初期化の失敗や性能低下が報告された。
+そのため、その後のカーネルではデフォルトが無効に変更された。
+
+必要に応じてブートパラメータ `tpm_security=1` で有効化できる。
+
+```bash
+# TPM HMAC セッション保護を有効にする
+# カーネルコマンドラインに追加:
+tpm_security=1
+```
+
+### PCR と計測
+
+PCR (Platform Configuration Register) は TPM 内の特殊なレジスタであり、以下の特性を持つ。
+
+- **extend 専用**: 値を直接書き込めず、`PCR_new = Hash(PCR_old || data)` で更新する
+- **リセット不可**: 再起動でのみリセットされる (一部の PCR は例外)
+- ブートプロセスの各段階で extend され、ブートチェーンの完全性を記録する
+
+| PCR | 用途 |
+|---|---|
+| 0 | UEFI ファームウェアコード |
+| 1 | UEFI ファームウェアデータ / 設定 |
+| 2-3 | オプション ROM |
+| 4-5 | ブートローダ (GRUB など) |
+| 7 | Secure Boot 状態 |
+| 8-9 | カーネル / initramfs |
+| 10 | IMA 計測 (デフォルト) |
+| 14 | shim / MOK |
+
+### Sealed Keys (封印鍵)
+
+TPM の重要な機能として、**特定の PCR 状態にバインドされた鍵** を作成できる。
+これにより「特定のブートチェーンでのみ復号できるデータ」を実現する。
+
+例えば、LUKS の鍵を TPM に封印すると、正しいファームウェア → 正しいブートローダ → 正しいカーネルの順にブートした場合のみ自動的にディスクを復号できる。
+ブートチェーンが改ざんされていると PCR 値が異なるため、鍵の封印解除に失敗する。
+
+```bash
+# TPM に封印された trusted key を作成
+keyctl add trusted mykey "new 32 pcrinfo=0:sha256=..." @u
+
+# systemd-cryptenroll で LUKS に TPM バインディングを追加
+systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs=0+7 /dev/sda2
+```
+
+## Kernel Keyring サブシステム
+
+### 概要
+
+Kernel Keyring は暗号鍵やクレデンシャルをカーネル空間で安全に管理するサブシステムである。
+鍵はプロセスやセッションに関連付けられ、アクセス制御が適用される。
+
+### 鍵の種類
+
+| 鍵タイプ | 説明 | 用途 |
+|---|---|---|
+| `user` | ユーザ空間から設定・読み取り可能 | 汎用的な鍵保管 |
+| `logon` | ユーザ空間から設定可能だが読み取り不可 | fscrypt, dm-crypt |
+| `encrypted` | カーネルがマスターキーで暗号化して保管 | 安全な鍵保管 |
+| `trusted` | TPM で封印・封印解除 | TPM バインド鍵 |
+| `keyring` | 他の鍵を格納するコンテナ | 鍵の組織化 |
+
+`logon` 鍵は重要な設計である。
+ユーザ空間のプロセスが鍵を設定できるが、鍵の内容をユーザ空間に読み戻すことはできない。
+これにより、暗号鍵がユーザ空間のメモリダンプで漏洩するリスクを軽減する。
+
+### keyctl インターフェース
+
+```bash
+# 鍵を追加
+keyctl add user mykey "secret-data" @s
+# @s = セッション keyring, @u = ユーザ keyring, @us = UID セッション keyring
+
+# 鍵の一覧
+keyctl show @s
+
+# 鍵の読み取り
+keyctl read <key-id>
+keyctl pipe <key-id>
+
+# 鍵の削除
+keyctl revoke <key-id>
+keyctl unlink <key-id> @s
+
+# logon 鍵 (カーネルのみ読み取り可)
+keyctl add logon fscrypt:abc123 "$(dd if=/dev/urandom bs=64 count=1 2>/dev/null)" @s
+
+# trusted 鍵 (TPM 封印)
+keyctl add trusted kmk "new 32" @u
+```
+
+### カーネルモジュールからの使用
+
+```c
+#include <linux/key.h>
+#include <keys/user-type.h>
+
+struct key *key;
+
+/* セッション keyring から鍵を検索 */
+key = request_key(&key_type_user, "mykey", NULL);
+if (IS_ERR(key))
+    return PTR_ERR(key);
+
+/* 鍵のペイロードにアクセス */
+const struct user_key_payload *payload;
+payload = user_key_payload_locked(key);
+/* payload->data にデータ、payload->datalen にサイズ */
+
+key_put(key);
+```
+
+### 鍵の利用先
+
+| サブシステム | 鍵タイプ | 用途 |
+|---|---|---|
+| fscrypt | `logon` | ファイル暗号化鍵 |
+| ecryptfs | `user` | ファイル暗号化鍵 |
+| dm-crypt | `logon` | ディスク暗号化鍵 |
+| Kerberos | `user` / `rxrpc` | 認証チケット |
+| CIFS/SMB | `logon` | ネットワーク認証 |
+| IMA | `keyring` | IMA 公開鍵 |
+
+## WireGuard アーキテクチャ
+
+### 設計哲学
+
+WireGuard は Jason Donenfeld が設計した VPN プロトコルであり、Linux 5.6 でカーネルにマージされた。
+約 **4,000 行**のコードで構成され、IPsec の数十万行と比較して極めてコンパクトである。
+
+WireGuard の設計思想は**暗号アジリティの排除**である。
+暗号スイートのネゴシエーションを行わず、固定のプリミティブセットのみを使用する。
+
+| プリミティブ | 用途 |
+|---|---|
+| ChaCha20 | 対称暗号 (データ暗号化) |
+| Poly1305 | メッセージ認証 (MAC) |
+| BLAKE2s | ハッシュ / 鍵導出 |
+| Curve25519 | 鍵交換 (ECDH) |
+| HKDF | 鍵導出関数 |
+
+プリミティブのいずれかに脆弱性が発見された場合、プロトコルバージョン全体を更新する。
+ネゴシエーションの複雑さを排除することで、ダウングレード攻撃のリスクを消去している。
+
+### Crypto API のバイパス
+
+WireGuard はカーネル Crypto API を**意図的に使用しない**。
+これは以下の理由による。
+
+1. **性能**: Crypto API は汎用的な抽象化層であり、WireGuard が必要とする固定プリミティブには不要なオーバーヘッドがある
+2. **アロケーション**: Crypto API は Noise プロトコルが必要とする多鍵マルチステップ操作でメモリ割り当てを避けることが難しい
+3. **コード監査**: 自前の暗号実装を持つことで、WireGuard 全体が独立してセキュリティ監査可能になる
+
+代わりに、WireGuard は `lib/crypto/` 以下に独自の暗号実装 (`chacha20poly1305.c`, `curve25519.c`, `blake2s.c`) を持っている。
+これらはカーネルの他の部分からも利用可能であり、WireGuard のマージに伴って `lib/crypto/` に追加された。
+
+### Noise プロトコルフレームワーク
+
+WireGuard は Trevor Perrin の **Noise Protocol Framework** に基づいている。
+具体的には Noise_IKpsk2 パターンを使用する。
+
+```
+Noise_IKpsk2 ハンドシェイク:
+
+Initiator (I)                          Responder (R)
+──────────────────────────────────────────────────────
+  I の静的鍵ペア: (s_i_priv, s_i_pub)
+  R の静的公開鍵: s_r_pub (事前共有)
+
+  1. I → R: e_i_pub, AEAD(s_i_pub), AEAD(timestamp)
+     I が一時鍵 e_i を生成
+     Curve25519(e_i_priv, s_r_pub) で共有秘密を導出
+     I の静的公開鍵と現在時刻を暗号化して送信
+
+  2. R → I: e_r_pub, AEAD(empty)
+     R が一時鍵 e_r を生成
+     Curve25519(e_r_priv, e_i_pub) と
+     Curve25519(e_r_priv, s_i_pub) で共有秘密を更新
+     PSK を混入 (psk2)
+
+  3. ハンドシェイク完了
+     → 双方向の対称鍵が確立
+     → データ転送は ChaCha20-Poly1305 AEAD で暗号化
+```
+
+このハンドシェイクは 1-RTT (1 往復) で完了し、IPsec IKEv2 の複数往復と比較して高速である。
+
+## kTLS: カーネル TLS オフロード
+
+### 仕組み
+
+kTLS (Kernel TLS) は TLS の対称暗号部分をカーネルに委譲する仕組みである。
+
+```
+従来の TLS:
+  アプリケーション → OpenSSL (全処理) → カーネル (TCP) → NIC
+
+kTLS:
+  アプリケーション → OpenSSL (ハンドシェイクのみ)
+                           ↓ 鍵をカーネルに渡す
+                     カーネル (TCP + 対称暗号) → NIC
+                           ↓ (HW オフロード対応 NIC の場合)
+                     NIC (暗号化/復号)
+```
+
+**TLS ハンドシェイクはユーザ空間** (OpenSSL, GnuTLS 等) が行い、ネゴシエーションされた対称鍵をソケットオプションでカーネルに渡す。
+以降のデータ転送はカーネルが暗号化・復号を行う。
+
+利点は以下のとおりである。
+
+- **sendfile()** が TLS で使える — ユーザ空間とカーネル空間のコピーが不要
+- NIC ハードウェアオフロードが使える — CPU 負荷をさらに軽減
+- splice / zero-copy 送信との組み合わせが可能
+
+```c
+/* ユーザ空間: ハンドシェイク完了後に鍵をカーネルに渡す */
+struct tls12_crypto_info_aes_gcm_128 crypto_info;
+
+/* ネゴシエーションされた鍵と IV を設定 */
+crypto_info.info.version = TLS_1_3_VERSION;
+crypto_info.info.cipher_type = TLS_CIPHER_AES_GCM_128;
+memcpy(crypto_info.key, tls_key, TLS_CIPHER_AES_GCM_128_KEY_SIZE);
+memcpy(crypto_info.iv, tls_iv, TLS_CIPHER_AES_GCM_128_IV_SIZE);
+/* ... */
+
+setsockopt(sock, SOL_TLS, TLS_TX, &crypto_info, sizeof(crypto_info));
+
+/* 以降、send/sendfile はカーネルが TLS 暗号化を行う */
+sendfile(sock, file_fd, NULL, file_size);
+```
+
+### Linux 6.14: key_update サポート
+
+Linux 6.14 で kTLS に **key_update** サポートが追加された。
+
+TLS 1.3 では KeyUpdate ハンドシェイクメッセージにより、セッション中に送信鍵を更新できる。
+6.14 より前のカーネルでは、カーネルに渡された鍵はセッション中に変更できなかった。
+これは以下の問題を引き起こしていた。
+
+- AES-GCM の鍵使用量制限 (同一鍵での暗号化回数上限) に達した場合、セッションを維持できない
+- GnuTLS は安全上の理由から、key_update 不能な kTLS セッションをエラーとして無効化していた
+
+6.14 以降、ユーザ空間ライブラリは `TLS_TX` / `TLS_RX` ソケットオプションを再設定することで、新しい鍵をカーネルに渡せるようになった。
+
+## モジュール署名
+
+### CONFIG_MODULE_SIG
+
+カーネルモジュール署名は、ロードされるモジュールの完全性と出自を検証する仕組みである。
+
+```bash
+# 関連カーネルコンフィグ
+CONFIG_MODULE_SIG=y            # モジュール署名検証を有効化
+CONFIG_MODULE_SIG_FORCE=y      # 未署名モジュールのロードを拒否
+CONFIG_MODULE_SIG_ALL=y        # ビルド時に全モジュールを自動署名
+CONFIG_MODULE_SIG_SHA256=y     # 署名に SHA-256 を使用
+CONFIG_MODULE_SIG_KEY="certs/signing_key.pem"  # 署名鍵
+```
+
+### sign-file ツール
+
+`scripts/sign-file` はカーネルソースに含まれるモジュール署名ツールである。
+
+```bash
+# モジュールに署名
+scripts/sign-file sha256 \
+    certs/signing_key.pem \
+    certs/signing_key.x509 \
+    drivers/my_module.ko
+
+# 署名はモジュールファイルの末尾に付加される
+# "~Module signature appended~" マーカーが追加される
+```
+
+署名の仕組みは以下のとおりである。
+
+1. ビルド時に、カーネルは自動的に署名鍵ペア (RSA または ECDSA) を生成する (`certs/signing_key.pem`)
+2. 公開鍵はカーネルイメージ内のシステム keyring (`.builtin_trusted_keys`) に組み込まれる
+3. `sign-file` がモジュールの ELF バイナリに対して秘密鍵で署名し、署名をファイル末尾に付加する
+4. `insmod` / `modprobe` 時に、カーネルはシステム keyring の公開鍵で署名を検証する
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│                   モジュール署名の流れ                         │
+│                                                              │
+│  ビルド時:                                                    │
+│    signing_key.pem (秘密鍵) ─→ sign-file ─→ module.ko (署名付) │
+│    signing_key.x509 (公開鍵) ─→ カーネルイメージに組込み       │
+│                                                              │
+│  ロード時:                                                    │
+│    module.ko ──→ カーネル ──→ 組込み公開鍵で署名を検証         │
+│                                    │                         │
+│                              ┌─────┴─────┐                   │
+│                              │           │                   │
+│                           検証成功     検証失敗               │
+│                              │           │                   │
+│                         ロード許可    ロード拒否               │
+│                                     (MODULE_SIG_FORCE 時)    │
+└──────────────────────────────────────────────────────────────┘
+```
+
+:::caution[署名済みモジュールの取り扱い]
+署名はモジュールファイルの ELF コンテナ外に付加されるため、署名後に `strip` コマンドでモジュールを処理すると**署名が無効化される**。
+パッケージングの工程で strip が自動的に適用されないよう注意が必要である。
+:::
+
+### Secure Boot との連携
+
+UEFI Secure Boot 環境では、以下のチェーンが形成される。
+
+1. UEFI が署名済みブートローダ (shim) を検証
+2. shim が署名済みカーネルを検証
+3. カーネルが署名済みモジュールを検証 (`CONFIG_MODULE_SIG_FORCE`)
+4. IMA が実行ファイルの署名を検証 (オプション)
+
+Lockdown LSM (`CONFIG_LOCK_DOWN_KERNEL`) と組み合わせることで、Secure Boot チェーンの完全性を維持しながら、カーネルの攻撃面を制限できる。
+
+## Rust 暗号バインディングの現状
+
+2026 年 4 月時点で、Rust for Linux における暗号サブシステムのバインディングは**まだ提供されていない**。
+
+Rust カーネルモジュールから暗号処理を行いたい場合、現時点では以下の選択肢がある。
+
+1. **unsafe FFI で C の Crypto API を直接呼ぶ** — 安全性の保証がなく推奨されない
+2. **C ヘルパー関数を書いて Rust から呼ぶ** — 実用的だが Rust の型安全性を活かせない
+3. **暗号処理をユーザ空間に委譲する** — 一部のユースケースでは合理的
+
+Rust for Linux プロジェクトは 2025 年末に「実験的」タグが外され、カーネルにおける Rust の地位は確立されつつある。
+しかし、暗号サブシステムのような複雑な API のラッパーは、所有権モデルとの整合性やメモリ安全性の保証を慎重に設計する必要があり、開発には時間がかかっている。
+
+将来的に提供される場合、以下のような型安全な API が期待される。
+
+```rust
+// 将来の想定 API (未実装 — あくまで予想)
+use kernel::crypto::{Skcipher, Shash};
+
+fn example() -> Result {
+    // 型パラメータでアルゴリズムを指定
+    let tfm = Skcipher::new("cbc(aes)", GFP_KERNEL)?;
+    tfm.set_key(&key)?;
+
+    // scatterlist の安全なラッパー
+    let req = tfm.alloc_request(GFP_KERNEL)?;
+    req.encrypt(&src, &mut dst, &iv)?;
+
+    Ok(())
+}
+```
+
+現段階で暗号処理を必要とする Rust カーネルモジュールを開発する場合は、C 側にヘルパーを用意し、FFI 境界を最小限に保つアプローチが現実的である。
+
+## 暗号サブシステム全体像
+
+ここまで解説した要素がどのように連携するかを俯瞰する。
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        ユーザ空間                                    │
+│  cryptsetup  fsverity  keyctl  wg  openssl  tpm2-tools  ima-evm   │
+└──────┬──────────┬────────┬──────┬──────┬────────┬──────────┬───────┘
+       │          │        │      │      │        │          │
+───────┼──────────┼────────┼──────┼──────┼────────┼──────────┼────────
+       │          │        │      │      │        │          │
+       ▼          ▼        ▼      ▼      ▼        ▼          ▼
+┌──────────┐ ┌────────┐ ┌─────┐ ┌────┐ ┌────┐ ┌──────┐ ┌───────┐
+│ dm-crypt │ │fs-verity│ │Key- │ │Wire│ │kTLS│ │ TPM  │ │  IMA  │
+│ dm-verity│ │         │ │ring │ │Guard│ │    │ │driver│ │       │
+└────┬─────┘ └───┬─────┘ └──┬──┘ └─┬──┘ └─┬──┘ └──┬───┘ └───┬───┘
+     │           │          │      │      │       │         │
+     ▼           ▼          │      │      ▼       │         ▼
+┌─────────────────────────────┐    │  ┌───────┐   │  ┌───────────┐
+│     Kernel Crypto API       │    │  │Socket │   │  │ 監査ログ   │
+│  (skcipher/aead/shash/ahash)│    │  │Layer  │   │  │ 計測リスト │
+└───────────┬─────────────────┘    │  └───────┘   │  └───────────┘
+            │                      │              │
+            ▼                      ▼              ▼
+┌─────────────────────────────────────────────────────────────┐
+│              暗号ドライバ / ハードウェア                       │
+│   aes-ni  sha256-ni  arm-ce  lib/crypto/chacha20  TPM chip  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+WireGuard が Crypto API をバイパスして直接 `lib/crypto/` の実装を使っている点に注目してほしい。
+kTLS はソケットレイヤを経由するため、Crypto API とは異なるパスで暗号処理を行う。
+IMA は計測結果を TPM ドライバを経由して TPM チップに書き込む。
+
+## よくある罠
+
+### 1. FPU 保存を忘れて AES-NI を使う
+
+`kernel_fpu_begin()` / `kernel_fpu_end()` なしに SIMD 命令を使うと、ユーザプロセスの FPU レジスタを破壊する。
+破壊は即座には検出されず、ユーザプロセスが浮動小数点演算で誤った結果を得るという形で顕在化する。
+デバッグが極めて困難である。
+
+### 2. 割込コンテキストで同期暗号 API を使う
+
+同期 API の一部は内部でメモリ割り当てや sleep を行う可能性がある。
+softirq コンテキスト (ネットワークパケット処理など) から暗号処理を行う場合は、非同期 API を使うか、ワーカースレッドに委譲する。
+
+### 3. nonce の再利用
+
+AES-GCM や ChaCha20-Poly1305 で同一鍵に対して nonce を再利用すると、暗号化の安全性が**完全に崩壊**する。
+カーネル内で暗号化を行う場合、nonce 管理は呼び出し側の責任である。カウンタベースの nonce 生成が一般的であるが、マルチスレッド環境ではカウンタの同期に注意が必要である。
+
+### 4. dm-verity のルートハッシュを保護しない
+
+dm-verity はルートハッシュの信頼性に依存する。
+ルートハッシュ自体が改ざんされると、dm-verity は無力である。
+必ず署名済み vbmeta パーティション、カーネルコマンドラインパラメータ、または Secure Boot チェーンでルートハッシュを保護する。
+
+### 5. /dev/urandom をブート直後に使う
+
+極めて初期のブートフェーズでは CRNG が十分なエントロピーで初期化されていない可能性がある。
+暗号鍵生成には `getrandom()` (フラグなし) を使い、CRNG の初期化完了を待つべきである。
+カーネルモジュールからは `wait_for_random_bytes()` で初期化完了を待機できる。
+
+```c
+#include <linux/random.h>
+
+/* CRNG 初期化を待ってから鍵を生成 */
+int err = wait_for_random_bytes();
+if (err)
+    return err;
+
+get_random_bytes(key, sizeof(key));
+```
+
+## 章末演習
+
+1. `cat /proc/crypto` を実行し、自分のシステムで利用可能な暗号アルゴリズムとそのドライバ・優先度を一覧せよ。AES のジェネリック実装とハードウェア加速実装の優先度の違いを確認せよ。
+
+2. `cryptsetup benchmark` を実行し、AES-XTS と ChaCha20 の暗号化・復号速度を比較せよ。AES-NI の有無がどのように影響するかを考察せよ。
+
+3. ループバックデバイスを使い、LUKS2 暗号化ボリュームを作成・マウント・アンマウントする一連の操作を実施せよ。
+
+   ```bash
+   dd if=/dev/zero of=/tmp/luks.img bs=1M count=64
+   sudo losetup /dev/loop0 /tmp/luks.img
+   sudo cryptsetup luksFormat /dev/loop0
+   sudo cryptsetup luksOpen /dev/loop0 testcrypt
+   sudo mkfs.ext4 /dev/mapper/testcrypt
+   sudo mount /dev/mapper/testcrypt /mnt
+   # ... ファイルの読み書き ...
+   sudo umount /mnt
+   sudo cryptsetup luksClose testcrypt
+   sudo losetup -d /dev/loop0
+   ```
+
+4. `keyctl show @s` でセッション keyring の内容を確認し、`keyctl add user testkey "hello" @s` で鍵を追加した後、`keyctl read` で内容を読み取れることを確認せよ。
+
+5. (発展) IMA が有効なシステムで `/sys/kernel/security/ima/ascii_runtime_measurements` の内容を確認し、どのファイルが計測されているかを分析せよ。IMA ポリシーと計測対象の関係を考察せよ。
+
+6. (発展) カーネルモジュールに対して `scripts/sign-file` で署名し、`CONFIG_MODULE_SIG_FORCE=y` のカーネルでのみロードできることを確認せよ。署名を `strip` で除去した場合にロードが拒否されることも確認せよ。
+
+## 参考資料
+
+- [Kernel Crypto API Architecture (kernel.org)](https://docs.kernel.org/crypto/architecture.html)
+- [dm-crypt (kernel.org)](https://docs.kernel.org/admin-guide/device-mapper/dm-crypt.html)
+- [dm-verity (kernel.org)](https://docs.kernel.org/admin-guide/device-mapper/verity.html)
+- [fs-verity (kernel.org)](https://docs.kernel.org/filesystems/fsverity.html)
+- [IMA (kernel.org)](https://docs.kernel.org/admin-guide/device-mapper/verity.html)
+- [Kernel Keyring (kernel.org)](https://docs.kernel.org/security/keys/core.html)
+- [Kernel TLS (kernel.org)](https://docs.kernel.org/networking/tls.html)
+- [Module Signing (kernel.org)](https://docs.kernel.org/admin-guide/module-signing.html)
+- [WireGuard (wireguard.com)](https://www.wireguard.com/)
+- [WireGuard Whitepaper (PDF)](https://www.wireguard.com/papers/wireguard.pdf)
+- [Random Number Generation Enhancements (5.17/5.18)](https://www.zx2c4.com/projects/linux-rng-5.17-5.18/)
+- [dm-verity multibuffer hashing for Linux 6.19 (Phoronix)](https://www.phoronix.com/news/Linux-6.19-dm-verity-Perf)
+- [random(7) man page](https://man7.org/linux/man-pages/man7/random.7.html)

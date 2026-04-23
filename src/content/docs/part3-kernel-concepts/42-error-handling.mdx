@@ -1,0 +1,1257 @@
+---
+title: "カーネルのエラーハンドリング詳解"
+description: "ERR_PTR, BUG_ON vs WARN_ON, panic vs oops, fault injection, -EPROBE_DEFER — C と Rust のエラー処理パターンを体系的に理解する"
+---
+
+## この章で学ぶこと
+
+- `ERR_PTR` / `IS_ERR` / `PTR_ERR` によるポインタへの errno 埋め込みを理解する
+- `panic` / oops / `BUG` / `WARN` の使い分けを判断できるようになる
+- `BUG_ON` が新規コードで禁止されている理由とその代替を説明できる
+- Fault Injection フレームワークでエラーパスをテストする方法を知る
+- `-EPROBE_DEFER` パターンとその落とし穴を把握する
+- `readl_poll_timeout` 系のポーリングヘルパーを使える
+- Rust の `kernel::error::Error` / `Result<T>` と `?` 演算子による安全なエラー処理を実践できる
+- エラーハンドリングの不備が引き起こした実際の CVE を分析し、Rust がどう防ぐかを理解する
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::error::Error`, `kernel::error::Result<T>`, `kernel::error::code::*` (EINVAL, ENOMEM 等)
+🟡 **開発中**: `read_poll_timeout` Rust 版 (`rust/kernel/io/poll.rs`, 2025 年パッチ)
+:::
+
+## 前提
+
+- [Ch 4](/part2-first-module/04-hello-c/)--[Ch 5](/part2-first-module/05-hello-rust/) (C/Rust モジュール基礎) を完了している
+- [Ch 5](/part3-kernel-concepts/08-memory/) (メモリ管理) の `kmalloc` / errno の基礎を知っている
+- [Ch 15](/part6-rust-kernel/20-ownership-unsafe/) (所有権・RAII) の goto チェーンと RAII の対比を理解している
+
+---
+
+## エラー伝播の基本規約
+
+Linux カーネルでは、エラーコードの伝え方に2つの基本パターンがある。
+
+### パターン 1: 整数を返す関数
+
+成功時に `0`、失敗時に **負の errno** を返す。
+
+```c title="整数リターンの慣例"
+int my_init(struct device *dev)
+{
+    int ret;
+
+    ret = clk_prepare_enable(dev->clk);
+    if (ret)           /* 0 でなければ失敗 */
+        return ret;    /* 負の errno をそのまま呼び出し元に伝播 */
+
+    ret = do_something_else(dev);
+    if (ret)
+        goto err_clk;
+
+    return 0;          /* 成功 */
+
+err_clk:
+    clk_disable_unprepare(dev->clk);
+    return ret;
+}
+```
+
+### パターン 2: ポインタを返す関数
+
+成功時に有効なポインタ、失敗時に `ERR_PTR(-errno)` を返す (次セクションで詳述)。
+
+### サブシステム固有の慣例
+
+一部のサブシステムでは独自のリターン規約がある:
+
+| サブシステム | 成功時 | 失敗時 | 備考 |
+|---|---|---|---|
+| VFS `read` / `write` | 転送バイト数 (正) | 負の errno | `ssize_t` |
+| `ioctl` | コマンド依存 | 負の errno | 正の値が成功データの場合もある |
+| IRQ handler | `IRQ_HANDLED` | `IRQ_NONE` | errno ではない |
+| `probe()` | `0` | 負の errno | `-EPROBE_DEFER` は特別扱い |
+| workqueue `schedule_work()` | `true` (新規投入) | `false` (既にキュー済) | エラーではない |
+
+:::caution[返り値の確認を省略しない]
+Linux カーネルにおけるバグの多くは、返り値チェックの欠落に起因する。
+`__must_check` 属性のついた関数の返り値を無視すると、コンパイラが警告を出す。
+Rust では `#[must_use]` + `Result<T>` がこれをコンパイル時に強制する。
+:::
+
+---
+
+## ERR_PTR / IS_ERR / PTR_ERR パターン
+
+### なぜポインタに errno を埋め込めるのか
+
+x86_64 カーネルでは、仮想アドレス空間の最上位ページは有効なカーネルポインタとして使われない。
+具体的には、`0xFFFF_FFFF_FFFF_F000` 以降の最上位 1 ページ (4096 バイト) は
+カーネルが意図的にマッピングしない予約領域である。
+
+errno の値は `-1` から `-4095` の範囲 (`-MAX_ERRNO` = `-4095`) に収まる。
+これらの値を `unsigned long` として見ると、`0xFFFF_FFFF_FFFF_F001` から `0xFFFF_FFFF_FFFF_FFFF` の範囲になる。
+つまり、有効なカーネルポインタとは絶対に重ならない。
+
+```
+アドレス空間 (x86_64):
+
+0x0000_0000_0000_0000  ─── ユーザ空間 (128 TB) ───
+         ...
+0x0000_7FFF_FFFF_FFFF
+         ...             [非正規領域 — アクセス不可]
+0xFFFF_8000_0000_0000  ─── カーネル空間 (128 TB) ───
+         ...
+0xFFFF_FFFF_FFFF_F000  ─── ここから最終ページ (4 KB) ───
+0xFFFF_FFFF_FFFF_F001  = (unsigned long)(-4095) = ERR_PTR(-MAX_ERRNO)
+         ...
+0xFFFF_FFFF_FFFF_FFFE  = (unsigned long)(-2)    = ERR_PTR(-ENOENT)
+0xFFFF_FFFF_FFFF_FFFF  = (unsigned long)(-1)    = ERR_PTR(-EPERM)
+```
+
+### 実装
+
+`include/linux/err.h` の実装は驚くほどシンプルである:
+
+```c title="include/linux/err.h (簡略版)"
+#define MAX_ERRNO 4095
+
+#define IS_ERR_VALUE(x) unlikely((unsigned long)(void *)(x) >= (unsigned long)-MAX_ERRNO)
+
+/* 負の errno → ポインタに変換 */
+static inline void * __must_check ERR_PTR(long error)
+{
+    return (void *)error;
+}
+
+/* ポインタ → 負の errno に復元 */
+static inline long __must_check PTR_ERR(const void *ptr)
+{
+    return (long)ptr;
+}
+
+/* ポインタがエラーかどうか判定 */
+static inline bool __must_check IS_ERR(const void *ptr)
+{
+    return IS_ERR_VALUE((unsigned long)ptr);
+}
+
+/* NULL もエラーとして扱う変種 */
+static inline bool __must_check IS_ERR_OR_NULL(const void *ptr)
+{
+    return unlikely(!ptr) || IS_ERR_VALUE((unsigned long)ptr);
+}
+```
+
+### 使用例
+
+```c title="ERR_PTR パターンの完全な例"
+#include <linux/err.h>
+#include <linux/slab.h>
+
+struct my_object {
+    int value;
+    char name[32];
+};
+
+/* ERR_PTR でエラーを返す関数 */
+struct my_object *create_object(const char *name, int value)
+{
+    struct my_object *obj;
+
+    if (!name)
+        return ERR_PTR(-EINVAL);      /* 引数エラー */
+
+    obj = kmalloc(sizeof(*obj), GFP_KERNEL);
+    if (!obj)
+        return ERR_PTR(-ENOMEM);      /* メモリ不足 */
+
+    obj->value = value;
+    strscpy(obj->name, name, sizeof(obj->name));
+
+    return obj;                       /* 成功: 有効なポインタ */
+}
+
+/* 呼び出し側 */
+int init_subsystem(void)
+{
+    struct my_object *obj;
+
+    obj = create_object("sensor", 42);
+    if (IS_ERR(obj)) {
+        pr_err("create_object failed: %ld\n", PTR_ERR(obj));
+        return PTR_ERR(obj);          /* errno を呼び出し元に伝播 */
+    }
+
+    /* obj は有効なポインタ — 安全に使える */
+    pr_info("created: %s = %d\n", obj->name, obj->value);
+
+    kfree(obj);
+    return 0;
+}
+```
+
+### IS_ERR_OR_NULL() — NULL とエラーの両方をチェック
+
+一部の古い API は、失敗時に `NULL` を返す関数と `ERR_PTR` を返す関数が混在している。
+`IS_ERR_OR_NULL()` は両方をまとめて判定する:
+
+```c
+struct clk *clk = clk_get(dev, "bus");
+if (IS_ERR_OR_NULL(clk)) {
+    /* clk が NULL でも ERR_PTR でもここに来る */
+    if (IS_ERR(clk))
+        return PTR_ERR(clk);
+    return -ENOENT;  /* NULL の場合のフォールバック */
+}
+```
+
+:::note[IS_ERR_OR_NULL は多用しない]
+Torvalds は `IS_ERR_OR_NULL()` の使用について「API の設計に問題がある兆候」と述べている。
+新規コードでは `ERR_PTR` か `NULL` のどちらかに統一し、混在を避けるべきである。
+:::
+
+### C vs Rust 比較: ERR_PTR パターン
+
+| 観点 | C (ERR_PTR) | Rust (Result) |
+|---|---|---|
+| 型安全性 | なし — `void *` のキャスト | `Result<T, Error>` で型レベルで表現 |
+| エラーの見落とし | `IS_ERR` チェック忘れでクラッシュ | `Result` 未処理はコンパイル警告 |
+| エラー値の復元 | `PTR_ERR()` のキャスト | `.err()` メソッド |
+| NULL との混在 | `IS_ERR_OR_NULL` が必要 | `Option<T>` と `Result<T>` で明確に分離 |
+
+---
+
+## Panic vs Oops vs BUG vs WARN — エラー報告の判断基準
+
+カーネルには複数の「異常を報告する」メカニズムがあり、それぞれ深刻度が異なる。
+**誤った選択はカーネルクラッシュや脆弱性につながる。**
+
+### 各メカニズムの概要
+
+| メカニズム | 動作 | システムへの影響 | 使用場面 |
+|---|---|---|---|
+| `pr_warn()` | ログメッセージ出力 | なし | 予期される軽微な問題 |
+| `WARN()` / `WARN_ON()` | スタックトレース + 継続 | なし (通常) | 「起きるべきでないが回復可能」な状態 |
+| `WARN_ONCE()` | 初回のみスタックトレース | なし | 同上 (ログ洪水防止) |
+| `BUG()` / `BUG_ON()` | oops 発生 + プロセス kill | 不安定化 | **非推奨 — 新規コードで使用禁止** |
+| oops | レジスタ + スタック出力 | プロセス kill, 場合により続行 | 不正メモリアクセス等で自動発生 |
+| `panic()` | システム完全停止 | 全停止 | データ破壊の回避が最優先の場合のみ |
+
+### panic()
+
+```c
+panic("Fatal: corrupted page tables, halting to prevent data loss");
+```
+
+`panic()` はシステム全体を即座に停止する。リブートするまで復帰しない。
+使用が許されるのは、**続行するとディスク上のデータが破壊される恐れがある場合のみ** である。
+
+典型的な例:
+- ページテーブルの不整合 (続行すると任意のメモリを破壊)
+- ルートファイルシステムのマウント失敗 (userspace を起動できない)
+- 初期化中の致命的エラー (カーネル自体が機能しない)
+
+### Oops
+
+Oops はカーネルが不正なメモリアクセスを検出したときに発生する。
+NULL ポインタ参照やページフォルト違反がこれに当たる。
+
+```
+BUG: unable to handle page fault for address: 0000000000000010
+RIP: 0010:my_func+0x1a/0x30 [my_module]
+Call Trace:
+ <TASK>
+ caller_func+0x45/0x80 [my_module]
+ ...
+```
+
+Oops が発生すると:
+1. レジスタの内容、スタックトレースがカーネルログに出力される
+2. 問題を起こしたプロセスが kill される
+3. システムは (通常) **続行する** — ただし不安定な状態かもしれない
+
+:::caution[panic_on_oops]
+`panic_on_oops=1` カーネルパラメータを設定すると、oops 発生時にシステムを即座に panic させる。
+本番サーバでは「不安定な状態で続行するより、即座に再起動してフェイルオーバー」という方針のため、
+ほぼ例外なくこのパラメータが有効である。
+:::
+
+### BUG() / BUG_ON() — 非推奨
+
+```c
+/* 非推奨: 新規コードでは使わない */
+BUG_ON(ptr == NULL);  /* ptr が NULL なら oops + プロセス kill */
+```
+
+`BUG()` と `BUG_ON(条件)` は意図的に oops を発生させる。
+アサーションのように「この条件が成立したらカーネルに深刻な問題がある」ことを示す。
+
+**しかし、現在のカーネル開発方針では新規コードでの使用が明確に禁止されている。**
+
+理由:
+1. `panic_on_oops=1` 環境 (本番サーバのほとんど) では、`BUG_ON` が即座にシステム全体を停止させる
+2. これはサービス拒否 (DoS) の脆弱性そのものである
+3. 多くの場合、エラーを報告して処理を続行するほうが安全である
+
+### WARN() / WARN_ON() / WARN_ONCE() — 推奨
+
+```c
+/* 推奨: スタックトレースを出力して続行 */
+if (WARN_ON(ptr == NULL))
+    return -EINVAL;
+
+/* 初回のみ警告 (ログ洪水を防止) */
+WARN_ONCE(count > MAX_LIMIT, "count exceeded limit: %d\n", count);
+```
+
+`WARN` 系は:
+1. スタックトレースをカーネルログに出力する
+2. **処理を続行する** (システムを停止しない)
+3. 開発者にバグの存在を知らせつつ、サービスは維持する
+
+:::note[panic_on_warn]
+テスト環境では `panic_on_warn=1` を設定して、`WARN` も panic にする場合がある。
+これにより syzbot 等の fuzzer が `WARN` を確実に検出できる。
+本番環境では通常 `0` のままにする。
+:::
+
+### pr_warn() — 単純なログ
+
+```c
+pr_warn("my_driver: unexpected value %d, using default\n", val);
+```
+
+スタックトレースなし。単なるログメッセージ。
+利用者やオペレータに異常を知らせるが、開発者がスタックトレースを必要としない場合に使う。
+
+### dump_stack() — 呼び出しスタックの出力
+
+```c
+void my_unexpected_path(void)
+{
+    pr_warn("Reached unexpected code path\n");
+    dump_stack();   /* 現在の呼び出しスタックをカーネルログに出力 */
+    /* ... エラー処理を続行 ... */
+}
+```
+
+`dump_stack()` は任意の場所で呼び出しスタックをカーネルログに出力する。
+oops も WARN も発生させず、システムに影響を与えない。
+
+用途:
+- 「この関数がどの経路で呼ばれたか」を調査する
+- 予期しないコードパスが実行されたことを記録する
+- `WARN_ON` ほど強いアサーションは不要だがスタックトレースは欲しい場合
+
+### エラー報告の判断ツリー
+
+```
+問題を検出した
+ │
+ ├── 続行するとデータが破壊されるか?
+ │    └── YES → panic()
+ │
+ ├── カーネルの内部不変条件が壊れているか?
+ │    ├── YES: 回復方法があるか?
+ │    │    ├── YES → WARN_ON_ONCE() + エラーリターン
+ │    │    └── NO → WARN_ON_ONCE() + 可能な限り安全にフェイル
+ │    │         (BUG_ON は使わない)
+ │    └── NO → 次へ
+ │
+ ├── 予期されるが望ましくない状態か?
+ │    └── YES: スタックトレースが必要か?
+ │         ├── YES → dump_stack() + pr_warn()
+ │         └── NO → pr_warn() / dev_warn()
+ │
+ └── 単なるデバッグ情報か?
+      └── YES → pr_debug() / dev_dbg()
+```
+
+### C vs Rust 比較: エラー報告
+
+| 観点 | C | Rust |
+|---|---|---|
+| panic | `panic()` 関数 | `panic!()` マクロ (カーネルでも同様に全停止) |
+| アサーション | `WARN_ON()` → 続行 | コンパイル時にほとんどのケースを排除 |
+| BUG 相当 | `BUG_ON()` (非推奨) | `unwrap()` / `expect()` (同様に非推奨) |
+| エラーリターン | `if (ret) return ret;` | `?` 演算子 |
+| 不到達コード | `WARN_ON(1); return -EINVAL;` | `unreachable!()` → panic |
+| ログ | `pr_warn()` / `dev_warn()` | `pr_warn!()` / `dev_warn!()` |
+
+---
+
+## BUG_ON 除去の取り組み
+
+### 公式方針
+
+カーネルドキュメント `Documentation/process/deprecated.rst` には次のように明記されている:
+
+> **Do not add new code that uses BUG() or BUG_ON().**
+
+Linus Torvalds も繰り返しこの方針を強調している:
+
+> *"BUG_ON() is already a security hole. It's a denial-of-service attack by definition."*
+
+### 問題の規模
+
+カーネルソースツリーには歴史的に約 12,000 件以上の `BUG_ON` が残っている。
+これらは順次 `WARN_ON_ONCE` + エラーリターンに置き換えられているが、
+すべてを変換するには各呼び出しサイトのコンテキストを理解する必要があり、
+機械的な置換では済まない。
+
+### 置換パターン
+
+```c title="Before: BUG_ON (非推奨)"
+void process_buffer(struct buffer *buf)
+{
+    BUG_ON(!buf);           /* NULL なら oops → システム停止 */
+    BUG_ON(buf->size == 0); /* サイズ 0 なら oops → システム停止 */
+
+    /* ... 処理 ... */
+}
+```
+
+```c title="After: WARN_ON_ONCE + エラーリターン (推奨)"
+int process_buffer(struct buffer *buf)
+{
+    if (WARN_ON_ONCE(!buf))
+        return -EINVAL;
+
+    if (WARN_ON_ONCE(buf->size == 0))
+        return -EINVAL;
+
+    /* ... 処理 ... */
+    return 0;
+}
+```
+
+注意点:
+- `void` 関数を `int` (または適切なエラー型) に変更する必要がある場合がある
+- 呼び出し元もエラーリターンを処理するよう修正が必要
+- 関数シグネチャの変更は ABI に影響するため、段階的に進める
+
+### BUG_ON が脆弱性になった実例
+
+**CVE-2026-22990 (libceph)**: libceph サブシステムで、ネットワークから受信した不正なメッセージに対して
+`BUG_ON` がトリガーされる可能性があった。攻撃者が細工したパケットを送信するだけで、
+カーネルが oops を発生させ、`panic_on_oops=1` のシステムではサービス拒否が成立する。
+
+修正は単純で、`BUG_ON` を `WARN_ON_ONCE` + エラーリターンに置き換えるだけだった:
+
+```c title="修正例: BUG_ON → WARN_ON_ONCE"
+/* Before: 攻撃者がクラッシュを引き起こせる */
+BUG_ON(msg->front.iov_len != expected_len);
+
+/* After: 不正なメッセージを拒否して続行 */
+if (WARN_ON_ONCE(msg->front.iov_len != expected_len))
+    return -EINVAL;
+```
+
+:::danger[ユーザ入力・ネットワーク入力に対する BUG_ON は絶対に使わない]
+外部から制御可能なデータに対して `BUG_ON` を使うことは、
+攻撃者にシステム停止のトリガーを渡すことと同義である。
+`WARN_ON_ONCE` + エラーリターンで不正な入力を安全に拒否すること。
+:::
+
+---
+
+## Fault Injection フレームワーク
+
+### 目的
+
+カーネルコードのエラーパスは、正常系に比べてテストが困難である。
+メモリ不足やディスク I/O エラーは本番環境では稀にしか起きないため、
+エラーハンドリングのバグが長期間潜伏する。
+
+Fault Injection フレームワーク (`CONFIG_FAULT_INJECTION`) は、
+意図的にエラーを注入してエラーパスをテストする仕組みである。
+
+### カーネル設定
+
+```bash
+scripts/config --enable FAULT_INJECTION
+scripts/config --enable FAILSLAB          # kmalloc 失敗の注入
+scripts/config --enable FAIL_PAGE_ALLOC   # ページ割り当て失敗の注入
+scripts/config --enable FAIL_MAKE_REQUEST # ブロック I/O エラーの注入
+scripts/config --enable FAULT_INJECTION_DEBUG_FS  # debugfs インターフェース
+scripts/config --enable FAIL_FUNCTION     # 特定関数の失敗の注入
+```
+
+### 注入可能なエラーの種類
+
+| 名前 | 対象 | 制御ディレクトリ |
+|---|---|---|
+| `failslab` | SLAB/SLUB アロケーション (`kmalloc`, `kmem_cache_alloc`) | `/sys/kernel/debug/failslab/` |
+| `fail_page_alloc` | ページアロケーション (`alloc_pages`) | `/sys/kernel/debug/fail_page_alloc/` |
+| `fail_make_request` | ブロック I/O リクエスト | `/sys/kernel/debug/fail_make_request/` |
+| `fail-nth` | N 回目の呼び出しで失敗 | `/proc/thread-self/fail-nth` |
+
+### debugfs による制御
+
+各エラー注入には共通の制御パラメータがある:
+
+```bash
+# failslab (kmalloc 失敗) の例
+
+# 失敗確率: 1% (100 回に 1 回)
+echo 1 > /sys/kernel/debug/failslab/probability
+
+# 失敗間隔: 最低 10 回は成功してから次の失敗
+echo 10 > /sys/kernel/debug/failslab/interval
+
+# 対象を現在のタスクに限定 (他のプロセスに影響しない)
+echo 1 > /sys/kernel/debug/failslab/task-filter
+echo 1 > /proc/self/make-it-fail
+
+# スタックトレースフィルタ: 特定のモジュールのみ対象
+echo 1 > /sys/kernel/debug/failslab/stacktrace-depth
+```
+
+### 制御パラメータ一覧
+
+| パラメータ | 意味 | 例 |
+|---|---|---|
+| `probability` | 失敗確率 (0--100) | `10` = 10% |
+| `interval` | 最低成功回数 | `5` = 5回成功してから次の失敗候補 |
+| `times` | 最大失敗回数 | `100` = 100回失敗したら注入停止 |
+| `space` | 対象の最大サイズ (バイト) | `4096` = 4KB 以下の割り当てのみ |
+| `task-filter` | 現在タスクの `make-it-fail` フラグで絞り込み | `1` = 有効 |
+| `stacktrace-depth` | スタックフィルタの深さ | `10` |
+| `require-start` / `require-end` | スタック内のアドレス範囲 | モジュールのアドレス範囲 |
+| `reject-start` / `reject-end` | 除外するアドレス範囲 | コア関数を除外 |
+
+### テスト例: kmalloc 失敗パスの検証
+
+```c title="テスト対象のコード"
+int my_init(struct device *dev)
+{
+    struct my_data *data;
+
+    data = kmalloc(sizeof(*data), GFP_KERNEL);
+    if (!data)
+        return -ENOMEM;
+
+    data->buffer = kmalloc(PAGE_SIZE, GFP_KERNEL);
+    if (!data->buffer) {
+        kfree(data);          /* 1 段目の解放を忘れるとリーク */
+        return -ENOMEM;
+    }
+
+    /* ... */
+    return 0;
+}
+```
+
+```bash title="fault injection でテスト"
+#!/bin/bash
+# failslab を有効化 (自タスクのみ)
+echo 1 > /sys/kernel/debug/failslab/probability
+echo 1 > /sys/kernel/debug/failslab/task-filter
+echo 1 > /proc/self/make-it-fail
+echo 100 > /sys/kernel/debug/failslab/times
+
+# テスト対象のモジュールをロード (kmalloc が確率的に失敗する)
+insmod my_module.ko
+
+# kmemleak でリークを検出
+echo scan > /sys/kernel/debug/kmemleak
+cat /sys/kernel/debug/kmemleak
+
+# クリーンアップ
+echo 0 > /sys/kernel/debug/failslab/probability
+```
+
+### fail-nth: 決定的なテスト
+
+`fail-nth` は N 回目のフォールブルな呼び出しを確実に失敗させる。
+確率的な `failslab` と異なり、再現性のあるテストが書ける。
+
+```bash
+# 3 回目の kmalloc を失敗させる
+echo 3 > /proc/thread-self/fail-nth
+insmod my_module.ko
+# → 3 回目の kmalloc が -ENOMEM を返す
+```
+
+### C vs Rust 比較: エラーパスのテスト
+
+| 観点 | C | Rust |
+|---|---|---|
+| メモリ割り当て失敗 | fault injection で外部注入 | `try_alloc` の `?` が静的に強制 |
+| リーク検出 | kmemleak (実行時) | RAII で Drop 時に自動解放 |
+| 解放順序の誤り | テストで発見するか、コードレビュー | 所有権で逆順 Drop が保証される |
+| テスト対象 | エラーパスそのもの | コンパイル時にパスの存在が強制される |
+
+---
+
+## -EPROBE_DEFER パターン
+
+### 概要
+
+デバイスドライバの `probe()` が呼ばれたとき、そのデバイスが依存する
+別のリソース (クロック、レギュレータ、GPIO コントローラなど) が
+まだ初期化されていない場合がある。
+
+このとき `-EPROBE_DEFER` を返すと、カーネルのドライバコアが
+そのデバイスを **遅延プローブキュー** に入れ、後で再試行する。
+
+```c title="deferred probe の典型例"
+static int my_probe(struct platform_device *pdev)
+{
+    struct device *dev = &pdev->dev;
+    struct clk *clk;
+    struct regulator *reg;
+
+    /* クロックの取得を試みる */
+    clk = devm_clk_get(dev, "bus");
+    if (IS_ERR(clk)) {
+        /* -EPROBE_DEFER ならクロックプロバイダがまだ未初期化 */
+        return dev_err_probe(dev, PTR_ERR(clk),
+                             "failed to get bus clock\n");
+    }
+
+    /* レギュレータの取得 */
+    reg = devm_regulator_get(dev, "vdd");
+    if (IS_ERR(reg)) {
+        return dev_err_probe(dev, PTR_ERR(reg),
+                             "failed to get vdd regulator\n");
+    }
+
+    /* すべての依存リソースが準備完了 — 初期化を続行 */
+    /* ... */
+    return 0;
+}
+```
+
+### dev_err_probe() ヘルパー
+
+`dev_err_probe()` は `-EPROBE_DEFER` を適切に処理するヘルパーである:
+- `-EPROBE_DEFER` の場合: `dev_dbg` レベルのメッセージを出力 (ログを汚さない)
+- その他のエラー: `dev_err` レベルのメッセージを出力
+- 返り値はそのままエラーコードを返す
+
+```c
+/* dev_err_probe を使わない場合 (冗長) */
+clk = devm_clk_get(dev, "bus");
+if (IS_ERR(clk)) {
+    if (PTR_ERR(clk) != -EPROBE_DEFER)
+        dev_err(dev, "failed to get clock: %ld\n", PTR_ERR(clk));
+    return PTR_ERR(clk);
+}
+
+/* dev_err_probe を使う場合 (簡潔) */
+clk = devm_clk_get(dev, "bus");
+if (IS_ERR(clk))
+    return dev_err_probe(dev, PTR_ERR(clk), "failed to get clock\n");
+```
+
+### 守らなければならないルール
+
+`-EPROBE_DEFER` を返す前に、**部分的な初期化状態を残してはならない**。
+
+```c title="NG: 部分的に初期化してから EPROBE_DEFER"
+static int bad_probe(struct platform_device *pdev)
+{
+    struct my_dev *priv;
+
+    priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+    if (!priv)
+        return -ENOMEM;
+
+    /* ハードウェアレジスタに書き込み: 副作用あり! */
+    writel(0x1, priv->base + ENABLE_REG);
+
+    /* ここで EPROBE_DEFER が返ると、ENABLE_REG が
+       セットされたまま再試行される → 二重初期化 */
+    priv->clk = devm_clk_get(&pdev->dev, "core");
+    if (IS_ERR(priv->clk))
+        return dev_err_probe(&pdev->dev, PTR_ERR(priv->clk),
+                             "clock not ready\n");
+
+    return 0;
+}
+```
+
+```c title="OK: 副作用のある操作は依存確認後に行う"
+static int good_probe(struct platform_device *pdev)
+{
+    struct my_dev *priv;
+    struct clk *clk;
+
+    /* まず依存リソースをすべて確認 (副作用なし) */
+    clk = devm_clk_get(&pdev->dev, "core");
+    if (IS_ERR(clk))
+        return dev_err_probe(&pdev->dev, PTR_ERR(clk),
+                             "clock not ready\n");
+
+    /* すべて揃ったら初期化を開始 */
+    priv = devm_kzalloc(&pdev->dev, sizeof(*priv), GFP_KERNEL);
+    if (!priv)
+        return -ENOMEM;
+
+    priv->clk = clk;
+    writel(0x1, priv->base + ENABLE_REG);  /* 安全 */
+
+    return 0;
+}
+```
+
+### 無限遅延ループのバグ
+
+循環依存や壊れた Device Tree により、ドライバが永遠に `-EPROBE_DEFER` を
+返し続ける「無限遅延ループ」が発生することがある。
+
+典型的な原因:
+1. **循環依存**: デバイス A がデバイス B に依存し、B が A に依存する
+2. **存在しないリソースの参照**: DT にタイポがあり、存在しないクロックを参照
+3. **プロバイダドライバの欠如**: カーネルコンフィグでプロバイダが無効化されている
+
+デバッグ:
+```bash
+# 遅延中のデバイス一覧
+cat /sys/kernel/debug/devices_deferred
+
+# 特定デバイスの遅延理由
+cat /sys/bus/platform/devices/my_device/waiting_for_supplier
+
+# 遅延プローブのタイムアウト (秒, 0=無限)
+cat /sys/module/driver_base/parameters/deferred_probe_timeout
+```
+
+### devm_* API と deferred probe の相互作用
+
+`devm_*` (device-managed) API で確保したリソースは、`probe()` が失敗すると
+**自動的に解放される**。これは deferred probe と良い相性を持つ:
+
+```c
+/* devm_clk_get で取得 → probe 失敗時に自動解放 */
+clk = devm_clk_get(dev, "bus");
+if (IS_ERR(clk))
+    return PTR_ERR(clk);  /* clk の解放不要 */
+
+/* devm でない場合 → 手動解放が必要 */
+clk = clk_get(dev, "bus");
+if (IS_ERR(clk))
+    return PTR_ERR(clk);
+/* ... */
+err_clk:
+    clk_put(clk);  /* 忘れるとリーク */
+```
+
+### C vs Rust 比較: deferred probe
+
+| 観点 | C | Rust |
+|---|---|---|
+| エラーリターン | `return PTR_ERR(clk);` | `clk_get(dev, "bus")?` |
+| リソース解放 | `devm_*` or 手動 goto | RAII (Drop で自動解放) |
+| 部分初期化の防止 | 開発者の規律に依存 | 型システムが初期化順序を強制可能 |
+| dev_err_probe 相当 | `dev_err_probe()` ヘルパー | `dev_err_probe!()` マクロ |
+
+---
+
+## readl_poll_timeout とポーリングヘルパー
+
+### 問題: ハードウェアステータスのポーリング
+
+ハードウェアの操作結果を待つとき、ステータスレジスタを繰り返し読む
+**ポーリング** が必要になる。タイムアウトなしのポーリングは、
+ハードウェアの異常時にカーネルを無限ループに陥れる。
+
+### readl_poll_timeout
+
+```c
+#include <linux/iopoll.h>
+
+int wait_for_ready(void __iomem *base)
+{
+    u32 val;
+    int ret;
+
+    /*
+     * readl_poll_timeout(addr, val, cond, delay_us, timeout_us)
+     *
+     *   addr      : ポーリングするレジスタのアドレス
+     *   val       : 読み取った値を格納する変数
+     *   cond      : 成功条件 (val を使った式)
+     *   delay_us  : 各読み取り間の遅延 (マイクロ秒)
+     *   timeout_us: 全体のタイムアウト (マイクロ秒, 0=無限)
+     */
+    ret = readl_poll_timeout(base + STATUS_REG, val,
+                             val & STATUS_READY,  /* READY ビットが立つまで */
+                             100,                 /* 100 us 間隔 */
+                             10000);              /* 10 ms タイムアウト */
+    if (ret) {
+        pr_err("device not ready (timeout)\n");
+        return ret;  /* -ETIMEDOUT */
+    }
+
+    return 0;
+}
+```
+
+### バリエーション
+
+| マクロ | 違い |
+|---|---|
+| `readl_poll_timeout` | `readl` でポーリング (通常の MMIO) |
+| `readl_poll_timeout_atomic` | アトミックコンテキスト向け (`udelay` 使用, スリープ不可) |
+| `readx_poll_timeout` | 任意の読み取り関数 `op` を使用 |
+| `read_poll_timeout` | 任意のオブジェクト + 読み取り関数 |
+| `regmap_read_poll_timeout` | regmap 経由でポーリング |
+
+### readx_poll_timeout の例
+
+```c
+/* レジスタではなく、関数の返り値をポーリングする例 */
+int status;
+ret = readx_poll_timeout(get_device_status, dev, status,
+                         status == DEV_READY,
+                         1000,    /* 1 ms 間隔 */
+                         100000); /* 100 ms タイムアウト */
+```
+
+### Rust の IO ポーリング
+
+Rust for Linux では、2025 年のパッチで `rust/kernel/io/poll.rs` に
+ポーリングヘルパーが追加されている:
+
+```rust title="Rust のポーリングパターン (概念)"
+use kernel::io::poll;
+use kernel::time::Delta;
+
+fn wait_for_ready(base: &IoMem<SIZE>) -> Result {
+    poll::read_poll_timeout(
+        || base.readl(STATUS_REG_OFFSET),  /* 読み取り関数 */
+        |val| val & STATUS_READY != 0,     /* 成功条件 */
+        Delta::from_micros(100),           /* ポーリング間隔 */
+        Delta::from_millis(10),            /* タイムアウト */
+    )
+}
+```
+
+### C vs Rust 比較: ポーリング
+
+| 観点 | C (readl_poll_timeout) | Rust (poll helpers) |
+|---|---|---|
+| タイプセーフ | マクロ — コンパイル時チェックが弱い | ジェネリクス — 型チェックあり |
+| タイムアウト忘れ | `timeout_us = 0` で無限ポーリング可 | 型で強制可能 |
+| アトミック判定 | 開発者が `_atomic` 版を選択 | コンテキストで自動選択 (検討中) |
+| エラー型 | `-ETIMEDOUT` (int) | `Err(ETIMEDOUT)` (`Result`) |
+
+---
+
+## Rust のエラーハンドリング
+
+### kernel::error::Error
+
+Rust for Linux のエラー型は `kernel::error::Error` である。
+内部的には C の負の errno 値をラップしている:
+
+```rust title="kernel/error.rs (簡略版)"
+/// カーネルのエラーコード (負の errno のラッパー)
+pub struct Error(core::ffi::c_int);
+
+impl Error {
+    /// C の負の errno から Error を作成
+    pub fn from_errno(errno: core::ffi::c_int) -> Error {
+        assert!(errno < 0, "Error::from_errno called with non-negative value");
+        Error(errno)
+    }
+
+    /// errno 値を取得 (負の値)
+    pub fn to_errno(self) -> core::ffi::c_int {
+        self.0
+    }
+}
+```
+
+### 定義済み errno 定数
+
+```rust
+use kernel::error::code;
+
+// よく使う errno 定数
+code::EINVAL    // -22: 無効な引数
+code::ENOMEM    // -12: メモリ不足
+code::ENOENT    // -2:  ファイル/エントリが存在しない
+code::EBUSY     // -16: リソースがビジー
+code::EIO       // -5:  I/O エラー
+code::ETIMEDOUT // -110: タイムアウト
+code::ENOSYS    // -38: 未実装
+code::EPROBE_DEFER // -517: プローブ延期
+```
+
+### kernel::error::Result\<T>
+
+```rust
+/// カーネルの標準リターン型
+pub type Result<T = ()> = core::result::Result<T, Error>;
+```
+
+`Result<()>` (成功時に値なし) は C の `int` 関数 (成功で 0, 失敗で負 errno) に対応する。
+`Result<T>` は C の `ERR_PTR` パターンに対応する。
+
+### ? 演算子によるエラー伝播
+
+```rust title="? 演算子の連鎖"
+fn init_device(dev: &Device) -> Result {
+    let clk = dev.clk_get("bus")?;           // 失敗なら即 return Err
+    let reg = dev.regulator_get("vdd")?;     // 失敗なら即 return Err
+    let irq = dev.request_irq(handler)?;     // 失敗なら即 return Err
+
+    // ここに到達 = 全リソース取得成功
+    clk.prepare_enable()?;
+
+    Ok(())
+}
+```
+
+C の goto チェーンと比較すると、正常系のフローだけが見えて読みやすい。
+**しかし、ここに落とし穴がある。**
+
+### ? 演算子の「沈黙の失敗」問題
+
+`?` はエラーを呼び出し元に伝播するが、**なぜ失敗したかのコンテキストを残さない**:
+
+```rust
+fn complex_init(dev: &Device) -> Result {
+    step_a(dev)?;  // ← どれが失敗したか分からない
+    step_b(dev)?;  // ← 同上
+    step_c(dev)?;  // ← 同上
+    Ok(())
+}
+// エラーログ: "complex_init failed: -EINVAL"
+// → step_a, b, c のどれ?
+```
+
+#### 対策 1: 各ステップにログを追加
+
+```rust
+fn complex_init(dev: &Device) -> Result {
+    step_a(dev).inspect_err(|e| dev_err!(dev, "step_a failed: {:?}\n", e))?;
+    step_b(dev).inspect_err(|e| dev_err!(dev, "step_b failed: {:?}\n", e))?;
+    step_c(dev).inspect_err(|e| dev_err!(dev, "step_c failed: {:?}\n", e))?;
+    Ok(())
+}
+```
+
+#### 対策 2: ScopeGuard パターン
+
+ScopeGuard は「スコープ脱出時に自動実行されるクリーンアップ」を実現する:
+
+```rust
+use kernel::sync::ScopeGuard;
+
+fn init_with_cleanup(dev: &Device) -> Result {
+    let clk = dev.clk_get("bus")?;
+    clk.prepare_enable()?;
+
+    // ScopeGuard: このスコープを抜けるとき (エラー含む)、
+    // 自動的に clk を disable する
+    let clk_guard = ScopeGuard::new(|| {
+        clk.disable_unprepare();
+    });
+
+    let irq = dev.request_irq(handler)?;
+    // ↑ ここで失敗すると clk_guard が drop → clk を自動で disable
+
+    // 成功 — ScopeGuard を解除 (クリーンアップ不要)
+    clk_guard.dismiss();
+    Ok(())
+}
+```
+
+### #[must_use] — Result の無視を防ぐ
+
+Rust の `Result` は `#[must_use]` 属性を持つため、返り値を無視するとコンパイラが警告する:
+
+```rust
+fn may_fail() -> Result { /* ... */ Ok(()) }
+
+fn caller() {
+    may_fail();  // ⚠ warning: unused `Result` that must be used
+    //               → エラーを見落としている可能性
+}
+```
+
+C にも `__must_check` があるが、これは **コンパイラ警告** であり無視可能である。
+Rust の `#[must_use]` はデフォルトで警告を出し、`#[deny(unused_must_use)]` で
+エラーに昇格できる。
+
+### unwrap() / expect() — カーネルでは原則禁止
+
+```rust
+// ユーザランド: よくあるパターン
+let file = File::open("config.toml").unwrap();
+
+// カーネル: これは BUG() と同等 — 使ってはならない
+let buf = KVec::new(GFP_KERNEL).unwrap();  // ENOMEM → panic → システム停止
+```
+
+`unwrap()` や `expect()` は `Err` 時に `panic!()` を呼び出す。
+カーネル空間では `panic!()` = システム全体の停止 = `BUG()` と同等である。
+
+**BUG_ON が新規コードで禁止されているのと同じ理由で、
+カーネル Rust コードでの `unwrap()` / `expect()` も原則禁止である。**
+
+代替:
+
+```rust
+// unwrap の代わりに ? を使う
+let buf = KVec::new(GFP_KERNEL)?;
+
+// 絶対に失敗しないことが証明できる場合のみ、
+// SAFETY コメント付きで使用を検討
+// SAFETY: x は直前の条件分岐で Some であることが確認済み
+let val = x.unwrap();
+```
+
+### C vs Rust 比較: エラーハンドリング全体
+
+| パターン | C | Rust |
+|---|---|---|
+| **成功/失敗の表現** | `0` / 負の errno | `Ok(T)` / `Err(Error)` |
+| **ポインタ + errno** | `ERR_PTR` / `IS_ERR` / `PTR_ERR` | `Result<NonNull<T>>` or `Result<KBox<T>>` |
+| **エラー伝播** | `if (ret) goto err;` | `?` 演算子 |
+| **リソース解放** | goto チェーン or `devm_*` | RAII (Drop) |
+| **未処理エラーの検出** | `__must_check` (警告のみ) | `#[must_use]` (警告 + エラー昇格可) |
+| **アサーション (致命的)** | `BUG_ON()` (非推奨) | `unwrap()` / `expect()` (同様に非推奨) |
+| **アサーション (非致命的)** | `WARN_ON_ONCE()` | コンパイル時チェック + `pr_warn!()` |
+| **NULL チェック** | `if (!ptr) return -EINVAL;` | `Option<T>` — null は型レベルで排除 |
+| **二重解放の防止** | 開発者の規律 | 所有権システムが静的に防止 |
+| **解放忘れの防止** | `devm_*` or コードレビュー | Drop で自動保証 |
+
+---
+
+## エラーハンドリングに起因する CVE
+
+### CVE-2026-23132: エラー後の return 欠落 → リソースリーク
+
+```c title="脆弱なコード (簡略化)"
+static int vuln_init(struct device *dev)
+{
+    struct resource *res;
+
+    res = alloc_resource(dev);
+    if (!res)
+        return -ENOMEM;
+
+    if (validate_resource(res)) {
+        dev_err(dev, "validation failed\n");
+        /* BUG: return を忘れている!
+         * → free_resource が呼ばれず、後続のコードが不正な res で続行 */
+    }
+
+    /* res が不正な状態のまま使用される */
+    use_resource(res);  /* ← データ破壊や権限昇格の可能性 */
+
+    free_resource(res);
+    return 0;
+}
+```
+
+修正:
+
+```c title="修正後"
+    if (validate_resource(res)) {
+        dev_err(dev, "validation failed\n");
+        free_resource(res);
+        return -EINVAL;     /* return を追加 */
+    }
+```
+
+**Rust ではこのバグは構造的に発生しない:**
+
+```rust title="Rust: return 忘れは不可能"
+fn safe_init(dev: &Device) -> Result {
+    let res = alloc_resource(dev)?;  // 失敗なら即 return Err
+
+    validate_resource(&res)?;        // 失敗なら即 return Err
+                                     // res は Drop で自動解放
+
+    use_resource(&res);
+    Ok(())
+    // res は RAII で自動解放 — 明示的な free 不要
+}
+```
+
+`?` 演算子は `return Err(...)` に展開されるため、`return` の書き忘れは起きない。
+さらに `res` が RAII で管理されるため、`free_resource` の呼び忘れも不可能である。
+
+### CVE-2026-23162: 初期化失敗時の二重解放
+
+```c title="脆弱なコード (簡略化)"
+static int vuln_probe(struct platform_device *pdev)
+{
+    struct my_dev *priv;
+    int ret;
+
+    priv = kzalloc(sizeof(*priv), GFP_KERNEL);
+    if (!priv)
+        return -ENOMEM;
+
+    priv->buf = kmalloc(BUF_SIZE, GFP_KERNEL);
+    if (!priv->buf) {
+        ret = -ENOMEM;
+        goto err_free_priv;
+    }
+
+    ret = init_hardware(priv);
+    if (ret)
+        goto err_free_all;
+
+    ret = register_device(priv);
+    if (ret)
+        goto err_free_all;  /* ← register_device が内部で priv->buf を
+                              *    部分的に解放済みの場合、二重解放になる */
+
+    return 0;
+
+err_free_all:
+    kfree(priv->buf);       /* ← 既に解放済みの場合: 二重解放 (use-after-free) */
+err_free_priv:
+    kfree(priv);
+    return ret;
+}
+```
+
+このパターンでは、`register_device` がエラー時に内部で `priv->buf` を解放し、
+呼び出し元も goto ラベルで再度解放しようとする。これが二重解放 (double-free) となり、
+ヒープ破壊やカーネル権限昇格に悪用される。
+
+**Rust では二重解放は原理的に発生しない:**
+
+```rust title="Rust: 所有権が二重解放を防止"
+fn safe_probe(pdev: &PlatformDevice) -> Result {
+    let priv_data = KBox::new(MyDev::new(), GFP_KERNEL)?;
+    // priv_data の所有権は 1 つだけ
+
+    let buf = KVec::new(GFP_KERNEL)?;
+    // buf の所有権も 1 つだけ
+
+    init_hardware(&priv_data)?;
+    // ↑ エラー時: buf, priv_data が逆順に Drop → 各リソースは正確に 1 回解放
+
+    register_device(priv_data)?;
+    // ↑ priv_data の所有権は register_device に move
+    //   → 呼び出し元はもう priv_data を触れない (コンパイルエラー)
+
+    Ok(())
+}
+```
+
+所有権ルールにより:
+1. 各値は正確に 1 つの所有者を持つ
+2. 所有権が move されると、元の変数はアクセス不可になる
+3. Drop は所有者のスコープ脱出時に正確に 1 回だけ呼ばれる
+
+これにより、二重解放も解放忘れもコンパイル時に防止される。
+
+### C エラーハンドリング CVE のパターン分類
+
+| CVE パターン | C での発生原因 | Rust での防止メカニズム |
+|---|---|---|
+| **return 忘れ** | `if (err) { log; }` の後に `return` がない | `?` 演算子が `return Err` を強制 |
+| **二重解放** | goto ラベルの設計ミス | 所有権: move 後はアクセス不可 |
+| **解放忘れ (リーク)** | エラーパスで `kfree` 漏れ | RAII: Drop で自動解放 |
+| **未初期化使用** | エラーパスの分岐後に初期化前の変数を使用 | コンパイラが未初期化変数を検出 |
+| **use-after-free** | 解放後のポインタを使用 | 借用チェッカーがライフタイムを検証 |
+| **エラー値の伝播漏れ** | `ret` を上書きして元のエラーを失う | `Result<T>` が型レベルでエラーを運搬 |
+
+---
+
+## 総合: エラーハンドリング判断マトリクス
+
+ここまでの内容をもとに、カーネル開発で「どのエラー処理パターンを使うべきか」を
+判断するための包括的なマトリクスを示す。
+
+### 関数のリターン型の選択
+
+```
+何を返す関数か?
+ │
+ ├── 成功/失敗だけを伝えたい
+ │    ├── C:  int (0 = 成功, 負 errno = 失敗)
+ │    └── Rust: Result<()>
+ │
+ ├── リソース (ポインタ) を返したい
+ │    ├── C:  struct T * (有効ポインタ = 成功, ERR_PTR = 失敗)
+ │    └── Rust: Result<KBox<T>> or Result<ARef<T>>
+ │
+ ├── 数値データ + エラーを返したい
+ │    ├── C:  ssize_t (正 = データ, 負 = errno) — VFS 等
+ │    └── Rust: Result<usize>
+ │
+ └── 存在/不存在 + エラーを区別したい
+      ├── C:  ERR_PTR / NULL / 有効ポインタの 3 値
+      └── Rust: Result<Option<T>>
+```
+
+### エラー検出時のアクション選択
+
+```
+エラーを検出した
+ │
+ ├── 外部入力 (ユーザ空間 / ネットワーク) が原因か?
+ │    └── YES → エラーを返す (-EINVAL 等) — 絶対に BUG/WARN しない
+ │
+ ├── カーネル内部のプログラミングエラーか?
+ │    ├── データ破壊の危険がある?
+ │    │    ├── YES → WARN_ON_ONCE() + 可能な限り安全にエラーリターン
+ │    │    │         (panic は最終手段 — FS 整合性破壊等の場合のみ)
+ │    │    └── NO → WARN_ON_ONCE() + エラーリターン
+ │    └── Rust: コンパイル時に防止 / pr_warn!() + エラーリターン
+ │
+ ├── リソースの一時的な不足か?
+ │    └── YES → エラーリターン (-ENOMEM, -EBUSY 等)
+ │         + 呼び出し元がリトライを判断
+ │
+ ├── 依存リソースが未初期化か?
+ │    └── YES → -EPROBE_DEFER を返す (ドライバ probe の場合)
+ │
+ └── ハードウェアが応答しないか?
+      └── YES → readl_poll_timeout でタイムアウト付きポーリング
+           → タイムアウト時は -ETIMEDOUT をリターン
+```
+
+### ログレベルの選択
+
+| 状況 | C | Rust |
+|---|---|---|
+| 致命的 (続行不可) | `pr_crit()` / `dev_crit()` | `pr_crit!()` / `dev_crit!()` |
+| エラー (機能不全) | `pr_err()` / `dev_err()` | `pr_err!()` / `dev_err!()` |
+| 警告 (回復可能) | `pr_warn()` / `dev_warn()` | `pr_warn!()` / `dev_warn!()` |
+| 通知 (正常だが重要) | `pr_notice()` / `dev_notice()` | `pr_notice!()` / `dev_notice!()` |
+| 情報 | `pr_info()` / `dev_info()` | `pr_info!()` / `dev_info!()` |
+| デバッグ | `pr_debug()` / `dev_dbg()` | `pr_debug!()` / `dev_dbg!()` |
+| probe 失敗の報告 | `dev_err_probe()` | `dev_err_probe!()` |
+
+---
+
+## まとめ
+
+Linux カーネルのエラーハンドリングは、ユーザランドプログラミングとは根本的に異なる。
+エラー処理の不備は単なるバグではなく、**セキュリティ脆弱性、データ破壊、サービス拒否** に
+直結する。
+
+### 重要なポイント
+
+1. **ERR_PTR パターン**: ポインタの最上位ページに errno を埋め込む。C 固有のハック。Rust では `Result<T>` に統一。
+
+2. **BUG_ON は使わない**: 新規コードでは `WARN_ON_ONCE()` + エラーリターンに置き換える。`BUG_ON` は DoS 脆弱性になりうる。
+
+3. **Fault Injection でエラーパスをテスト**: `failslab`, `fail_page_alloc` 等でメモリ不足を再現し、エラーパスのバグを早期に発見する。
+
+4. **-EPROBE_DEFER のルール**: 副作用のある操作の前に依存リソースをすべて確認する。循環依存に注意。
+
+5. **readl_poll_timeout**: ハードウェアポーリングには必ずタイムアウトを設ける。
+
+6. **Rust の優位性**: `Result<T>` + `?` + RAII + 所有権により、C で頻発するエラーハンドリングの CVE クラス (return 忘れ, 二重解放, 解放忘れ, use-after-free) をコンパイル時に防止する。
+
+7. **unwrap() はカーネルの BUG() と同等**: Rust でも `unwrap()` / `expect()` はカーネルコードで禁止。`?` でエラーを伝播すること。
+
+### 次の章へ
+
+この章で学んだエラーハンドリングパターンは、以降のすべてのドライバ実装で必要になる。
+特に [Ch 25](/part8-practice/25-lab-echo/) (echo デバイス演習) では、
+goto チェーンと RAII の実践的な使い分けを体験する。

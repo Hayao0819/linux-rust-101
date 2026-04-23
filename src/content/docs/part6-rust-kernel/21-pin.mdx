@@ -1,0 +1,564 @@
+---
+title: "Ch 16. Pin と pinned-init"
+description: "Pin, #[pin_data], pin_init!, PinnedDrop — カーネル構造体の in-place 初期化"
+---
+
+## この章で学ぶこと
+
+- カーネル構造体が「動かせない」理由を理解する
+- `Pin<P>` と `!Unpin` の意味を説明できる
+- `#[pin_data]` / `pin_init!` で安全に pinned 初期化を行える
+- `stack_pin_init!`、`Box::pin_init`、`Arc::pin_init` を使い分けられる
+- `PinnedDrop` の必要性と使い方を把握する
+
+:::note[Rust API ステータス]
+🟢 **安定**: `pin_init!`, `#[pin_data]`, `PinnedDrop`, `stack_pin_init!`
+🟢 **安定**: `KBox::pin_init`, `Arc::pin_init`
+🟢 **安定**: `new_mutex!`, `new_spinlock!` (lockdep class 自動生成)
+:::
+
+## 前提
+
+- [Ch 9](/part3-kernel-concepts/09-concurrency/) (Mutex / SpinLock) を完了している
+- [Ch 20](/part6-rust-kernel/20-ownership-unsafe/) (所有権・unsafe) を完了している
+- `Pin` という型が存在することは知っている (詳しくなくてよい)
+
+## なぜカーネル構造体は動かせないのか
+
+ユーザランドの Rust では、ほとんどの値は自由にメモリ上を移動できる。
+`let a = b;` で `b` のビット列がそのまま `a` にコピーされ、古い `b` は無効化される。
+通常これは問題にならない。
+
+しかしカーネル空間では、**自分自身のアドレスに依存する構造体** が多数存在する。
+これらは一度メモリ上に配置されたら動かしてはならない。
+
+### 自己参照ポインタ: `list_head`
+
+Linux カーネルの侵入型連結リスト `list_head` は、空リストを表すとき `next` と `prev` が
+自分自身を指す:
+
+```c
+struct list_head {
+    struct list_head *next, *prev;
+};
+
+/* 空リスト初期化: next と prev が自分自身を指す */
+static inline void INIT_LIST_HEAD(struct list_head *list)
+{
+    list->next = list;
+    list->prev = list;
+}
+```
+
+この構造体を初期化した後にメモリ上で移動すると、`next` と `prev` が
+移動前のアドレスを指したままになり、**ダングリングポインタ** となる。
+
+### lockdep の逆参照
+
+[Ch 9](/part3-kernel-concepts/09-concurrency/) で学んだ lockdep は、各ロックインスタンスの `lockdep_map` にキーを登録し、
+カーネル内部のグローバルテーブルからそのアドレスを参照する。
+ロックを移動するとグローバルテーブルの参照先が無効になる。
+
+### C サブシステムへの登録
+
+`cdev_add()` や `device_register()` でカーネルサブシステムに構造体を登録すると、
+サブシステム側がその構造体のアドレスを保持する。
+登録後に構造体を移動すれば、カーネルが不正なアドレスにアクセスする。
+
+**まとめ:** カーネルでは「初期化後に動かしてはならない構造体」が至る所に存在する。
+Rust でこの制約を型レベルで表現する仕組みが `Pin` である。
+
+## Pin\<P\> と !Unpin
+
+### Pin の基本
+
+`Pin<P>` は「ポインタ `P` が指す値を動かさないことを保証する」ラッパー型である。
+
+```rust
+use core::pin::Pin;
+
+// Pin<&mut T> — T を動かせない可変参照
+// Pin<Box<T>> — T を動かせない Box
+// Pin<Arc<T>> — T を動かせない Arc
+```
+
+`Pin<P>` は `P` が指す値への `&mut T` の取得を制限する。
+`&mut T` があれば `mem::swap` で値を移動できてしまうため、これを防ぐのが `Pin` の本質である。
+
+### Unpin と !Unpin
+
+Rust のほとんどの型は `Unpin` トレイトを自動実装する。
+`Unpin` な型は「pin されても自由に動かせる」ことを意味し、`Pin` の制約が実質無効になる。
+
+カーネルで pin が意味を持つのは `!Unpin` (= `Unpin` を実装しない) 型である:
+
+```rust
+use core::marker::PhantomPinned;
+
+struct SelfReferential {
+    data: u32,
+    // PhantomPinned を含めると !Unpin になる
+    _pin: PhantomPinned,
+}
+```
+
+カーネルの `Mutex<T>` や `SpinLock<T>` は内部的に `!Unpin` である。
+これにより、pin された後は安全に動かせなくなる。
+
+### structural pinning (構造的 pin)
+
+構造体のフィールドが pin されるべきかどうかは、フィールドごとに決まる:
+
+- **structurally pinned** — 親が pin されたらそのフィールドも pin される。
+  例: `Mutex` 内部のロック状態、`list_head` のような自己参照フィールド。
+- **not structurally pinned** — 親が pin されてもそのフィールドは自由に動かせる。
+  例: 単純な `u32` や `bool` のフラグ。
+
+この区別が後述する `#[pin]` 属性に直結する。
+
+## pin-init: カーネルの in-place 初期化フレームワーク
+
+### 問題: Pin された値をどう初期化するか
+
+通常の Rust では、値をスタック上で作ってから `Box::new(value)` でヒープに移す。
+しかしこれでは初期化→移動の間に自己参照が壊れる。
+
+Pin された値は「最初から最終的なメモリ位置で初期化」する必要がある。
+これを **in-place initialization (所定位置初期化)** と呼ぶ。
+
+カーネルの `pin-init` クレートはこの問題を解決するマクロ群を提供する。
+
+### #\[pin_data\] と #\[pin\] 属性
+
+`#[pin_data]` を構造体に付けると、`pin_init!` マクロで初期化できるようになる。
+structurally pinned なフィールドには `#[pin]` を付ける:
+
+```rust
+use kernel::prelude::*;
+use kernel::sync::Mutex;
+use kernel::alloc::KVec;
+use pin_init::pin_data;
+
+#[pin_data]
+struct MyDevice {
+    #[pin]
+    data: Mutex<KVec<u32>>,   // Mutex は pin が必要
+    name: CString,             // CString は pin 不要
+    id: u32,                   // プリミティブ型も pin 不要
+}
+```
+
+`#[pin]` が付いたフィールドは `Pin` の構造的射影の対象となり、
+親が pin されると自動的にそのフィールドも pin される。
+
+### pin_init! マクロ
+
+`pin_init!` は構造体の **初期化子 (initializer)** を生成するマクロである。
+値そのものではなく、「最終的なメモリ位置に書き込む手順」を返す。
+
+```rust
+let initializer = pin_init!(MyDevice {
+    data <- new_mutex!(KVec::new(), "mydev.data"),
+    name: CString::try_from_fmt(fmt!("mydev-{}", 0))?,
+    id: 42,
+});
+```
+
+### `<-` 構文 vs `:` 構文
+
+`pin_init!` 内では 2 つの構文を使い分ける:
+
+| 構文 | 意味 | 用途 |
+|------|------|------|
+| `field <- expr` | **in-place 初期化**。`expr` は `impl PinInit<T>` を返す | `#[pin]` フィールド |
+| `field: expr` | **通常の値代入**。`expr` は `T` 型の値を返す | `#[pin]` なしのフィールド |
+
+`<-` は「この式の結果を、最終メモリ位置に直接書き込め」という指示である。
+`new_mutex!` や `CMutex::new()` は `PinInit` を返すので `<-` で受ける。
+
+`:` は通常の構造体初期化と同じく、式が評価された値をフィールドに代入する。
+
+```rust
+pin_init!(Foo {
+    // <- : in-place で Mutex を初期化。Mutex は PinInit を返す
+    locked_data <- new_mutex!(0_u32, "foo.locked_data"),
+    // : : 値をそのまま代入
+    counter: 0,
+})
+```
+
+**間違いやすい点:** `#[pin]` フィールドに `:` を使うとコンパイルエラーになる。
+逆に `#[pin]` なしのフィールドに `<-` を使ってもエラーになる。
+
+## 初期化の実行: stack, Box, Arc
+
+`pin_init!` が返すのは初期化子であり、実際の値ではない。
+初期化子を実行してメモリ上に値を生成する方法が 3 つある。
+
+### stack_pin_init! — スタック上での pin 初期化
+
+```rust
+use pin_init::stack_pin_init;
+
+stack_pin_init!(let dev = pin_init!(MyDevice {
+    data <- new_mutex!(KVec::new(), "mydev.data"),
+    name: CString::try_from_fmt(fmt!("mydev-stack"))?,
+    id: 1,
+}));
+// dev: Pin<&mut MyDevice>
+// この時点で dev はスタック上に pin されている
+let mut guard = dev.data.lock();
+guard.push(100, GFP_KERNEL)?;
+```
+
+`stack_pin_init!` はスタック上に値を直接構築し、`Pin<&mut T>` を返す。
+小さな構造体のテストや一時的な利用に適している。
+
+### Box::pin_init — ヒープ上での pin 初期化
+
+```rust
+use kernel::alloc::KBox;
+
+let dev: Pin<KBox<MyDevice>> = KBox::pin_init(
+    pin_init!(MyDevice {
+        data <- new_mutex!(KVec::new(), "mydev.data"),
+        name: CString::try_from_fmt(fmt!("mydev-box"))?,
+        id: 2,
+    }),
+    GFP_KERNEL,
+)?;
+// dev: Pin<KBox<MyDevice>>
+```
+
+`KBox::pin_init` はヒープ上のメモリを確保し、そこに直接初期化する。
+スタック上に一時的な値を作ってからコピーするのではない点が重要である。
+
+### Arc::pin_init — 参照カウント付き pin 初期化
+
+```rust
+use kernel::sync::Arc;
+
+let dev: Arc<MyDevice> = Arc::pin_init(
+    pin_init!(MyDevice {
+        data <- new_mutex!(KVec::new(), "mydev.data"),
+        name: CString::try_from_fmt(fmt!("mydev-arc"))?,
+        id: 3,
+    }),
+    GFP_KERNEL,
+)?;
+// dev: Arc<MyDevice>
+// Arc は内部で Pin を保証する (Arc<T> の T は動かない)
+```
+
+`Arc` は参照カウンタにより値の位置が固定されるため、`Pin<Arc<T>>` ではなく
+`Arc<T>` を直接返す。カーネルドライバの `probe` 関数で最もよく使われるパターンである。
+
+## PinnedDrop
+
+### 通常の Drop が使えない理由
+
+pin された値に対して通常の `Drop::drop(&mut self)` を実装すると、
+`&mut self` を通じて値を移動できてしまう。
+これは pin の安全性保証を破壊する。
+
+### #\[pinned_drop\] の使い方
+
+`#[pin_data]` を使う構造体で Drop が必要な場合、`PinnedDrop` を使う:
+
+```rust
+use pin_init::{pin_data, pinned_drop};
+
+#[pin_data(PinnedDrop)]
+struct MyDevice {
+    #[pin]
+    data: Mutex<KVec<u32>>,
+    id: u32,
+}
+
+#[pinned_drop]
+impl PinnedDrop for MyDevice {
+    fn drop(self: Pin<&mut Self>) {
+        pr_info!("MyDevice {} dropped\n", self.id);
+        // self は Pin<&mut Self> なので値を動かせない
+        // しかし pin されていないフィールドへのアクセスは可能
+    }
+}
+```
+
+`#[pin_data(PinnedDrop)]` の引数に `PinnedDrop` を渡すことで、
+通常の `Drop` の代わりに `PinnedDrop` を使うことをマクロに伝える。
+
+**重要:** `#[pin_data(PinnedDrop)]` を指定した構造体に通常の `impl Drop` を書くと
+コンパイルエラーになる。逆に `PinnedDrop` を指定しない `#[pin_data]` 構造体には
+通常の `Drop` も `PinnedDrop` も実装できない (フィールドの自動 Drop に任せる)。
+
+## In-place 初期化 vs Move 初期化
+
+### スタックオーバーフローの回避
+
+カーネルスタックはユーザランドと比べて極端に小さい (通常 8 KiB、アーキテクチャにより 4〜16 KiB)。
+大きな構造体をスタック上で初期化してからヒープに移す方式は、スタックオーバーフローを引き起こす:
+
+```rust
+// 危険: 大きな構造体をスタック上で一時的に構築する
+struct BigStruct {
+    buf: [u8; 4096],
+    // ... 他のフィールド
+}
+
+// この方式はスタックに 4KiB+ を消費する
+let big = Box::new(BigStruct { buf: [0; 4096] });
+//        ^^^^^^^^ BigStruct がまずスタックに作られ、その後 Box にコピーされる
+```
+
+`pin_init!` + `KBox::pin_init` を使えば、最終的なヒープメモリに直接書き込むため
+スタックを消費しない:
+
+```rust
+#[pin_data]
+struct BigStruct {
+    #[pin]
+    lock: Mutex<()>,
+    buf: [u8; 4096],
+}
+
+// 安全: スタック上に一時的な BigStruct は作られない
+let big = KBox::pin_init(pin_init!(BigStruct {
+    lock <- new_mutex!((), "big.lock"),
+    buf: [0; 4096],
+}), GFP_KERNEL)?;
+```
+
+このパターンは `pin` が不要な場合でも `init!` マクロで利用できる。
+大きなバッファを持つ構造体では積極的に in-place 初期化を使うべきである。
+
+### pin-init が解決する 2 つの問題
+
+| 問題 | 解決策 |
+|------|--------|
+| pin された値の初期化 | `pin_init!` + `<-` 構文で in-place 初期化 |
+| 大きな構造体のスタックオーバーフロー | `KBox::pin_init` / `Arc::pin_init` で直接ヒープに構築 |
+
+## C vs Rust: 初期化スタイルの比較
+
+C カーネルでは、構造体の初期化は手続き的に行われる:
+
+```c title="C: 手続き的初期化"
+struct my_device {
+    struct mutex lock;
+    struct list_head list;
+    u32 id;
+};
+
+static int my_device_init(struct my_device *dev, u32 id)
+{
+    /* 各フィールドを個別に初期化 — 順序と漏れはプログラマの責任 */
+    mutex_init(&dev->lock);
+    INIT_LIST_HEAD(&dev->list);
+    dev->id = id;
+    return 0;
+}
+```
+
+この方式の問題点:
+
+- フィールドの初期化漏れをコンパイラが検出できない
+- 初期化順序の誤りがランタイムバグになる
+- エラーパスでの部分的な後片付けが複雑になる (`goto err_destroy_mutex;`)
+
+Rust の `pin_init!` は宣言的な構文で同等の処理を行う:
+
+```rust title="Rust: 宣言的 pin_init!"
+#[pin_data]
+struct MyDevice {
+    #[pin]
+    lock: Mutex<()>,
+    id: u32,
+}
+
+let init = pin_init!(MyDevice {
+    lock <- new_mutex!((), "mydev.lock"),
+    id: 42,
+});
+
+// 全フィールドの初期化が強制される (漏れはコンパイルエラー)
+// エラー時の部分的な後片付けはマクロが自動生成する
+let dev = KBox::pin_init(init, GFP_KERNEL)?;
+```
+
+### 対比表
+
+| 観点 | C | Rust (pin_init!) |
+|------|---|------------------|
+| 初期化スタイル | 手続き的: `mutex_init()`, `INIT_LIST_HEAD()` | 宣言的: `pin_init!` マクロ |
+| フィールド漏れ検出 | なし (静的解析ツール頼み) | コンパイルエラー |
+| pin 保証 | 規約のみ (ドキュメントで「動かすな」) | 型レベルで強制 (`Pin<P>`) |
+| エラー時の後片付け | 手動 (`goto` チェイン) | 自動 (マクロが逆順 drop を生成) |
+| in-place 初期化 | 自然 (ポインタ経由で直接書き込み) | `pin_init!` + `<-` 構文 |
+
+## 実践例: Mutex\<KVec\<u32\>\> を持つデバイス構造体
+
+以下は、カーネルモジュールでよくあるパターンを `pin_init!` で実装した例である:
+
+```rust
+use kernel::prelude::*;
+use kernel::sync::{Arc, Mutex};
+use kernel::alloc::KVec;
+use pin_init::pin_data;
+
+#[pin_data]
+struct SampleDevice {
+    #[pin]
+    buffer: Mutex<KVec<u32>>,
+    device_id: u32,
+    max_entries: usize,
+}
+
+impl SampleDevice {
+    /// 新しい SampleDevice の初期化子を返す
+    fn new(id: u32, max: usize) -> impl PinInit<Self, Error> {
+        pin_init!(Self {
+            buffer <- new_mutex!(KVec::new(), "sample.buffer"),
+            device_id: id,
+            max_entries: max,
+        })
+    }
+
+    /// バッファにエントリを追加する
+    fn add_entry(self: &Self, value: u32) -> Result {
+        let mut guard = self.buffer.lock();
+        if guard.len() >= self.max_entries {
+            return Err(ENOMEM);
+        }
+        guard.push(value, GFP_KERNEL)?;
+        Ok(())
+    }
+
+    /// バッファの内容をログに出力する
+    fn dump(self: &Self) {
+        let guard = self.buffer.lock();
+        for (i, val) in guard.iter().enumerate() {
+            pr_info!("  [{}] = {}\n", i, val);
+        }
+    }
+}
+
+// Arc で共有する典型的な使い方
+fn setup_device() -> Result<Arc<SampleDevice>> {
+    let dev = Arc::pin_init(
+        SampleDevice::new(1, 64),
+        GFP_KERNEL,
+    )?;
+
+    dev.add_entry(100)?;
+    dev.add_entry(200)?;
+    dev.dump();
+
+    Ok(dev)
+}
+```
+
+**ポイント:**
+
+1. `new()` は値ではなく `impl PinInit<Self, Error>` を返す — これが pin-init のイディオムである
+2. `buffer` は `#[pin]` + `<-` で in-place 初期化される
+3. `device_id` と `max_entries` は通常の `:` で値を代入する
+4. `Arc::pin_init` で参照カウント付きのヒープオブジェクトとして構築する
+5. `add_entry` は `&self` で呼べる — `Mutex` が内部可変性を提供するため
+
+## よくある罠
+
+### 1. `#[pin]` フィールドに `:` を使う
+
+```rust
+// コンパイルエラー!
+pin_init!(MyDevice {
+    data: new_mutex!(KVec::new(), "mydev.data"),  // ✗ : ではなく <- を使う
+    id: 42,
+});
+```
+
+`#[pin]` フィールドは必ず `<-` 構文を使う。`new_mutex!` は `PinInit` を返すため、
+値として代入する `:` では型が合わない。
+
+### 2. pin_init! の結果を値として使おうとする
+
+```rust
+// コンパイルエラー!
+let dev: MyDevice = pin_init!(MyDevice { ... });
+```
+
+`pin_init!` は値ではなく初期化子を返す。
+`KBox::pin_init`、`Arc::pin_init`、`stack_pin_init!` のいずれかで実行する必要がある。
+
+### 3. PinnedDrop を指定し忘れる
+
+```rust
+#[pin_data]                         // ← PinnedDrop を指定していない
+struct Foo {
+    #[pin]
+    mtx: Mutex<u32>,
+}
+
+// これはコンパイルエラーになる
+impl Drop for Foo {
+    fn drop(&mut self) { /* ... */ }
+}
+```
+
+`#[pin_data]` を使う構造体で `Drop` 相当の処理が必要な場合は、
+`#[pin_data(PinnedDrop)]` を指定し、`#[pinned_drop] impl PinnedDrop` を実装する。
+
+### 4. 巨大な構造体を stack_pin_init! で初期化する
+
+```rust
+// 危険: カーネルスタックを大量消費する可能性がある
+stack_pin_init!(let dev = pin_init!(HugeStruct { ... }));
+```
+
+`stack_pin_init!` はスタック上に値を構築する。
+大きな構造体には `KBox::pin_init` や `Arc::pin_init` を使うこと。
+
+### 5. Pin\<&mut T\> から &mut T を取り出そうとする
+
+```rust
+let pinned: Pin<&mut MyDevice> = /* ... */;
+
+// コンパイルエラー! !Unpin な型から &mut T は取れない
+let inner: &mut MyDevice = Pin::get_mut(pinned);
+```
+
+`!Unpin` な型では `Pin::get_mut` は使えない。
+`unsafe` な `Pin::get_unchecked_mut` を使う必要があるが、
+その場合は pin 契約を破らない責任がプログラマにある。
+
+## 章末演習
+
+1. 以下の構造体に `#[pin_data]` と `#[pin]` を正しく付与し、
+   `pin_init!` で初期化する `new()` 関数を書け。
+   ```rust
+   struct Counter {
+       value: Mutex<u32>,
+       name: CString,
+   }
+   ```
+
+2. 演習 1 の `Counter` に `increment(&self) -> Result<u32>` メソッドを追加し、
+   `Mutex` のロックを取得して値をインクリメントし、新しい値を返すようにせよ。
+
+3. 演習 1 の `Counter` に `PinnedDrop` を実装し、
+   drop 時に `pr_info!` でカウンタ名と最終値をログ出力せよ。
+
+4. (発展) `pin_init_from_closure` を使って、
+   C の `struct mutex` を直接ラップする独自の `RawMutex` 型を作り、
+   `pin_init!` で初期化できるようにせよ。
+   ヒント: `unsafe { pin_init_from_closure(|slot| { ... }) }` の中で
+   `bindings::mutex_init()` を呼ぶ。
+
+## 参考資料
+
+- [pin-init crate (rustdoc)](https://rust.docs.kernel.org/pin_init/) — `pin_init!` マクロ、`#[pin_data]`、`PinnedDrop` の公式ドキュメント
+- [pin-init GitHub リポジトリ](https://github.com/Rust-for-Linux/pin-init) — ソースコードと設計の詳細
+- [Safe pinned initialization (LWN.net)](https://lwn.net/Articles/907876/) — pin-init の設計背景と議論
+- [std::pin Module (Rust 標準ライブラリ)](https://doc.rust-lang.org/std/pin/index.html) — `Pin` の公式ドキュメント
+- [kernel::sync (rustdoc)](https://rust.docs.kernel.org/kernel/sync/) — `Mutex`, `SpinLock` など pin を必要とする同期プリミティブ

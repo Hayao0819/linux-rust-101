@@ -1,0 +1,457 @@
+---
+title: "Ch 18b. カーネルサブシステムと Rust の現在地"
+description: "VFS, ネットワーク, ブロックデバイス, スケジューラ, LSM, mm, USB/サウンド — 各サブシステムの C 基礎と Rust 抽象の成熟度を総覧する"
+---
+
+## この章で学ぶこと
+
+- カーネル主要サブシステムの C 側アーキテクチャを概観し、設計思想を理解する
+- 各サブシステムにおける Rust 抽象の現状 (2026 年 4 月時点) を正確に把握する
+- 「Rust で何が書けて、何がまだ書けないのか」の全体像を自分の言葉で説明できるようになる
+---
+
+[Ch 27](/part8-practice/27-case-studies/) では Binder や rnull など **既に動いている** Rust ドライバを読み解いた。
+本章は視点を逆にする。カーネルの主要サブシステムを一つずつ取り上げ、
+**C 側の基礎知識を押さえたうえで、Rust の抽象がどこまで来ているか** を確認していく。
+
+結論を先に言えば、2026 年 4 月時点で Rust だけで完結できるサブシステムはごく一部である。
+しかし各領域で進行中の作業を知っておくことは、今後の貢献先を選ぶうえで不可欠である。
+
+---
+
+## 18b.1 VFS とファイルシステム
+
+### C の VFS アーキテクチャ
+
+Linux の **Virtual Filesystem Switch (VFS)** はすべてのファイルシステムに共通のインターフェースを提供する抽象層である。
+ユーザ空間が `open()`, `read()`, `write()` といったシステムコールを呼ぶと、
+VFS が適切なファイルシステム実装にディスパッチする。
+
+VFS を構成する 5 大構造体を押さえておく必要がある。
+
+| 構造体 | 役割 |
+|---|---|
+| `struct super_block` | マウントされたファイルシステム全体を表現する。FS 固有の操作 (`super_operations`) を保持する |
+| `struct inode` | ファイルやディレクトリのメタデータ (パーミッション、サイズ、タイムスタンプ) を保持する。ディスク上の inode と 1:1 に対応する |
+| `struct dentry` | ディレクトリエントリ。パス名とinode を結びつけるキャッシュ (dcache) の単位である |
+| `struct file` | プロセスがファイルを open したときに作られるインスタンス。ファイルオフセットやアクセスモードを保持する |
+| `struct address_space` | ファイルのページキャッシュを管理する。`readpage` / `writepage` などの操作を提供する |
+
+### read パスの流れ
+
+ユーザ空間で `read(fd, buf, count)` を呼ぶと、以下の経路をたどる。
+
+```
+userspace read()
+  → sys_read()          // syscall entry
+    → vfs_read()        // VFS 層: file->f_op->read_iter を呼ぶ
+      → FS の read_iter  // 例: ext4_file_read_iter
+        → page cache    // address_space から該当ページを探す
+          → block layer // キャッシュミス時に bio を発行
+```
+
+この階層構造は VFS の設計哲学を端的に示している。
+各ファイルシステムは `file_operations` や `inode_operations` といった関数ポインタテーブルを実装するだけでよく、
+共通ロジック (パス解決、パーミッションチェック、ページキャッシュ) は VFS が担当する。
+
+### ramfs: 最もシンプルな FS
+
+`fs/ramfs/` はカーネルに同梱された最小限のファイルシステムである。
+ディスクを持たず、ページキャッシュだけで動作するため、ブロック層との連携がない。
+構造を理解するのに最適な教材である。
+
+```
+fs/ramfs/
+├── inode.c     // ramfs_get_inode, ramfs_fill_super, ramfs_init_fs_context
+└── file-mmu.c  // ramfs_file_operations (generic_file_read_iter 等を使用)
+```
+
+`ramfs_fill_super()` は `super_block` を初期化し、ルート inode を作成する。
+`ramfs_get_inode()` は新規 inode を確保し、ファイル種別に応じた `i_op` と `i_fop` を設定する。
+わずか数百行で FS の骨格が成り立っていることがわかる。
+
+### Rust の現在地
+
+**Rust から Linux ファイルシステムを実装することは、2026 年 4 月時点で不可能である。**
+
+`kernel::fs` モジュールには `File` と `Kiocb` の薄いラッパーが存在するが、
+inode、superblock、dentry の抽象は一切提供されていない。
+FS を作るには最低でもこの 3 つが必要であり、現状では VFS コールバックを Rust で登録する手段がない。
+
+歴史的経緯を整理する。
+
+- **2024 年 5 月**: Wedson Almeida Filho が VFS 抽象の RFC v2 を投稿した。
+  `super_block`, `inode`, `dentry`, `file` のラッパーと、
+  `FileSystem` トレイトによるコールバック登録の仕組みが含まれていた。
+- **2024 年後半**: Wedson が Rust-for-Linux プロジェクトから離脱し、VFS RFC は事実上停滞した。
+- **PuzzleFS / tarfs**: Rust で書かれた実験的 FS だが、いずれも out-of-tree であり、upstream の VFS 抽象が存在しない以上、独自のバインディングに依存している。
+
+VFS は Linux カーネルで最も複雑なサブシステムの一つであり、抽象の設計には慎重な議論が必要である。
+短期的に状況が変わる見込みは薄い。
+
+> **参考**: [The Linux Virtual Filesystem (docs.kernel.org)](https://docs.kernel.org/filesystems/vfs.html)
+
+---
+
+## 18b.2 ネットワーク
+
+### C のネットワークスタック: 3 大概念
+
+Linux のネットワークスタックは巨大だが、NIC ドライバを書く観点では以下の 3 つを押さえれば骨格が見える。
+
+**1. `struct net_device`**
+
+ネットワークインターフェース (eth0, wlan0 等) を表現する構造体である。
+`net_device_ops` 関数ポインタテーブルを通じて `ndo_start_xmit` (送信)、`ndo_open` (up) などの操作を登録する。
+
+**2. `struct sk_buff` (skb)**
+
+カーネル内でパケットを表現するバッファである。
+ヘッダーのプッシュ/プルを効率的に行うために、`head`, `data`, `tail`, `end` の 4 つのポインタを持つ。
+ネットワークスタック全体で最も頻繁に触れる構造体であり、正しく扱わないとメモリリークや use-after-free が発生する。
+
+**3. NAPI (New API)**
+
+割り込み駆動とポーリングのハイブリッドモデルである。
+高トラフィック時にパケット到着ごとの割り込みが性能を殺す問題を解決するために導入された。
+
+### パケット受信の流れ
+
+```
+NIC がパケット受信
+  → ハードウェア割り込み (IRQ)
+    → ドライバの IRQ ハンドラ: NAPI をスケジュールし、割り込みを無効化
+      → NAPI poll: リングバッファからパケットを取り出し sk_buff を構築
+        → netif_receive_skb(): プロトコル層 (IP → TCP/UDP) にディスパッチ
+```
+
+[Ch 18](/part5-hardware/18-irq-timer-wq/) で学んだ top-half / bottom-half の分離がここでも活用されている。
+IRQ ハンドラ (top-half) は最小限の仕事だけを行い、実際のパケット処理は NAPI poll (bottom-half) で行う。
+
+### PHY vs MAC vs NIC
+
+NIC ドライバの文脈でこの 3 層は混同されやすいので整理する。
+
+| 層 | 役割 | 例 |
+|---|---|---|
+| **PHY** (Physical Layer) | 電気信号とデジタルデータの変換。リンク速度のネゴシエーション | Realtek RTL8211F |
+| **MAC** (Media Access Control) | フレームの組み立て・分解、DMA 制御 | Intel i210 のコントローラ部分 |
+| **NIC** (Network Interface Card) | PHY + MAC + 周辺回路の全体 | Intel I210 カード全体 |
+
+PHY と MAC は別チップであることが多く、MDIO バスで接続される。
+Linux では PHY ドライバと MAC (NIC) ドライバは **別のドライバ** として実装される。
+この区別が Rust の現状を理解するうえで重要になる。
+
+### Rust の現在地
+
+**PHY ドライバは Rust で書ける。NIC (MAC) ドライバは書けない。**
+
+upstream に存在する Rust ネットワーク抽象は `kernel::net::phy` のみである。
+以下の PHY ドライバが実際に upstream されている。
+
+| ドライバ | 対象ハードウェア | マージバージョン |
+|---|---|---|
+| `ax88796b_rust` | ASIX AX88796B | 6.8 |
+| Realtek PHY | Realtek 各種 | 6.9 |
+| QT2025 PHY | QT2025 10GbE PHY | 6.12 |
+
+一方、NIC ドライバに必要な `net_device`, `sk_buff`, NAPI の Rust 抽象は upstream に存在しない。
+FUJITA Tomonori 氏が Intel e1000 の Rust 実装を実験的に開発しているが、out-of-tree である。
+`net_device` の抽象だけでも膨大な `net_device_ops` コールバックの設計が必要であり、
+`sk_buff` はカーネル内で最も複雑な構造体の一つであるため、安全な Rust ラッパーの設計は困難を極める。
+
+> **参考**: [Linux Networking Documentation (docs.kernel.org)](https://docs.kernel.org/networking/)
+> [Rust PHY driver (rust-for-linux.com)](https://rust-for-linux.com)
+
+---
+
+## 18b.3 ブロックデバイス
+
+### C の blk-mq アーキテクチャ
+
+Linux のブロック層は **blk-mq (multi-queue block layer)** と呼ばれるアーキテクチャを採用している。
+NVMe のような高速デバイスが CPU コアごとに独立したキューを持つことを前提に設計されている。
+
+主要な概念は以下の通りである。
+
+| 概念 | 説明 |
+|---|---|
+| `struct bio` | I/O リクエストの最小単位。ブロック番号、長さ、ページリストを保持する |
+| `struct request` | 1 つ以上の `bio` をマージしたもの。ドライバに渡される I/O 操作の単位 |
+| `struct blk_mq_tag_set` | ハードウェアキューの設定 (キュー数、キュー深度) を保持する |
+| `struct blk_mq_ops` | ドライバが実装する操作: `queue_rq` (リクエスト処理), `init_hctx` 等 |
+
+### Rust の現在地
+
+**ブロックデバイスは Rust サブシステム抽象の中で最も成熟している (GPU 以外)。**
+
+- **Linux 6.8**: `kernel::block::mq` (blk-mq 抽象) が upstream にマージされた
+- **Linux 6.11**: `rnull` (null block driver の Rust 版) が upstream にマージされた
+
+`rnull` は `/dev/nullb0` として動作し、書き込みを捨て読み込みにゼロを返す。
+性能テストやブロック層のテストに使われる。
+[Ch 27](/part8-practice/27-case-studies/) で詳しく解説した通りである。
+
+この成果は主に **Andreas Hindborg** 氏の仕事である。
+blk-mq 抽象は `Operations` トレイトとしてモデル化されており、
+`queue_rq` などのコールバックを Rust の型安全な形で実装できる。
+
+NVMe の Rust ドライバも Hindborg 氏により開発が進められているが、
+2026 年 4 月時点では out-of-tree である。
+
+> **参考**: [Rust null block driver (rust-for-linux.com)](https://rust-for-linux.com)
+
+---
+
+## 18b.4 プロセス管理とスケジューラ
+
+### C の task_struct
+
+`struct task_struct` はカーネル内でプロセス (スレッド) を表現する構造体であり、
+600 以上のフィールドを持つ Linux カーネル最大の構造体の一つである。
+主要なフィールドを抜粋する。
+
+| フィールド | 型 | 役割 |
+|---|---|---|
+| `pid` | `pid_t` | プロセス ID |
+| `tgid` | `pid_t` | スレッドグループ ID (ユーザ空間から見た「PID」) |
+| `mm` | `struct mm_struct *` | プロセスのアドレス空間。カーネルスレッドでは NULL |
+| `files` | `struct files_struct *` | オープンファイルテーブル |
+| `__state` | `unsigned int` | プロセスの状態 (TASK_RUNNING, TASK_INTERRUPTIBLE 等) |
+
+### current マクロ
+
+x86_64 では「現在実行中のタスク」へのポインタは CPU ごとの変数 (per-CPU variable) として保持されている。
+`current` マクロは `%gs` セグメントベース相対のメモリアクセスにより、ロックなしで `task_struct *` を取得する。
+
+```c
+// arch/x86/include/asm/current.h (簡略化)
+DECLARE_PER_CPU(struct task_struct *, current_task);
+
+static __always_inline struct task_struct *get_current(void)
+{
+    return this_cpu_read_stable(current_task);
+}
+#define current get_current()
+```
+
+これはキャッシュフレンドリーかつ極めて高速な実装であり、
+カーネル内のあらゆる場所で `current->pid` のように使用される。
+
+### Rust の現在地
+
+`kernel::task::Task` は `task_struct` の **読み取り専用** ラッパーである。
+
+```rust
+// kernel/task.rs で提供される主な API
+impl Task {
+    pub fn current() -> impl Deref<Target = Task>;  // current タスクへの参照
+    pub fn pid(&self) -> Pid;
+    pub fn uid(&self) -> Kuid;
+    pub fn signal_pending(&self) -> bool;
+    pub fn wake_up(&self);
+}
+```
+
+`state` の変更、`mm` や `files` へのアクセスは一切提供されていない。
+つまり **Rust でスケジューラを書くことは不可能** である。
+
+### sched_ext: 別のアプローチ
+
+スケジューラの拡張に関しては、**sched_ext** という eBPF ベースのフレームワークが注目に値する。
+sched_ext はカーネル内のスケジューリングポリシーを eBPF プログラムで差し替え可能にする仕組みで、
+Linux 6.12 でマージされた。
+
+**scx_rustland** は sched_ext 上に構築された Rust 製のユーザ空間スケジューラである。
+カーネル内の eBPF 部分がタスクをユーザ空間にディスパッチし、
+Rust で書かれたスケジューリングロジックが決定を行ってカーネルに返す。
+
+この方式はカーネル内の `task_struct` を直接操作するのではなく、
+eBPF を介した安全なインターフェースでスケジューリングポリシーを実装するため、
+Rust の型安全性をユーザ空間側で活用できる。
+
+> **参考**: [sched_ext (lwn.net)](https://lwn.net/Articles/922405/)
+> [scx_rustland (GitHub)](https://github.com/sched-ext/scx)
+
+---
+
+## 18b.5 セキュリティ (LSM)
+
+### C の LSM フレームワーク
+
+**Linux Security Modules (LSM)** はカーネルのセキュリティポリシーをモジュール化するフレームワークである。
+カーネル全体に配置された **LSM フック** (約 200 箇所) に対して、
+セキュリティモジュールがコールバックを登録する仕組みである。
+
+主要なフックの例:
+
+| フック | タイミング |
+|---|---|
+| `bprm_check_security` | `execve()` 実行前のバイナリチェック |
+| `inode_permission` | ファイルアクセスのパーミッションチェック |
+| `socket_connect` | `connect()` システムコール時のチェック |
+| `task_alloc` | 新規タスク作成時のセキュリティラベル割り当て |
+
+### 主要な LSM の位置付け
+
+| LSM | 特徴 |
+|---|---|
+| **SELinux** | 強制アクセス制御 (MAC)。ラベルベース。最も包括的だが設定が複雑 |
+| **AppArmor** | パスベースの MAC。SELinux より設定が簡単。Ubuntu のデフォルト |
+| **Landlock** | 非特権プロセスが自分自身にサンドボックスを適用できる。Linux 5.13+ |
+
+### Rust の現在地
+
+**Rust で LSM を書くことはできない。**
+
+`kernel::security` モジュールは存在するが、これは **Binder ドライバ** が LSM フックを呼び出す側の API であり、
+LSM フックを実装 (登録) する側の API ではない。
+
+LSM のフック登録には `security_hook_list` 構造体と `security_add_hooks()` 関数が必要だが、
+これらの Rust ラッパーは存在しない。
+
+一方、**Landlock** についてはユーザ空間側で Rust を活用できる。
+[rust-landlock](https://github.com/landlock-lsm/rust-landlock) crate が Landlock のシステムコール
+(`landlock_create_ruleset`, `landlock_add_rule`, `landlock_restrict_self`) の
+安全なラッパーを提供しており、ユーザ空間アプリケーションのサンドボックス化に利用できる。
+
+---
+
+## 18b.6 メモリ管理 (mm)
+
+### C のメモリ管理: allocator の階層
+
+[Ch 8](/part3-kernel-concepts/08-memory/) で学んだ内容を復習しつつ、発展的な概念を加える。
+
+```
+ユーザ空間の malloc()
+  → brk / mmap システムコール
+    → VMA 管理 (mm_struct → vm_area_struct)
+      → ページフォルト時に物理ページを確保
+        → page allocator (Buddy system) — struct page 単位
+          → slab allocator (kmalloc, kmem_cache) — オブジェクト単位
+```
+
+page allocator はバディシステムにより物理ページを 2^n 単位で管理する。
+slab allocator (SLUB) はその上に構築され、頻繁にアロケート/フリーされる固定サイズオブジェクトを効率的に扱う。
+
+### folio: struct page の後継
+
+`struct page` はカーネル内で最も問題を抱えた構造体の一つである。
+4KB ページ、compound page (huge page)、slab ページなど、まったく異なる用途で使い回されており、
+`union` だらけの定義は理解困難で、バグの温床であった。
+
+**`struct folio`** は Matthew Wilcox 氏により導入された新しい抽象で、以下の問題を解決する。
+
+- **compound_head の隠蔽**: compound page の tail page が渡されたときに `compound_head()` で先頭ページを取得する必要があったが、folio は常に先頭ページを表す
+- **型安全性**: slab ページと page cache ページの混同をコンパイル時に防ぐ
+- **API の明確化**: `folio_lock()`, `folio_mark_dirty()` など、folio 専用の API により意図が明確になる
+
+ページキャッシュやファイルシステムのコードは `struct page` から `struct folio` への移行が進んでいる。
+
+### Rust の現在地
+
+| 機能 | 状態 |
+|---|---|
+| `KBox<T>` / `KVec<T>` | 成熟。`GFP_KERNEL` / `GFP_ATOMIC` フラグ付きアロケーション |
+| `mm_struct` / VMA ラッパー | 6.16+ で追加 (主に GPU ドライバ向け) |
+| `folio` サポート | なし |
+
+[Ch 8](/part3-kernel-concepts/08-memory/) で見た通り、`KBox` や `KVec` はカーネル内のメモリアロケーションの基本として機能している。
+`mm_struct` と VMA のラッパーは Nova GPU ドライバの要件から追加されたものである。
+
+folio の Rust 抽象は存在しない。
+folio はファイルシステムとページキャッシュの文脈で使われるため、
+VFS 抽象が先に整備されない限り、folio 単独でラッパーを作る動機が薄い。
+
+---
+
+## 18b.7 USB / サウンド / 入力デバイス
+
+### USB
+
+Linux 6.18 で USB ホストコントローラドライバ向けの Rust フレームワークが追加された。
+ただし、**デフォルトでは無効化** されており、実験的な段階にとどまる。
+USB ガジェットドライバやクラスドライバの Rust 抽象は存在しない。
+
+### サウンド / ALSA
+
+ALSA (Advanced Linux Sound Architecture) の Rust 抽象は **一切存在しない**。
+サウンドカードドライバ、コーデックドライバ、PCM ストリーム、コントロール (mixer) など、
+サウンドサブシステムのすべての要素が C でしか扱えない。
+
+### HID (入力デバイス)
+
+2025 年 3 月に HID サブシステム向けの Rust RFC パッチが投稿された。
+Glorious Technology のゲーミングマウス用 Rust ドライバを例題として、
+HID デバイスドライバを Rust で記述するためのフレームワークが提案されている。
+ただし、2026 年 4 月時点で **未マージ** である。
+
+---
+
+## 18b.8 まとめ: 成熟度マップ
+
+以下の表は、2026 年 4 月時点における各サブシステムの Rust 抽象の状態を一覧にしたものである。
+
+| サブシステム | 状態 | ドライバ作成可能か | 備考 |
+|---|---|---|---|
+| **GPU (DRM/KMS)** | upstream (6.12+) | ✅ 可能 | Nova GPU ドライバが開発中 |
+| **ブロックデバイス (blk-mq)** | upstream (6.8+) | ✅ 可能 | rnull が upstream (6.11+) |
+| **PHY ドライバ** | upstream (6.8+) | ✅ 可能 | 3 件の PHY ドライバが upstream |
+| **プラットフォームデバイス** | upstream | ✅ 可能 | [Ch 16](/part5-hardware/16-drivers/) 参照 |
+| **misc デバイス** | upstream | ✅ 可能 | [Ch 13](/part4-device-drivers/13-chardev-rust/) 参照 |
+| **PCI** | upstream (6.12+) | ✅ 可能 | Nova GPU で使用 |
+| **mm (VMA)** | upstream (6.16+) | ⚠️ 限定的 | GPU 向けの VMA ラッパーのみ |
+| **USB** | 実験的 (6.18) | ❌ 不可 | フレームワークは disabled |
+| **HID** | RFC (未マージ) | ❌ 不可 | 2025年3月 RFC |
+| **NIC (net_device)** | out-of-tree | ❌ 不可 | FUJITA 氏の e1000 実験のみ |
+| **VFS / FS** | 停滞 | ❌ 不可 | Wedson VFS RFC 後に進展なし |
+| **スケジューラ** | なし | ❌ 不可 | sched_ext + Rust は可能 |
+| **LSM** | なし | ❌ 不可 | Binder 呼び出し側 API のみ |
+| **サウンド / ALSA** | なし | ❌ 不可 | 抽象一切なし |
+
+「可能」と「不可」の境界は明確である。
+upstream に抽象が存在し、実際にドライバがマージされているか、少なくともビルド可能な状態であれば「可能」とした。
+
+この表を見ると、Rust 化が進んでいるのは **ハードウェアに近い leaf ドライバ** (PHY, ブロック, GPU) であり、
+**カーネルのコア基盤** (VFS, ネットワークスタック, mm, スケジューラ) は手つかずであることがわかる。
+これは意図的な戦略でもある。leaf ドライバはバグの影響範囲が限定的であり、
+既存の C コードとの境界が明確なため、段階的な Rust 導入に適している。
+
+> **次のステップ**: [Ch 27](/part8-practice/27-case-studies/) で取り上げた Binder, rnull, Nova, PHY ドライバは、
+> この表の「可能」な領域で実際に動いている実例である。
+> upstream への道のりは [Ch 29](/part8-practice/29-upstream/) で扱う。
+
+---
+
+## 参考資料
+
+### カーネルドキュメント
+
+- [The Linux Virtual Filesystem](https://docs.kernel.org/filesystems/vfs.html) — VFS の公式ドキュメント
+- [Linux Networking Documentation](https://docs.kernel.org/networking/) — ネットワークスタック全般
+- [Block Layer Documentation](https://docs.kernel.org/block/) — blk-mq を含むブロック層の解説
+
+### Rust-for-Linux 関連
+
+- [rust-for-linux.com](https://rust-for-linux.com) — プロジェクト公式。upstream ドライバの一覧
+- [rust.docs.kernel.org](https://rust.docs.kernel.org) — カーネル Rust API のリファレンスドキュメント
+- [rust.docs.kernel.org/kernel/block](https://rust.docs.kernel.org/kernel/block/) — blk-mq 抽象の API ドキュメント
+- [rust.docs.kernel.org/kernel/net/phy](https://rust.docs.kernel.org/kernel/net/phy/) — PHY ドライバ抽象の API ドキュメント
+- [rust.docs.kernel.org/kernel/task](https://rust.docs.kernel.org/kernel/task/) — Task API ドキュメント
+
+### LWN.net 記事
+
+- [Rust and the Linux VFS (LWN)](https://lwn.net/Articles/958072/) — Wedson の VFS RFC に関する解説
+- [A Rust-based e1000 driver (LWN)](https://lwn.net/Articles/945460/) — FUJITA 氏の NIC ドライバ実験
+- [sched_ext (LWN)](https://lwn.net/Articles/922405/) — eBPF ベースのスケジューラ拡張
+- [Rust null block driver (LWN)](https://lwn.net/Articles/966216/) — rnull の upstream までの経緯
+- [Folios (LWN)](https://lwn.net/Articles/849538/) — struct folio 導入の背景と設計
+
+### 関連する章
+
+- [Ch 8: メモリ管理](/part3-kernel-concepts/08-memory/) — page allocator, slab allocator の詳細
+- [Ch 13: キャラクタデバイス (Rust)](/part4-device-drivers/13-chardev-rust/) — misc デバイスの実装
+- [Ch 16: デバイスモデルとドライバ](/part5-hardware/16-drivers/) — プラットフォームデバイスの実装
+- [Ch 18: 割り込み](/part5-hardware/18-irq-timer-wq/) — IRQ ハンドラと bottom-half
+- [Ch 27: ケーススタディ](/part8-practice/27-case-studies/) — 実際の Rust ドライバの解析

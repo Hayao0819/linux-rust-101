@@ -1,0 +1,65 @@
+---
+title: Linux with Rust 101
+description: CS 学生のための体系的入門 — カーネル未経験者が Rust for Linux を学ぶ教材
+template: splash
+hero:
+  tagline: カーネル未経験者が Rust for Linux を体系的に学ぶための教材
+  actions:
+    - text: 学習を始める
+      link: /part1-introduction/01-why-rust/
+      icon: right-arrow
+      variant: primary
+    - text: GitHub
+      link: https://github.com/Hayao0819/linux-rust-101
+      icon: external
+---
+
+import { Card, CardGrid } from "@astrojs/starlight/components";
+
+## この教材について
+
+Linux カーネルに Rust コードが入り始めた。
+しかし「カーネル開発の経験がない学生」が Rust for Linux を体系的に学べる教材は、まだ存在しない。
+
+この教材は、**C でカーネルの基礎概念を理解してから、同じものを Rust で書き直す** というアプローチで、
+カーネルプログラミングと Rust for Linux の両方を同時に身につけることを目指す。
+
+<CardGrid>
+  <Card title="到達目標" icon="rocket">
+    Rust で miscdevice ドライバを書き、ioctl で状態変更し、KUnit でテストできるようになる。
+  </Card>
+  <Card title="対象カーネル" icon="linux">
+    Linux 6.18 以降。API ステータス (安定 / 実験的 / RFC) は各章冒頭で明示する。
+  </Card>
+</CardGrid>
+
+## カリキュラム構成
+
+| Part | 内容 | 章 |
+|------|------|----|
+| I | はじめに — なぜ Rust か、環境構築、ブートプロセス | 01-03, 36 |
+| II | 最初のカーネルモジュール — C 版・Rust 版・kbuild/FFI | 04-06 |
+| III | カーネルの基礎概念 — プロセス、メモリ、並行性、データ構造、syscall、IPC、エラー処理 | 07-10, 30, 35, 42 |
+| IV | デバイスドライバの基礎 — chardev、blocking I/O、/proc/sys/debugfs | 11-14 |
+| V | ハードウェアとの通信 — デバイスモデル、MMIO/DMA、割り込み、電力管理 | 15-19 |
+| VI | Rust カーネルプログラミング — 所有権、Pin、マクロ | 20-22 |
+| VII | セキュリティと観測 — デバッグ、トレーシング、セキュリティ、攻撃緩和、テスト | 23-24, 37, 40-41 |
+| VIII | 実践と応用 — 実習、ケーススタディ、upstream、最新動向 | 25-29, 44 |
+| IX | サブシステム深掘り — Namespaces、VFS、ネットワーク、暗号、メモリ、RT、仮想化 | 31-34, 38-39, 43 |
+
+## 設計原則
+
+1. **C first, then Rust** — 各概念を C で先に教え、次に Rust 抽象を示す
+2. **一次情報最優先** — `rust.docs.kernel.org`, `docs.kernel.org`, `lore.kernel.org` を参照
+3. **API ステータス可視化** — 安定 / 実験的 / RFC をバッジで明示
+4. **TODO スケルトン方式** — 穴埋め式の実習で能動的に学ぶ
+5. **Safety Contract 中心** — `// SAFETY:` コメントと `# Invariants` を徹底
+
+## 参考教材
+
+この教材は以下の先行教材から着想を得ている:
+
+- [Linux Device Drivers 3rd edition (LDD3)](https://lwn.net/Kernel/LDD3/)
+- [Linux Kernel Module Programming Guide (LKMPG)](https://sysprog21.github.io/lkmpg/)
+- [Linux Kernel Teaching](https://linux-kernel-labs.github.io/)
+- [Writing an OS in Rust (BlogOS)](https://os.phil-opp.com/)

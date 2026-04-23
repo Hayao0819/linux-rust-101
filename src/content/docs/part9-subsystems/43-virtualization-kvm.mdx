@@ -1,0 +1,1138 @@
+---
+title: "仮想化と KVM"
+description: "KVM, QEMU, virtio, vhost, VFIO, IOMMU — カーネル開発者のための仮想化技術"
+---
+
+## この章で学ぶこと
+
+- KVM のアーキテクチャと ioctl ベースの API を理解する
+- Intel VT-x / AMD-V によるハードウェア仮想化の仕組みを把握する
+- virtio による準仮想化 I/O フレームワークの設計を理解する
+- vhost によるカーネル内データプレーンの高速化手法を知る
+- VFIO と IOMMU を用いたデバイスパススルーの仕組みを習得する
+- Rust エコシステム (rust-vmm) の仮想化スタックを概観する
+## 前提
+
+- [Ch 8](/part3-kernel-concepts/08-memory/) (カーネルメモリ管理) を完了している
+- [Ch 12b](/part5-hardware/17-mmio-dma/) (MMIO と DMA) を完了している
+- [Ch 16](/part5-hardware/16-drivers/) (Platform / PCI ドライバ) を完了している
+
+---
+
+## 仮想化の全体像: 完全仮想化 vs 準仮想化
+
+仮想化技術には歴史的に 2 つのアプローチが存在する。
+
+### 完全仮想化 (Full Virtualization)
+
+ゲスト OS を**一切変更せずに**仮想マシン上で動作させる。
+ハードウェア支援がない時代は、特権命令を trap してエミュレートする方式 (trap-and-emulate) が採られたが、
+x86 アーキテクチャには仮想化を前提としない命令 (popf, smsw など) が存在し、
+trap されずにサイレントに失敗する問題があった。
+
+VMware は「バイナリトランスレーション」でこれを回避した。
+しかし性能面では大きなオーバーヘッドがあった。
+
+### 準仮想化 (Paravirtualization)
+
+ゲスト OS のカーネルを**明示的に変更**し、ハイパーバイザと連携する方式である。
+Xen の PV (ParaVirtual) モードや virtio がこのアプローチに該当する。
+
+特権操作をハイパーコール (hypercall) で置き換えることで、trap のオーバーヘッドを回避する。
+性能は良いが、ゲスト OS の変更が必要になるため汎用性に劣る。
+
+### 現代の KVM: 両方の利点を組み合わせる
+
+現代の KVM は以下の組み合わせを採用する:
+
+- **CPU・メモリ**: VT-x / AMD-V によるハードウェア支援付き完全仮想化 (ゲスト OS の変更不要)
+- **I/O**: virtio による準仮想化 (性能重視、ゲスト内にドライバが必要)
+
+この**ハイブリッドアプローチ**が、性能と互換性の最適なバランスを実現する。
+
+| 方式 | CPU | I/O | ゲスト変更 | 性能 |
+|---|---|---|---|---|
+| 純粋な完全仮想化 | trap-and-emulate | エミュレーション | 不要 | 低 |
+| 純粋な準仮想化 | hypercall | PV ドライバ | 必要 | 中-高 |
+| KVM (現代型) | VT-x/AMD-V | virtio | I/O ドライバのみ | 高 |
+
+---
+
+## KVM アーキテクチャ
+
+KVM (Kernel-based Virtual Machine) は、Linux カーネル自体をハイパーバイザに変える技術である。
+カーネルモジュール `kvm.ko` と CPU 固有モジュール (`kvm-intel.ko` または `kvm-amd.ko`) で構成される。
+
+### 全体アーキテクチャ
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         ゲスト VM                              │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  ゲスト OS (Linux, Windows, ...)                         │   │
+│  │  ┌────────────┐  ┌────────────┐  ┌───────────────────┐  │   │
+│  │  │ ゲストアプリ│  │ ゲストアプリ│  │ virtio ドライバ   │  │   │
+│  │  └────────────┘  └────────────┘  └───────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│                    vCPU 0       vCPU 1                          │
+└────────────┬──────────┬──────────┬──────────────────────────────┘
+             │ VM Exit  │ VM Exit  │
+             ▼          ▼          ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                    Linux カーネル (ホスト)                       │
+│  ┌──────────────────────────────────────────────────────────┐   │
+│  │  KVM モジュール (kvm.ko + kvm-intel.ko / kvm-amd.ko)     │   │
+│  │  ┌──────────┐  ┌──────────┐  ┌───────────────────────┐  │   │
+│  │  │ /dev/kvm │  │ VM fd    │  │ vCPU fd               │  │   │
+│  │  └──────────┘  └──────────┘  └───────────────────────┘  │   │
+│  └──────────────────────────────────────────────────────────┘   │
+│  ┌────────────────────────┐  ┌────────────────────────────┐     │
+│  │ メモリ管理 (EPT/NPT)   │  │ 割り込み仮想化 (APIC)     │     │
+│  └────────────────────────┘  └────────────────────────────┘     │
+└────────────┬────────────────────────────────────────────────────┘
+             │ ioctl
+             ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                  ユーザ空間 (QEMU プロセス)                      │
+│  ┌──────────┐  ┌──────────────┐  ┌────────────────────────┐    │
+│  │ vCPU     │  │ デバイス      │  │ virtio バックエンド    │    │
+│  │ スレッド  │  │ エミュレーション│  │ (net, blk, ...)      │    │
+│  └──────────┘  └──────────────┘  └────────────────────────┘    │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### ioctl ベース API
+
+KVM は `/dev/kvm` キャラクタデバイスを通じて ioctl ベースの API を提供する。
+API は 3 つの階層で構成される。
+
+**レベル 1: システム ioctl (/dev/kvm)**
+
+```c
+int kvm_fd = open("/dev/kvm", O_RDWR);
+
+/* API バージョン確認 */
+int api_ver = ioctl(kvm_fd, KVM_GET_API_VERSION, 0);
+/* 常に 12 を返す (安定 ABI) */
+
+/* 機能の確認 */
+int has_irqchip = ioctl(kvm_fd, KVM_CHECK_EXTENSION, KVM_CAP_IRQCHIP);
+```
+
+**レベル 2: VM ioctl (VM fd)**
+
+```c
+/* VM 作成 → VM fd を取得 */
+int vm_fd = ioctl(kvm_fd, KVM_CREATE_VM, 0);
+
+/* ゲスト物理メモリの設定 */
+struct kvm_userspace_memory_region region = {
+    .slot            = 0,
+    .flags           = 0,
+    .guest_phys_addr = 0x0,           /* ゲスト物理アドレス */
+    .memory_size     = MEM_SIZE,
+    .userspace_addr  = (uint64_t)mem, /* ホスト仮想アドレス (mmap 済み) */
+};
+ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &region);
+```
+
+`KVM_SET_USER_MEMORY_REGION` はゲスト物理アドレスをホスト仮想アドレスにマッピングする。
+QEMU (ユーザ空間) が `mmap` で確保したメモリ領域を、ゲストの物理メモリとして使用させる仕組みである。
+
+**レベル 3: vCPU ioctl (vCPU fd)**
+
+```c
+/* vCPU 作成 → vCPU fd を取得 */
+int vcpu_fd = ioctl(vm_fd, KVM_CREATE_VCPU, 0);
+
+/* vCPU の共有メモリ領域を mmap */
+int mmap_size = ioctl(kvm_fd, KVM_GET_VCPU_MMAP_SIZE, 0);
+struct kvm_run *run = mmap(NULL, mmap_size,
+                           PROT_READ | PROT_WRITE,
+                           MAP_SHARED, vcpu_fd, 0);
+
+/* レジスタ設定 */
+struct kvm_regs regs = { .rip = 0x0, .rsp = MEM_SIZE, .rflags = 0x2 };
+ioctl(vcpu_fd, KVM_SET_REGS, &regs);
+```
+
+### vCPU 実行ループ
+
+KVM の中核は `KVM_RUN` ioctl による vCPU 実行ループである。
+vCPU がゲストコードを実行し、ハイパーバイザの介入が必要なイベント (VM Exit) が発生すると
+ioctl が返る。ユーザ空間 (QEMU) がイベントを処理し、再び `KVM_RUN` を呼ぶ。
+
+```c
+for (;;) {
+    int ret = ioctl(vcpu_fd, KVM_RUN, 0);
+    if (ret < 0) {
+        perror("KVM_RUN");
+        break;
+    }
+
+    switch (run->exit_reason) {
+    case KVM_EXIT_IO:
+        /* ゲストが I/O ポートにアクセス (in/out 命令) */
+        handle_io(run);
+        break;
+
+    case KVM_EXIT_MMIO:
+        /* ゲストがマップされていない MMIO アドレスにアクセス */
+        handle_mmio(run);
+        break;
+
+    case KVM_EXIT_HLT:
+        /* ゲストが HLT 命令を実行 (通常は終了を意味する) */
+        printf("Guest halted\n");
+        return 0;
+
+    case KVM_EXIT_SHUTDOWN:
+        /* ゲストがトリプルフォルト等で停止 */
+        printf("Guest shutdown\n");
+        return 0;
+
+    default:
+        fprintf(stderr, "Unexpected exit: %d\n", run->exit_reason);
+        return 1;
+    }
+}
+```
+
+主な VM Exit の理由:
+
+| exit_reason | 意味 |
+|---|---|
+| `KVM_EXIT_IO` | ゲストが `in` / `out` 命令でI/O ポートにアクセスした |
+| `KVM_EXIT_MMIO` | EPT/NPT でマップされていないアドレスへのアクセス |
+| `KVM_EXIT_HLT` | ゲストが `hlt` 命令を実行した |
+| `KVM_EXIT_IRQ_WINDOW_OPEN` | 割り込み注入のウィンドウが開いた |
+| `KVM_EXIT_SHUTDOWN` | トリプルフォルト等でゲストが停止した |
+| `KVM_EXIT_INTERNAL_ERROR` | KVM 内部エラー |
+
+---
+
+## ハードウェア仮想化
+
+### Intel VT-x
+
+Intel VT-x は CPU に「VMX root モード」と「VMX non-root モード」の 2 つの動作モードを追加する。
+
+- **VMX root モード**: ハイパーバイザ (KVM) が実行される。すべての特権操作が可能。
+- **VMX non-root モード**: ゲスト OS が実行される。特定の操作が自動的に VM Exit を引き起こす。
+
+#### VMCS (Virtual Machine Control Structure)
+
+VMCS は VM Exit/Entry の動作を制御するハードウェアデータ構造である。
+1 つの vCPU に対して 1 つの VMCS が存在し、以下の領域で構成される:
+
+| VMCS 領域 | 内容 |
+|---|---|
+| Guest-state area | ゲストのレジスタ状態 (RIP, RSP, CR3, EFLAGS, ...) |
+| Host-state area | VM Exit 時に復元されるホストの状態 |
+| VM-execution control | どの操作で VM Exit を発生させるかの設定 |
+| VM-exit control | VM Exit 時の動作制御 |
+| VM-entry control | VM Entry 時の動作制御 |
+| VM-exit information | 直近の VM Exit の原因情報 |
+
+KVM は `VMLAUNCH` (初回) および `VMRESUME` (2 回目以降) 命令で VM Entry を行い、
+VM Exit が発生すると自動的に VMX root モードに戻る。
+
+### AMD-V (SVM)
+
+AMD-V は同等の機能を提供するが、制御構造の名称が異なる:
+
+| Intel VT-x | AMD-V (SVM) |
+|---|---|
+| VMCS | VMCB (Virtual Machine Control Block) |
+| `VMLAUNCH` / `VMRESUME` | `VMRUN` |
+| VMX root / non-root | Host mode / Guest mode |
+
+VMCB はメモリ上の構造体であり (VMCS はハードウェアが管理する不透明な構造)、
+ソフトウェアからの読み書きが比較的容易である。
+
+### VM Entry と VM Exit
+
+```
+         VM Entry                    VM Exit
+  ┌────────────────┐          ┌────────────────┐
+  │   ホスト状態    │          │   ゲスト状態    │
+  │   を VMCS に    │          │   を VMCS に    │
+  │   保存          │          │   保存          │
+  └───────┬────────┘          └───────┬────────┘
+          │                           │
+          ▼                           ▼
+  ┌────────────────┐          ┌────────────────┐
+  │   ゲスト状態    │          │   ホスト状態    │
+  │   を VMCS から  │          │   を VMCS から  │
+  │   復元          │          │   復元          │
+  └───────┬────────┘          └───────┬────────┘
+          │                           │
+          ▼                           ▼
+  ┌────────────────┐          ┌────────────────┐
+  │  ゲストコード   │──Exit──▷│  ホストコード   │
+  │  (VMX non-root) │ 発生    │  (VMX root)    │
+  └────────────────┘          └────────────────┘
+```
+
+VM Exit を引き起こす代表的なイベント:
+
+- **I/O 命令** (`in`, `out`): ゲストが I/O ポートにアクセス
+- **MSR アクセス**: 特定のモデル固有レジスタの読み書き
+- **CPUID 命令**: CPU 機能情報の取得
+- **HLT 命令**: CPU の停止
+- **EPT violation**: ゲスト物理アドレスの変換失敗
+- **外部割り込み**: ホスト側の割り込み処理のため
+
+VM Entry/Exit は 1 回あたり数百サイクルのコストがかかる。
+Exit の頻度を減らすことが仮想化の性能最適化において重要である。
+
+### EPT / NPT: 2 段階アドレス変換
+
+ハードウェア仮想化がない場合、ゲスト OS のページテーブルをハイパーバイザが「影」として管理する
+シャドウページテーブルが必要であった。これは TLB フラッシュが多発し、性能が悪い。
+
+**EPT (Extended Page Tables, Intel)** および **NPT (Nested Page Tables, AMD)** は、
+ハードウェアで 2 段階のアドレス変換を行う:
+
+```
+  ゲスト仮想アドレス (GVA)
+         │
+         │ ゲストページテーブル (ゲスト OS が管理)
+         ▼
+  ゲスト物理アドレス (GPA)
+         │
+         │ EPT / NPT (ハイパーバイザが管理)
+         ▼
+  ホスト物理アドレス (HPA)
+```
+
+| 変換 | 管理者 | テーブル |
+|---|---|---|
+| GVA → GPA | ゲスト OS | 通常のページテーブル (CR3) |
+| GPA → HPA | ハイパーバイザ (KVM) | EPT / NPT |
+
+KVM は `KVM_SET_USER_MEMORY_REGION` で設定されたゲスト物理 → ホスト仮想のマッピングに基づいて
+EPT/NPT エントリを構築する。EPT violation (マッピングが存在しない GPA へのアクセス) が発生すると
+VM Exit が起き、KVM がエントリを追加して解決する。
+
+---
+
+## virtio フレームワーク
+
+virtio は、仮想マシンのための標準化された準仮想化 I/O インタフェースである。
+OASIS 標準として仕様が公開されており (最新は v1.3)、ベンダやハイパーバイザに依存しない。
+
+### なぜ virtio が必要か
+
+完全にエミュレートされたデバイス (例: QEMU の e1000 NIC エミュレーション) は、
+実在のハードウェアの複雑なレジスタインタフェースをソフトウェアで再現するため、
+VM Exit が多発し性能が低い。
+
+virtio は「仮想環境であることを前提に設計された」シンプルなインタフェースにより、
+最小限の VM Exit で効率的なデータ転送を実現する。
+
+### フロントエンド / バックエンドモデル
+
+```
+┌─────────────────────────────────┐
+│           ゲスト VM              │
+│  ┌───────────────────────────┐  │
+│  │  virtio フロントエンド     │  │
+│  │  (ゲスト内ドライバ)       │  │
+│  │  例: virtio-net, virtio-blk│  │
+│  └─────────────┬─────────────┘  │
+│                │ virtqueue       │
+│                │ (共有リング     │
+│                │  バッファ)      │
+└────────────────┼────────────────┘
+                 │
+┌────────────────┼────────────────┐
+│  ┌─────────────┴─────────────┐  │
+│  │  virtio バックエンド       │  │
+│  │  (ホスト側実装)           │  │
+│  │  QEMU / vhost-net /       │  │
+│  │  vhost-user               │  │
+│  └───────────────────────────┘  │
+│             ホスト               │
+└─────────────────────────────────┘
+```
+
+- **フロントエンドドライバ**: ゲスト OS 内で動作する virtio ドライバ。Linux カーネルには `virtio-net`, `virtio-blk` 等の標準ドライバが含まれる。
+- **バックエンド**: ホスト側で実際の I/O を処理する。QEMU プロセス内、カーネル内 (vhost)、または別のユーザ空間プロセス (vhost-user) で動作する。
+- **virtqueue**: フロントエンドとバックエンドの間でデータを受け渡す共有メモリ上のリングバッファ。
+
+### virtqueue: 共有リングバッファ
+
+virtqueue は virtio の核心となるデータ構造で、3 つの領域で構成される (Split Virtqueue 形式):
+
+```
+ virtqueue の構造 (Split Virtqueue)
+
+ ┌──────────────────────────────────────────────────────────────┐
+ │                  Descriptor Table                            │
+ │  ┌──────┬──────────┬──────┬───────┬──────┐                  │
+ │  │ addr │   len    │ flags│  next │      │ ... (最大 N 個)   │
+ │  │(u64) │  (u32)   │(u16) │ (u16) │      │                  │
+ │  └──────┴──────────┴──────┴───────┴──────┘                  │
+ │  各エントリがデータバッファのアドレスとサイズを記述           │
+ │  flags: NEXT (チェーン), WRITE (デバイス書込み用)            │
+ └──────────────────────────────────────────────────────────────┘
+
+ ┌──────────────────────────────────────────────────────────────┐
+ │              Available Ring (ドライバ → デバイス)             │
+ │  ┌───────┬────────────────────────────────┬──────────────┐   │
+ │  │ flags │ idx (次の書込位置)              │ ring[0..N-1] │   │
+ │  │ (u16) │ (u16)                          │ desc index   │   │
+ │  └───────┴────────────────────────────────┴──────────────┘   │
+ │  ドライバが「このバッファを使ってくれ」とデバイスに通知       │
+ └──────────────────────────────────────────────────────────────┘
+
+ ┌──────────────────────────────────────────────────────────────┐
+ │                Used Ring (デバイス → ドライバ)                │
+ │  ┌───────┬────────────────────────────────┬──────────────┐   │
+ │  │ flags │ idx (次の書込位置)              │ ring[0..N-1] │   │
+ │  │ (u16) │ (u16)                          │ (id, len)    │   │
+ │  └───────┴────────────────────────────────┴──────────────┘   │
+ │  デバイスが「このバッファの処理が終わった」とドライバに通知   │
+ └──────────────────────────────────────────────────────────────┘
+```
+
+**動作の流れ (例: ネットワーク送信)**
+
+1. ゲストドライバが送信データを含むバッファを Descriptor Table に登録する
+2. そのディスクリプタのインデックスを Available Ring に追加する
+3. ゲストが「通知」を発行する (virtio-pci の場合は PCI config space への書き込み)
+4. ホスト側バックエンドが Available Ring からインデックスを取得し、バッファを処理する
+5. 処理完了後、バックエンドが Used Ring にインデックスと処理済み長を書き込む
+6. ホストがゲストに割り込みを注入して完了を通知する
+
+virtio 1.1 以降では **Packed Virtqueue** 形式も定義されている。
+Split 形式の 3 領域を 1 つのリングに統合し、キャッシュ効率を向上させる設計である。
+
+### 主要な virtio デバイスタイプ
+
+| デバイス | 用途 | Linux ドライバ |
+|---|---|---|
+| virtio-net | ネットワーク | `virtio_net.ko` |
+| virtio-blk | ブロックストレージ | `virtio_blk.ko` |
+| virtio-scsi | SCSI ストレージ | `virtio_scsi.ko` |
+| virtio-gpu | GPU / ディスプレイ | `virtio_gpu.ko` |
+| virtio-console | シリアルコンソール | `virtio_console.ko` |
+| virtio-balloon | メモリバルーニング | `virtio_balloon.ko` |
+| virtio-rng | 乱数生成 | `virtio_rng.ko` |
+| virtio-fs | ファイルシステム共有 | `virtiofs` |
+| virtio-vsock | VM-ホスト間ソケット | `vmw_vsock_virtio_transport.ko` |
+
+### トランスポートバインディング
+
+virtio デバイスはトランスポート層から独立して定義される。
+実際のデバイスは以下のトランスポートのいずれかを通じて公開される:
+
+| トランスポート | 用途 | デバイス検出 |
+|---|---|---|
+| virtio-pci | PC プラットフォーム (QEMU, Cloud Hypervisor 等) | PCI enumeration |
+| virtio-mmio | 組み込み / 軽量 VMM (Firecracker 等) | Device Tree / ACPI |
+| virtio-ccw | IBM s390 | Channel subsystem |
+
+Firecracker は起動時間を最小化するために virtio-mmio を採用している。
+PCI バスのエミュレーションオーバーヘッドを回避できるためである。
+
+### デバイスの機能ネゴシエーション
+
+virtio デバイスの初期化時に、デバイスとドライバの間で**機能ビット**のネゴシエーションが行われる:
+
+1. ドライバがデバイスの機能ビットを読み取る (デバイスが提供する機能セット)
+2. ドライバが対応可能な機能ビットのサブセットを書き戻す
+3. 両者が合意した機能セットで動作を開始する
+
+```
+ドライバ                                 デバイス
+  │   ① 機能ビットの読み取り               │
+  │◁━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━│
+  │   features = 0x3FF (全機能)            │
+  │                                        │
+  │   ② サポートする機能の通知             │
+  │━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━▷│
+  │   accepted = 0x1AB (一部を選択)        │
+  │                                        │
+  │   ③ FEATURES_OK ステータス設定         │
+  │━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━▷│
+  │                                        │
+  │   ④ ステータス確認                     │
+  │◁━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━│
+  │   FEATURES_OK が残っていれば合意成立    │
+```
+
+例えば `virtio-net` では、チェックサムオフロード、TSO (TCP Segmentation Offload)、
+マルチキュー対応などが機能ビットとして定義されている。
+
+---
+
+## vhost: カーネル内データプレーン
+
+### QEMU 経由の I/O の問題
+
+標準的な virtio の構成では、ゲストからの I/O 通知 (VM Exit) が QEMU のイベントループを経由する。
+この場合、以下のコンテキストスイッチが発生する:
+
+```
+パケット送信の流れ (QEMU 経由):
+  ゲスト → VM Exit → KVM → QEMU (ユーザ空間) → システムコール → カーネル → NIC
+
+  コンテキストスイッチ: ゲスト → カーネル → ユーザ空間 → カーネル
+```
+
+高帯域幅のネットワーク通信やストレージ I/O では、このオーバーヘッドが無視できない。
+
+### vhost-net: カーネル内データプレーン
+
+`vhost-net` はカーネルモジュールとして実装され、virtqueue のデータプレーン処理を
+カーネル内で直接行う。QEMU はコントロールプレーン (デバイスの設定・ネゴシエーション) のみを担当し、
+実際のデータ転送は QEMU を経由しない。
+
+```
+パケット送信の流れ (vhost-net):
+  ゲスト → VM Exit → KVM → vhost-net (カーネル) → NIC
+
+  コンテキストスイッチ: ゲスト → カーネル (QEMU を経由しない)
+```
+
+vhost-net は eventfd と irqfd を利用し、ゲストからの通知と割り込み注入を
+カーネル内で直接処理する:
+
+- **ioeventfd**: ゲストが特定の MMIO アドレスに書き込むと eventfd に通知される。KVM が VM Exit せずに直接 eventfd をトリガーできる。
+- **irqfd**: eventfd を書き込むだけでゲストに割り込みを注入できる。
+
+```
+┌──────────────┐         ioeventfd         ┌──────────────────┐
+│  ゲスト VM    │─────────────────────────▷│  vhost-net        │
+│              │                           │  (カーネル内)     │
+│              │◁─────────────────────────│                   │
+└──────────────┘         irqfd             │  ┌────────────┐  │
+                                           │  │ TAP デバイス│  │
+                                           │  └──────┬─────┘  │
+                                           └─────────┼────────┘
+                                                     │
+                                                     ▼
+                                               物理 NIC
+```
+
+カーネル内には以下の vhost モジュールが存在する:
+
+| モジュール | 用途 |
+|---|---|
+| `vhost-net` | ネットワーク I/O |
+| `vhost-scsi` | SCSI ストレージ I/O |
+| `vhost-vsock` | VM-ホスト間ソケット通信 |
+
+### vhost-user: ユーザ空間データプレーン
+
+`vhost-user` は vhost プロトコルをユーザ空間プロセスに拡張する仕組みである。
+カーネルを経由せず、ゲストメモリを共有メモリとして直接マッピングし、
+ユーザ空間のプロセスがデータプレーンを処理する。
+
+代表的な使用例:
+
+- **DPDK (Data Plane Development Kit)**: ユーザ空間のネットワークスタックが vhost-user バックエンドとして動作し、カーネルのネットワークスタックを完全にバイパスする。
+- **virtiofsd**: virtio-fs のバックエンドデーモン。ホストのファイルシステムをゲストに公開する。
+
+```
+┌──────────────┐                          ┌──────────────────┐
+│  ゲスト VM    │                          │  vhost-user       │
+│              │     共有メモリ            │  バックエンド     │
+│  virtio-net  │◁━━━(virtqueue)━━━━━━━━━▷│  (例: DPDK)       │
+│  ドライバ    │                          │                   │
+└──────────────┘                          └──────────────────┘
+                  Unix ドメインソケット
+                  (制御チャネル)
+```
+
+vhost-user は制御チャネル (Unix ドメインソケット) とデータチャネル (共有メモリ) を分離する。
+QEMU は起動時に vhost-user バックエンドとの接続を確立し、virtqueue のメモリ領域を共有する。
+
+### 性能比較の目安
+
+| 構成 | ネットワーク性能 (相対値) |
+|---|---|
+| e1000 エミュレーション (QEMU) | 低 |
+| virtio-net (QEMU バックエンド) | 中 |
+| virtio-net + vhost-net (カーネル) | 高 |
+| virtio-net + vhost-user (DPDK) | 最高 (ほぼネイティブ) |
+
+---
+
+## VFIO とデバイスパススルー
+
+### デバイスパススルーとは
+
+デバイスパススルーは、物理ハードウェアデバイスをゲスト VM に直接割り当てる技術である。
+デバイスエミュレーションや準仮想化のオーバーヘッドなしに、ネイティブ性能を実現できる。
+GPU パススルーによる VM 内でのグラフィックス処理、SR-IOV NIC による高性能ネットワーキングなどに使用される。
+
+### VFIO (Virtual Function I/O)
+
+VFIO は Linux カーネルが提供するデバイスパススルーのためのフレームワークである。
+`/dev/vfio/` 以下のデバイスファイルを通じて、ユーザ空間のプロセス (QEMU) が
+IOMMU の保護下で安全にデバイスにアクセスする。
+
+```
+ VFIO パススルーの流れ
+
+ ┌────────────────────────────────────────────────────────┐
+ │                    ゲスト VM                            │
+ │  ┌─────────────────────────────────────────────────┐   │
+ │  │  ゲスト OS                                       │   │
+ │  │  ┌──────────────┐                               │   │
+ │  │  │ デバイスドライバ│  ← 通常のドライバで動作      │   │
+ │  │  │ (例: GPU)     │                               │   │
+ │  │  └──────┬───────┘                               │   │
+ │  └─────────┼───────────────────────────────────────┘   │
+ │            │ MMIO / DMA (ゲスト物理アドレス)            │
+ └────────────┼───────────────────────────────────────────┘
+              │
+              │ EPT/NPT: GPA → HPA
+              ▼
+ ┌────────────────────────────────────────────────────────┐
+ │  KVM + VFIO                                            │
+ │  ┌──────────────────────────────────────────────────┐  │
+ │  │  IOMMU (VT-d / AMD-Vi)                           │  │
+ │  │  ┌───────────────────────────────────────────┐   │  │
+ │  │  │  DMA リマッピングテーブル                  │   │  │
+ │  │  │  GPA → HPA 変換                           │   │  │
+ │  │  │  デバイスのDMAアクセスを制御               │   │  │
+ │  │  └───────────────────────────────────────────┘   │  │
+ │  └──────────────────────────────────────────────────┘  │
+ │                          │                              │
+ └──────────────────────────┼──────────────────────────────┘
+                            │
+                            ▼
+              ┌──────────────────────┐
+              │  物理デバイス (GPU等) │
+              │  DMA ← IOMMU 経由   │
+              │  割り込み → ゲスト   │
+              └──────────────────────┘
+```
+
+### IOMMU グループ
+
+IOMMU はデバイスを**グループ**単位で隔離する。同じ IOMMU グループに属するデバイスは、
+ハードウェアレベルで互いのメモリにアクセスできる可能性があるため、
+**グループ全体を同じ VM に割り当てる必要がある**。
+
+```bash
+# IOMMU グループの確認
+$ find /sys/kernel/iommu_groups/ -type l | sort -V
+/sys/kernel/iommu_groups/0/devices/0000:00:00.0
+/sys/kernel/iommu_groups/1/devices/0000:00:01.0
+/sys/kernel/iommu_groups/1/devices/0000:01:00.0   ← GPU
+/sys/kernel/iommu_groups/1/devices/0000:01:00.1   ← GPU Audio
+```
+
+上の例では GPU (01:00.0) と GPU Audio (01:00.1) が同じ IOMMU グループ 1 に属するため、
+GPU をパススルーする際は Audio 機能も一緒にパススルーする必要がある。
+
+### VFIO の設定手順
+
+```bash
+# 1. IOMMU を有効化 (ブートパラメータ)
+# Intel: intel_iommu=on iommu=pt
+# AMD:   iommu=pt
+
+# 2. デバイスを既存ドライバから切り離す
+echo "0000:01:00.0" > /sys/bus/pci/devices/0000:01:00.0/driver/unbind
+
+# 3. vfio-pci ドライバにバインド
+echo "vfio-pci" > /sys/bus/pci/devices/0000:01:00.0/driver_override
+echo "0000:01:00.0" > /sys/bus/pci/drivers_probe
+
+# 4. QEMU で使用
+qemu-system-x86_64 \
+    -device vfio-pci,host=0000:01:00.0 \
+    ...
+```
+
+QEMU は内部で以下の VFIO ioctl を呼び出す:
+
+1. `/dev/vfio/vfio` を open → VFIO コンテナ fd を取得
+2. IOMMU グループの `/dev/vfio/<group_id>` を open → グループ fd を取得
+3. `VFIO_GROUP_GET_DEVICE_FD` → デバイス fd を取得
+4. `VFIO_DEVICE_GET_REGION_INFO` → BAR 領域の情報を取得
+5. `VFIO_DEVICE_GET_IRQ_INFO` → 割り込み情報を取得
+6. `VFIO_IOMMU_MAP_DMA` → DMA マッピングを設定
+
+### SR-IOV (Single-Root I/O Virtualization)
+
+SR-IOV は、1 つの物理デバイスを複数の**仮想ファンクション (VF)** に分割し、
+各 VF を異なる VM に割り当てる PCI 規格の機能である。
+
+```
+┌──────────────────────────────────┐
+│        物理 NIC (SR-IOV 対応)    │
+│  ┌────────────────────────────┐  │
+│  │  PF (Physical Function)    │  │  ← ホストが使用
+│  │  全機能を持つ。VF を管理。 │  │
+│  ├────────────────────────────┤  │
+│  │  VF 0                     │  │  ← VM 0 にパススルー
+│  ├────────────────────────────┤  │
+│  │  VF 1                     │  │  ← VM 1 にパススルー
+│  ├────────────────────────────┤  │
+│  │  VF 2                     │  │  ← VM 2 にパススルー
+│  └────────────────────────────┘  │
+└──────────────────────────────────┘
+```
+
+各 VF は独自の PCI コンフィグ空間と BAR 領域を持ち、
+VFIO 経由で個別の VM にパススルーできる。
+GPU パススルーと異なり、1 つの物理デバイスを複数の VM で共有できる利点がある。
+
+```bash
+# SR-IOV VF の作成
+echo 3 > /sys/class/net/enp3s0f0/device/sriov_numvfs
+
+# VF が PCI デバイスとして認識される
+lspci | grep "Virtual Function"
+# 03:10.0 Ethernet controller: ... Virtual Function
+# 03:10.2 Ethernet controller: ... Virtual Function
+# 03:10.4 Ethernet controller: ... Virtual Function
+```
+
+---
+
+## IOMMU: 仮想化コンテキストでの再考
+
+[Ch 12b](/part5-hardware/17-mmio-dma/) で IOMMU の基本概念を学んだが、
+仮想化の文脈では IOMMU はさらに重要な役割を果たす。
+
+### デバイス隔離とマルチテナントセキュリティ
+
+クラウド環境では、同一ホスト上で複数のテナント (顧客) の VM が動作する。
+VFIO でデバイスをパススルーする場合、IOMMU がなければ VM 内のデバイスドライバが
+DMA を使ってホストの任意のメモリを読み書きできてしまう。
+
+IOMMU は **DMA リマッピング** により、デバイスがアクセスできるメモリ領域を厳密に制限する:
+
+```
+IOMMU なし (危険):
+  デバイス → DMA → ホストの全物理メモリに自由にアクセス可能
+
+IOMMU あり (安全):
+  デバイス → DMA → IOMMU のページテーブルで変換 → 許可された領域のみアクセス可能
+```
+
+### DMA リマッピング
+
+IOMMU は CPU のページテーブルと類似した仕組みで、デバイスからの DMA アクセスに対して
+アドレス変換を行う:
+
+| CPU のページテーブル | IOMMU のページテーブル |
+|---|---|
+| 仮想アドレス → 物理アドレス | I/O 仮想アドレス → 物理アドレス |
+| プロセスごとのメモリ隔離 | デバイスごとのメモリ隔離 |
+| CR3 で切り替え | デバイスの BDF (Bus:Device:Function) で区別 |
+
+### VFIO との関係
+
+VFIO は IOMMU を利用してデバイスの DMA アクセスを安全に管理する。
+QEMU が `VFIO_IOMMU_MAP_DMA` を呼び出すと、VFIO が IOMMU のページテーブルに
+エントリを追加し、デバイスが特定のメモリ領域にのみ DMA できるようにする。
+
+```
+QEMU (ユーザ空間)
+  │
+  │ VFIO_IOMMU_MAP_DMA ioctl
+  │   iova=0x10000, size=4096, vaddr=0x7f...
+  ▼
+VFIO (カーネル)
+  │
+  │ IOMMU ページテーブル更新
+  ▼
+IOMMU ハードウェア
+  │
+  │ デバイスからの DMA: 0x10000 → 物理ページ
+  ▼
+物理メモリ (許可された領域のみ)
+```
+
+Intel では VT-d (Virtualization Technology for Directed I/O)、
+AMD では AMD-Vi (AMD I/O Virtualization Technology) として実装されている。
+Linux 6.8 以降、Intel CPU では IOMMU がデフォルトで有効化されている。
+
+---
+
+## KVM + QEMU の関係
+
+KVM と QEMU は分離されたコンポーネントであり、それぞれ異なる役割を担う。
+
+### 役割分担
+
+```
+┌──────────────────────────────────────────────────────────┐
+│  QEMU (ユーザ空間プロセス)                                │
+│                                                          │
+│  担当:                                                   │
+│  ・デバイスエミュレーション (NIC, ディスク, USB, ...)      │
+│  ・virtio バックエンド                                   │
+│  ・マシンモデル (PC, virt, ...)                           │
+│  ・ゲストメモリの確保 (mmap)                              │
+│  ・管理インタフェース (QMP, HMP)                         │
+│  ・マイグレーション                                      │
+│                                                          │
+│  KVM ioctl を呼び出して CPU/メモリ仮想化を委譲            │
+└──────────────────────┬───────────────────────────────────┘
+                       │ ioctl
+                       ▼
+┌──────────────────────────────────────────────────────────┐
+│  KVM (カーネルモジュール)                                  │
+│                                                          │
+│  担当:                                                   │
+│  ・CPU 仮想化 (VT-x / AMD-V 管理)                        │
+│  ・メモリ仮想化 (EPT / NPT 管理)                         │
+│  ・割り込み仮想化 (APIC 仮想化)                           │
+│  ・VM Entry / VM Exit 処理                               │
+│  ・vhost データプレーン                                   │
+│                                                          │
+│  デバイスエミュレーションは行わない                        │
+└──────────────────────────────────────────────────────────┘
+```
+
+### QEMU が KVM を使う流れ
+
+QEMU は起動時に以下の手順で KVM を初期化する:
+
+1. `/dev/kvm` を open する
+2. `KVM_CREATE_VM` で VM を作成する
+3. ゲストメモリを `mmap` で確保し、`KVM_SET_USER_MEMORY_REGION` で登録する
+4. vCPU ごとに `KVM_CREATE_VCPU` を呼び、QEMU 内のスレッドに割り当てる
+5. 各 vCPU スレッドが `KVM_RUN` ループを実行する
+6. VM Exit が発生すると、QEMU がデバイスエミュレーションなどの処理を行う
+
+### 本コースとの関係
+
+本コースでは、カーネルモジュールの開発・テストに QEMU + KVM を使用する。
+
+```bash
+# カスタムカーネルでの起動例
+qemu-system-x86_64 \
+    -enable-kvm \                      # KVM を使用
+    -kernel bzImage \                  # ビルドしたカーネル
+    -initrd initramfs.cpio.gz \        # initramfs
+    -append "console=ttyS0" \          # カーネルパラメータ
+    -nographic \                       # シリアルコンソールのみ
+    -m 512M \                          # メモリ 512MB
+    -device virtio-net-pci,netdev=n0 \ # virtio NIC
+    -netdev user,id=n0                 # ユーザモードネットワーク
+```
+
+`-enable-kvm` を付けないと QEMU は純粋なエミュレーション (TCG) モードで動作し、
+数十倍遅くなる。カーネル開発では KVM の使用が事実上必須である。
+
+---
+
+## Rust と仮想化
+
+### rust-vmm プロジェクト
+
+rust-vmm は AWS, Intel, Google, Microsoft, Red Hat, Alibaba, Linaro などが共同で開発する、
+仮想化コンポーネントの Rust クレート群である。
+個別の VMM プロジェクトが共通基盤として利用できるよう設計されている。
+
+2025-2026 年にかけてモノレポ化が進められ、関連クレートが統合されつつある。
+
+#### 主要クレート
+
+| クレート | 機能 |
+|---|---|
+| `kvm-ioctls` | KVM ioctl の安全なラッパー |
+| `kvm-bindings` | KVM の構造体・定数定義 |
+| `vm-memory` | ゲストメモリ管理の抽象化 |
+| `vm-allocator` | リソースアロケータ (IRQ, ポート, MMIO) |
+| `virtio-queue` | virtqueue のホスト側実装 |
+| `virtio-bindings` | virtio の構造体・定数定義 |
+| `vhost` | vhost プロトコルの実装 |
+| `vhost-user-backend` | vhost-user バックエンドライブラリ |
+| `vfio-ioctls` | VFIO ioctl の安全なラッパー |
+| `vm-superio` | レガシーデバイス (UART, i8042) のエミュレーション |
+
+#### kvm-ioctls の使用例
+
+```rust
+use kvm_ioctls::{Kvm, VcpuExit};
+use kvm_bindings::kvm_userspace_memory_region;
+
+// KVM システム fd を取得
+let kvm = Kvm::new().expect("Failed to open /dev/kvm");
+
+// VM 作成
+let vm = kvm.create_vm().expect("Failed to create VM");
+
+// ゲストメモリの設定
+let mem_region = kvm_userspace_memory_region {
+    slot: 0,
+    guest_phys_addr: 0,
+    memory_size: mem_size as u64,
+    userspace_addr: guest_mem as u64,
+    flags: 0,
+};
+unsafe { vm.set_user_memory_region(mem_region).unwrap() };
+
+// vCPU 作成
+let vcpu = vm.create_vcpu(0).expect("Failed to create vCPU");
+
+// vCPU 実行ループ
+loop {
+    match vcpu.run().expect("KVM_RUN failed") {
+        VcpuExit::IoOut { port, data } => {
+            // ゲストの I/O を処理
+            handle_io_out(port, data);
+        }
+        VcpuExit::Hlt => {
+            println!("Guest halted");
+            break;
+        }
+        VcpuExit::MmioWrite { addr, data } => {
+            handle_mmio_write(addr, &data);
+        }
+        exit => {
+            eprintln!("Unexpected exit: {:?}", exit);
+            break;
+        }
+    }
+}
+```
+
+C の ioctl コードと比較すると、Rust 版は以下の点で優れている:
+
+- `VcpuExit` enum による網羅的なパターンマッチ (switch-case の漏れ防止)
+- RAII による VM / vCPU リソースの自動解放
+- エラーハンドリングが `Result` 型で強制される
+
+### rust-vmm を使用する VMM
+
+| VMM | 開発元 | 用途 |
+|---|---|---|
+| Firecracker | AWS | サーバレスワークロード (AWS Lambda, Fargate) |
+| Cloud Hypervisor | Intel / Microsoft | クラウドワークロード |
+| crosvm | Google | Chrome OS のアプリケーション隔離 |
+| libkrun | Red Hat | ライブラリベースの VMM |
+| Dragonball Sandbox | Alibaba | Kata Containers |
+
+これらの VMM は同じ rust-vmm クレートを基盤として共有している。
+`vm-memory` への改善は Firecracker にも Cloud Hypervisor にも同時に恩恵をもたらす。
+
+```
+                     rust-vmm クレート群
+              ┌─────────────────────────────┐
+              │  kvm-ioctls  │  vm-memory   │
+              │  virtio-queue│  vhost       │
+              │  vfio-ioctls │  vm-allocator│
+              └──────┬──────┬──────┬───────┘
+                     │      │      │
+          ┌──────────┤      │      ├──────────┐
+          ▼          ▼      ▼      ▼          ▼
+    Firecracker  Cloud    crosvm  libkrun  Dragonball
+                Hypervisor
+```
+
+### virtio-drivers クレート (ゲスト側)
+
+rust-vmm はホスト側 (VMM) の実装だが、ゲスト側にも Rust の virtio ドライバが存在する。
+
+**rcore-os/virtio-drivers** は `no_std` 環境で動作するゲスト側 virtio ドライバクレートである。
+ベアメタルコードや Rust で書かれた OS カーネルが QEMU や crosvm 上の virtio デバイスと
+通信するために使用される。最新バージョンは 0.13.0 (2026 年時点)。
+
+対応デバイス: Block, Net, GPU, Input, Console, Socket, Sound, RNG
+
+対応トランスポート: MMIO, PCI (Legacy / Modern)
+
+Android (Google) の Rust コンポーネントでも使用されている。
+
+### カーネル内 Rust virtio ドライバの状況
+
+2026 年 4 月時点で、Linux カーネルのメインラインには Rust で書かれた virtio ドライバは
+まだマージされていない。Rust-for-Linux プロジェクトの主な焦点はドライバ基盤
+(デバイスモデル、メモリ管理、同期プリミティブ) の整備にある。
+
+今後、基盤が成熟するにつれて virtio-net や virtio-blk の Rust 実装が提案される可能性がある。
+rcore-os/virtio-drivers はユーザ空間の研究プロジェクト向けであり、
+カーネル内ドライバとは設計が異なる点に注意されたい。
+
+---
+
+## セキュリティ
+
+仮想化のセキュリティモデルは「ゲストがホストに影響を与えられない」ことを前提とする。
+しかし、この前提は複数の攻撃手法により破られる可能性がある。
+
+### VM エスケープ
+
+VM エスケープとは、ゲスト VM 内の攻撃者がホストの権限でコードを実行する攻撃である。
+最も一般的な攻撃ベクタは **QEMU のデバイスエミュレーション**のバグである。
+
+歴史的な例:
+
+- **VENOM (CVE-2015-3456)**: QEMU の仮想フロッピードライバのバッファオーバーフロー
+- **virtio-gpu の脆弱性**: 複雑な 3D グラフィックスエミュレーションにおけるメモリ破壊
+- **USB コントローラのバグ**: xHCI, EHCI エミュレーションにおける境界チェック不備
+
+**対策: 攻撃面の最小化**
+
+```
+攻撃面の大きさ (大 → 小):
+
+  完全エミュレーション       準仮想化 (virtio)      デバイスパススルー
+  (e1000, IDE, USB, ...)   (シンプルなリング        (VFIO)
+                            バッファ IF)
+  ┌─────────────────┐      ┌──────────────┐      ┌──────────────┐
+  │ 複雑なレジスタ   │      │ 定義された   │      │ QEMU を      │
+  │ エミュレーション  │      │ 仮想化 IF    │      │ 経由しない   │
+  │ → バグが入りやすい│      │ → 検証しやすい│      │ → 最小攻撃面 │
+  └─────────────────┘      └──────────────┘      └──────────────┘
+  攻撃面: 大                攻撃面: 中              攻撃面: 小
+```
+
+Firecracker はこの原則を徹底し、エミュレートするデバイスを virtio-net, virtio-blk,
+シリアルコンソール、最小限のレガシーデバイスに限定している。
+
+### サイドチャネル攻撃
+
+ハードウェアのマイクロアーキテクチャに起因するサイドチャネル攻撃は、
+仮想化環境において特に深刻である。同一物理ホスト上の異なる VM 間で情報が漏洩する可能性がある。
+
+| 脆弱性 | 概要 | 影響 |
+|---|---|---|
+| Spectre (V1, V2) | 投機的実行を利用したキャッシュサイドチャネル | VM 間の情報漏洩 |
+| Meltdown | カーネルメモリの読み取り | ゲストからホストの情報漏洩 |
+| L1TF (Foreshadow) | L1 データキャッシュからの情報漏洩 | VM 間の L1 キャッシュ漏洩 |
+| MDS | マイクロアーキテクチャバッファからの漏洩 | VM 間のバッファ漏洩 |
+| VMSCAPE (CVE-2025-40300) | Spectre-BTI で QEMU ユーザ空間のメモリを漏洩 | ゲストからホスト情報漏洩 |
+
+#### VMSCAPE (2025)
+
+VMSCAPE は 2025 年に発見された Spectre ベースの攻撃であり、
+ゲスト VM 内の攻撃者がデフォルト構成の KVM/QEMU 環境から
+ホストのメモリを 32 バイト/投機実行ウィンドウの速度で読み取れる。
+
+攻撃の原理: ゲスト VM 内で訓練された間接分岐予測が、VM Exit 後に
+QEMU ユーザ空間のコンテキストで持続し、QEMU 内のディスクロージャーガジェットに
+投機的にジャンプすることでホストメモリが漏洩する。
+
+**緩和策**: VM Exit のたびに IBPB (Indirect Branch Prediction Barrier) を発行する。
+Linux 6.8 以降でパッチが提供され、性能オーバーヘッドは約 1% に抑えられている。
+
+### カーネル側の緩和策
+
+| 緩和策 | 対象 | 仕組み |
+|---|---|---|
+| L1D flush on VM exit | L1TF | VM Exit 時に L1 データキャッシュをフラッシュ |
+| Core scheduling | L1TF, MDS | 同じ物理コアの SMT スレッドに同一 VM の vCPU のみを配置 |
+| IBPB on VM exit | Spectre V2, VMSCAPE | VM Exit 時に間接分岐予測バッファをクリア |
+| KPTI | Meltdown | カーネルとユーザ空間のページテーブルを分離 |
+| retpoline | Spectre V2 | 間接分岐をリターンスタックバッファ経由に変換 |
+
+#### Core scheduling
+
+Linux 5.14 で導入された core scheduling は、SMT (ハイパースレッディング) 環境で
+同一物理コアのスレッド間の情報漏洩を防ぐ。
+
+```
+Core scheduling なし (脆弱):
+  物理コア 0
+    ├── SMT スレッド 0: VM A の vCPU    ← L1 キャッシュを共有
+    └── SMT スレッド 1: VM B の vCPU    ← 攻撃者が L1 を観測可能
+
+Core scheduling あり (安全):
+  物理コア 0
+    ├── SMT スレッド 0: VM A の vCPU 0  ← 同じ VM のみ
+    └── SMT スレッド 1: VM A の vCPU 1  ← L1 共有しても安全
+```
+
+### vhost-user のサンドボックス化
+
+vhost-user バックエンドプロセスはユーザ空間で動作するため、
+seccomp-bpf によるシステムコールフィルタリングでサンドボックス化できる。
+
+```
+vhost-user バックエンド (例: virtiofsd)
+  │
+  │ seccomp-bpf: 許可されたシステムコールのみ
+  │  - read, write, mmap, munmap, ...
+  │  - fork, execve → 禁止
+  │  - mount, chroot → 禁止
+  │
+  └─→ 攻撃者がバックエンドを乗っ取っても被害を限定
+```
+
+virtiofsd は Rust で書き直されており (Rust 実装は rust-vmm エコシステムの一部)、
+メモリ安全性と seccomp の組み合わせで多層防御を実現している。
+
+---
+
+## よくある罠
+
+1. **`-enable-kvm` の付け忘れ** — QEMU が TCG (ソフトウェアエミュレーション) モードで動作し、カーネルビルドやテストが極端に遅くなる。`/dev/kvm` が存在しない場合は、CPU の仮想化拡張 (VT-x / AMD-V) が BIOS で無効化されている可能性がある。
+
+2. **IOMMU グループの部分的なパススルー** — IOMMU グループの一部のデバイスのみをパススルーしようとしてエラーになる。グループ全体を同一 VM に割り当てる必要がある。
+
+3. **ネストされた仮想化の未有効化** — VM 内で KVM を使いたい場合 (本コースの VM 内開発環境など)、`nested=1` オプションが必要。`modprobe kvm_intel nested=1` または `/etc/modprobe.d/kvm.conf` に設定する。
+
+4. **virtio ドライバの未インストール** — Windows ゲストでは virtio ドライバが標準では含まれない。Red Hat が提供する virtio-win ドライバ ISO を事前にインストールする必要がある。
+
+5. **EPT/NPT の無効化による性能低下** — 古いカーネルや特定のデバッグ設定で EPT/NPT が無効化されると、シャドウページテーブルにフォールバックし、メモリ仮想化の性能が大幅に低下する。
+
+6. **vhost-net のカーネルモジュール未ロード** — `vhost_net.ko` がロードされていないと、QEMU が自動的にユーザ空間バックエンドにフォールバックし、ネットワーク性能が低下する。`lsmod | grep vhost` で確認する。
+
+---
+
+## 章末演習
+
+1. 最小限の KVM VMM を C で実装せよ。`/dev/kvm` を open し、`KVM_CREATE_VM` → `KVM_CREATE_VCPU` → ゲストメモリに `hlt` 命令を配置 → `KVM_RUN` ループで `KVM_EXIT_HLT` を検出して終了するプログラムを作成する。
+
+2. QEMU で `virtio-net-pci` と `e1000` の両方を使って Linux ゲストを起動し、`iperf3` でネットワークスループットを比較せよ。さらに `vhost=on` オプションを追加した場合の差を計測せよ。
+
+3. (発展) `kvm-ioctls` クレートを使い、演習 1 と同等の Rust プログラムを作成せよ。`VcpuExit` enum のパターンマッチを使い、C 版との可読性の違いを考察せよ。
+
+4. (発展) SR-IOV 対応 NIC がある場合、VF を作成して QEMU の VFIO パススルーで VM にアタッチし、`ethtool` でリンク状態を確認せよ。IOMMU グループの割り当てを `/sys/kernel/iommu_groups/` で確認し、レポートにまとめよ。
+
+5. (発展) `perf kvm stat` を使って KVM の VM Exit 統計を収集し、`KVM_EXIT_IO`, `KVM_EXIT_MMIO`, `KVM_EXIT_EPT_VIOLATION` の発生頻度を分析せよ。virtio デバイスとエミュレーションデバイスで Exit の頻度がどう変わるか比較せよ。
+
+---
+
+## まとめ
+
+| コンポーネント | 役割 | レイヤ |
+|---|---|---|
+| KVM | CPU・メモリの仮想化 | カーネル |
+| QEMU | デバイスエミュレーション、管理 | ユーザ空間 |
+| VT-x / AMD-V | CPU 命令の仮想化支援 | ハードウェア |
+| EPT / NPT | メモリアドレス変換の仮想化支援 | ハードウェア |
+| virtio | 準仮想化 I/O 標準 | ゲスト-ホスト間 |
+| vhost | カーネル内 I/O データプレーン | カーネル |
+| vhost-user | ユーザ空間 I/O データプレーン | ユーザ空間 |
+| VFIO | デバイスパススルー | カーネル |
+| IOMMU | デバイスの DMA 隔離 | ハードウェア |
+| rust-vmm | Rust 仮想化クレート群 | ユーザ空間 |
+
+仮想化はカーネル開発者にとって 2 つの意味で重要である:
+
+1. **開発ツールとして**: QEMU + KVM はカーネルモジュールの開発・テスト環境として不可欠
+2. **技術領域として**: virtio ドライバ、VFIO、vhost などはカーネル内の大きなサブシステムであり、Rust-for-Linux が今後取り組む領域でもある
+
+---
+
+## 参考資料
+
+- [The Definitive KVM API Documentation (kernel.org)](https://docs.kernel.org/virt/kvm/api.html)
+- [Using the KVM API (LWN.net)](https://lwn.net/Articles/658511/)
+- [VFIO - "Virtual Function I/O" (kernel.org)](https://docs.kernel.org/driver-api/vfio.html)
+- [Virtual I/O Device (VIRTIO) Specification v1.3 (OASIS)](https://docs.oasis-open.org/virtio/virtio/v1.3/csd01/virtio-v1.3-csd01.html)
+- [Virtio on Linux (kernel.org)](https://docs.kernel.org/driver-api/virtio/virtio.html)
+- [Virtqueues and virtio ring: How the data travels (Red Hat)](https://www.redhat.com/en/blog/virtqueues-and-virtio-ring-how-data-travels)
+- [Introduction to virtio-networking and vhost-net (Red Hat)](https://www.redhat.com/en/blog/introduction-virtio-networking-and-vhost-net)
+- [rust-vmm (GitHub)](https://github.com/rust-vmm)
+- [kvm-ioctls (crates.io)](https://crates.io/crates/kvm-ioctls)
+- [virtio-drivers (rcore-os)](https://github.com/rcore-os/virtio-drivers)
+- [KVM host in a few lines of code (zserge.com)](https://zserge.com/posts/kvm/)
+- [An EPYC escape: Case-study of a KVM breakout (Project Zero)](https://projectzero.google/2021/06/an-epyc-escape-case-study-of-kvm.html)
+- [Ch 12b. I/O メモリと DMA](/part5-hardware/17-mmio-dma/) — IOMMU の基礎
+- [Ch 8. カーネルメモリ管理](/part3-kernel-concepts/08-memory/) — メモリの基礎

@@ -1,0 +1,185 @@
+---
+title: "Rust for Linux プロジェクト概観"
+description: RfL の公式情報源、メンテナ体制、コーディング規約を把握する
+---
+
+## この章で学ぶこと
+
+- Rust for Linux (RfL) の公式情報がどこにあるかを把握する
+- メンテナ体制と Git tree 構成を理解する
+- コーディング規約やアーキテクチャサポートの現状を確認できる
+- コミュニティの活動場所を知る
+## 前提
+
+- [Ch 1](/part1-introduction/01-why-rust/) (なぜカーネルを Rust で書くのか) を完了している
+
+## 公式サイト: rust-for-linux.com
+
+[rust-for-linux.com](https://rust-for-linux.com) はプロジェクトの公式ポータルである。
+主要なページ構成は以下の通り:
+
+| ページ | 内容 |
+|---|---|
+| トップページ | プロジェクト概要、最新ニュース |
+| [Third-party resources](https://rust-for-linux.com/third-party-resources) | 外部の発表・記事・動画へのリンク集 |
+| [Contributing](https://rust-for-linux.com/contributing) | 貢献方法、パッチの送り方 |
+| [Branches](https://rust-for-linux.com/branches) | Git ブランチの構成と役割 |
+| [Unstable features](https://rust-for-linux.com/unstable-features) | 使用中の Rust nightly 機能一覧 |
+| [Contact](https://rust-for-linux.com/contact) | Zulip、メーリングリストなどの連絡先 |
+
+プロジェクトの最新動向を追うには、このサイトの確認が最も効率的である。
+
+## カーネルの公式ドキュメント: docs.kernel.org/rust/
+
+Linux カーネルの公式ドキュメントとして [docs.kernel.org/rust/](https://docs.kernel.org/rust/) にまとまったセクションがある。
+
+| ページ | 内容 |
+|---|---|
+| [Quick Start](https://docs.kernel.org/rust/quick-start.html) | Rust 対応カーネルのビルド手順 (ツールチェイン導入から `make` まで) |
+| [General Information](https://docs.kernel.org/rust/general-information.html) | Rust サポートの全体像、仕組み、制約 |
+| [Coding Guidelines](https://docs.kernel.org/rust/coding-guidelines.html) | Rust コーディング規約 (`rustfmt`、命名、unsafe のルール等) |
+| [Arch Support](https://docs.kernel.org/rust/arch-support.html) | アーキテクチャ別のサポート状況 (x86_64, arm64, riscv64 等) |
+| [Testing](https://docs.kernel.org/rust/testing.html) | KUnit テスト、ドキュメントテストの書き方と実行方法 |
+
+特に **Coding Guidelines** は upstream にパッチを送る際の必読文書である。
+`rustfmt` によるフォーマットが必須であること、`// SAFETY:` コメントの書式、
+`unsafe` ブロックの使用ルールなどが規定されている。
+
+## rustdoc: rust.docs.kernel.org
+
+カーネルの Rust API リファレンスは rustdoc 形式で公開されている。
+2 つの URL を区別する必要がある:
+
+| URL | 内容 |
+|---|---|
+| [rust.docs.kernel.org/kernel/](https://rust.docs.kernel.org/kernel/) | **最新リリース版** (mainline) のドキュメント |
+| [rust.docs.kernel.org/next/kernel/](https://rust.docs.kernel.org/next/kernel/) | **linux-next** (開発最前線) のドキュメント |
+
+`next/` 版には、まだ mainline にマージされていない最新の API が含まれる。
+新しい抽象化の設計を確認したい場合は `next/` を参照するとよい。
+ただし、`next/` の API はマージ前に変更される可能性がある点に注意が必要である。
+
+## メンテナ体制
+
+Rust for Linux は以下のメンテナ・レビュアによって維持されている:
+
+| 名前 | 役割 | 主な担当領域 |
+|---|---|---|
+| **Miguel Ojeda** | メインメンテナ | プロジェクト全体の統括、Rust インフラ、コンパイラ連携 |
+| **Alice Ryhl** | メンテナ | `kernel` crate の各種抽象化 (miscdev, workqueue 等) |
+| **Benno Lossin** | メンテナ | pin-init、型安全な初期化フレームワーク |
+| **Danilo Krummrich** | メンテナ | デバイスモデル、メモリアロケータ (KVec, KBox 等) |
+| **Andreas Hindborg** | メンテナ | ブロックレイヤ (null_blk ドライバ等) |
+
+メンテナの連絡先やレビュー担当は `MAINTAINERS` ファイルに記載されている (後述)。
+
+## Git tree 構成
+
+RfL 関連のコードは複数の Git tree を経由して mainline に取り込まれる。
+
+```
+rust-next  ──────────────────────→  linux-next  ──→  mainline (Linus tree)
+                                        ↑
+drm-rust-next  (GPU 関連の Rust)  ──────┘
+```
+
+- **rust-next**: RfL の主要な開発ブランチ。Rust インフラ、`kernel` crate の変更はここに集約される。
+- **drm-rust-next**: DRM (Direct Rendering Manager) サブシステムの Rust 対応。GPU ドライバ (Nova 等) の開発が進行中である。
+
+これらは `linux-next` に統合された後、マージウィンドウで Linus tree に取り込まれる。
+
+## コミュニティ活動
+
+| チャネル | 用途 | URL |
+|---|---|---|
+| **Zulip** | 日常的な議論、質問、コードレビュー | [rust-for-linux.zulipchat.com](https://rust-for-linux.zulipchat.com) |
+| **LKML** (Linux Kernel Mailing List) | パッチ投稿、正式なレビュー | [lore.kernel.org/rust-for-linux/](https://lore.kernel.org/rust-for-linux/) |
+| **Kangrejos** | RfL の年次ワークショップ | [kangrejos.com](https://kangrejos.com) |
+| **LPC Rust MC** | Linux Plumbers Conference の Rust マイクロカンファレンス | [lpc.events](https://lpc.events) |
+
+**Zulip** は最も活発な場所であり、メンテナが常駐している。
+初心者の質問にも丁寧に対応してもらえるため、まずはここに参加するのがよい。
+
+**Kangrejos** はスペインで開催される年次ワークショップで、
+RfL に関する技術的な議論が集中的に行われる。過去の発表はオンラインで視聴可能である。
+
+## MAINTAINERS ファイルの読み方
+
+カーネルの `MAINTAINERS` ファイルには、各サブシステムのメンテナ、レビュア、
+関連ファイル、メーリングリスト、Git tree が記載されている。
+
+RUST セクションの典型的な構成は以下の通り:
+
+```
+RUST
+M:	Miguel Ojeda <ojeda@kernel.org>
+M:	Alex Gaynor <alex.gaynor@gmail.com>
+R:	Boqun Feng <boqun.feng@gmail.com>
+R:	...
+L:	rust-for-linux@vger.kernel.org
+S:	Supported
+W:	https://rust-for-linux.com
+B:	https://github.com/Rust-for-Linux/linux/issues
+C:	zulip://rust-for-linux.zulipchat.com
+P:	Documentation/rust/coding-guidelines.rst
+T:	git https://github.com/Rust-for-Linux/linux.git rust-next
+F:	Documentation/rust/
+F:	rust/
+F:	scripts/*rust*
+F:	...
+```
+
+各フィールドの意味:
+
+| フィールド | 意味 |
+|---|---|
+| `M:` | メンテナ (パッチのマージ権限を持つ) |
+| `R:` | レビュア (レビューを行うがマージ権限はない) |
+| `L:` | メーリングリスト |
+| `S:` | ステータス (`Supported`, `Maintained`, `Odd Fixes` 等) |
+| `W:` | Web ページ |
+| `B:` | バグトラッカー |
+| `C:` | チャット |
+| `P:` | コーディング規約文書 |
+| `T:` | Git tree |
+| `F:` | 関連ファイルパターン |
+
+## 実習: MAINTAINERS の RUST エントリを抽出する
+
+手元に clone した linux リポジトリで、以下のコマンドを実行してみよう。
+
+### RUST セクションの抽出
+
+```bash
+# MAINTAINERS ファイルから RUST セクションを抽出
+# 空行が出たらセクション終了
+awk '/^RUST$/,/^$/' MAINTAINERS
+```
+
+### 特定のファイルがどのサブシステムに属するかを調べる
+
+```bash
+# scripts/get_maintainer.pl を使用
+perl scripts/get_maintainer.pl --file rust/kernel/sync.rs
+```
+
+このコマンドは `rust/kernel/sync.rs` に関連するメンテナ・レビュア・メーリングリストを出力する。
+パッチを送る前に必ず実行して、宛先を確認する習慣をつけるとよい。
+
+### RUST に関連するサブシステムの一覧
+
+```bash
+# MAINTAINERS から Rust 関連のセクション名を一覧
+grep -B1 'rust-for-linux' MAINTAINERS | grep -v '^--$' | grep -v 'rust-for-linux'
+```
+
+## 参考資料
+
+- [rust-for-linux.com](https://rust-for-linux.com) — プロジェクト公式サイト
+- [docs.kernel.org/rust/](https://docs.kernel.org/rust/) — カーネル公式の Rust ドキュメント
+- [rust.docs.kernel.org/kernel/](https://rust.docs.kernel.org/kernel/) — Rust API リファレンス (rustdoc)
+- [rust-for-linux.zulipchat.com](https://rust-for-linux.zulipchat.com) — Zulip チャット
+- [lore.kernel.org/rust-for-linux/](https://lore.kernel.org/rust-for-linux/) — メーリングリストアーカイブ
+- [kangrejos.com](https://kangrejos.com) — Kangrejos ワークショップ
+- [Rust for Linux GitHub](https://github.com/Rust-for-Linux/linux) — 開発用 Git リポジトリ
+- [MAINTAINERS ファイルの書式 (kernel.org)](https://docs.kernel.org/process/maintainers.html) — MAINTAINERS の公式ガイド

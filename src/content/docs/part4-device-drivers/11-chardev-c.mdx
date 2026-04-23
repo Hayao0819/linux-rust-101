@@ -1,0 +1,351 @@
+---
+title: "Ch 8. 文字デバイスドライバ — C 版"
+description: file_operations, cdev, copy_to_user/copy_from_user, ioctl の実装を学ぶ
+---
+
+## この章で学ぶこと
+
+- メジャー番号 / マイナー番号の意味と `dev_t` の仕組みを理解する
+- `struct file_operations` の主要メンバを把握する
+- `copy_to_user` / `copy_from_user` の必要性と使い方を身につける
+- ioctl コマンドのエンコーディングと実装方法を学ぶ
+## 前提
+
+- [Ch 4](/part2-first-module/04-hello-c/) (C モジュール), [Ch 8](/part3-kernel-concepts/08-memory/) (メモリ管理), [Ch 9](/part3-kernel-concepts/09-concurrency/) (同期) を完了している
+
+## 文字デバイスとは
+
+Linux のデバイスは 3 種類に分類される:
+
+| 種類 | 特徴 | 例 |
+|---|---|---|
+| **文字デバイス** | バイトストリームとしてアクセス | `/dev/tty`, `/dev/random`, `/dev/null` |
+| **ブロックデバイス** | 固定サイズブロック単位でアクセス | `/dev/sda`, `/dev/nvme0n1` |
+| **ネットワークデバイス** | ソケット API 経由でアクセス | `eth0`, `wlan0` |
+
+文字デバイスは最もシンプルなドライバの形態であり、カーネルドライバ学習の出発点である。
+
+## メジャー番号とマイナー番号
+
+`/dev/` 以下のデバイスノードは 2 つの番号で識別される:
+
+- **メジャー番号** — ドライバを特定する (例: 1=mem, 4=tty, 10=misc)
+- **マイナー番号** — そのドライバが管理する個々のデバイスを特定する
+
+```bash
+ls -l /dev/null /dev/zero /dev/random
+# crw-rw-rw- 1 root root 1, 3 ... /dev/null     (メジャー 1, マイナー 3)
+# crw-rw-rw- 1 root root 1, 5 ... /dev/zero     (メジャー 1, マイナー 5)
+# crw-rw-rw- 1 root root 1, 8 ... /dev/random   (メジャー 1, マイナー 8)
+```
+
+カーネル内では `dev_t` 型 (32 ビット) に格納される:
+
+```c
+dev_t dev = MKDEV(major, minor);
+int major = MAJOR(dev);
+int minor = MINOR(dev);
+```
+
+## struct file_operations
+
+`file_operations` はシステムコールとドライバ関数を結びつけるディスパッチテーブルである:
+
+| フィールド | 対応するシステムコール | 用途 |
+|---|---|---|
+| `.open` | `open()` | デバイスオープン時の初期化 |
+| `.release` | `close()` (最後の close) | クリーンアップ |
+| `.read` | `read()` | カーネル → ユーザにデータを渡す |
+| `.write` | `write()` | ユーザ → カーネルにデータを渡す |
+| `.unlocked_ioctl` | `ioctl()` | デバイス固有のコマンド |
+| `.llseek` | `lseek()` | ファイル位置の変更 |
+| `.poll` | `poll()` / `select()` | 読み書き可能状態の通知 |
+| `.mmap` | `mmap()` | デバイスメモリのマッピング |
+
+NULL のフィールドはその操作が未サポートであることを意味する。
+
+## 最小の文字デバイスドライバ
+
+```c title="echo_dev.c"
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/uaccess.h>
+#include <linux/device.h>
+
+#define DEVICE_NAME "echo"
+#define BUF_SIZE    256
+
+static dev_t dev_num;
+static struct cdev echo_cdev;
+static struct class *echo_class;
+static char kbuf[BUF_SIZE];
+static size_t data_len;
+static DEFINE_MUTEX(echo_mutex);
+
+static int echo_open(struct inode *inode, struct file *file)
+{
+    pr_info("echo: opened\n");
+    return 0;
+}
+
+static int echo_release(struct inode *inode, struct file *file)
+{
+    pr_info("echo: closed\n");
+    return 0;
+}
+
+static ssize_t echo_read(struct file *file, char __user *buf,
+                         size_t count, loff_t *ppos)
+{
+    size_t to_copy;
+
+    mutex_lock(&echo_mutex);
+    to_copy = min(count, data_len - (size_t)*ppos);
+    if (to_copy == 0) {
+        mutex_unlock(&echo_mutex);
+        return 0;
+    }
+    if (copy_to_user(buf, kbuf + *ppos, to_copy)) {
+        mutex_unlock(&echo_mutex);
+        return -EFAULT;
+    }
+    *ppos += to_copy;
+    mutex_unlock(&echo_mutex);
+    return to_copy;
+}
+
+static ssize_t echo_write(struct file *file, const char __user *buf,
+                          size_t count, loff_t *ppos)
+{
+    size_t to_copy = min(count, (size_t)BUF_SIZE);
+
+    mutex_lock(&echo_mutex);
+    if (copy_from_user(kbuf, buf, to_copy)) {
+        mutex_unlock(&echo_mutex);
+        return -EFAULT;
+    }
+    data_len = to_copy;
+    *ppos = 0;
+    mutex_unlock(&echo_mutex);
+    return to_copy;
+}
+
+static const struct file_operations echo_fops = {
+    .owner   = THIS_MODULE,
+    .open    = echo_open,
+    .release = echo_release,
+    .read    = echo_read,
+    .write   = echo_write,
+};
+
+static int __init echo_init(void)
+{
+    int ret;
+
+    /* 1. デバイス番号の動的割り当て */
+    ret = alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
+    if (ret < 0)
+        return ret;
+
+    /* 2. cdev の初期化と登録 */
+    cdev_init(&echo_cdev, &echo_fops);
+    echo_cdev.owner = THIS_MODULE;
+    ret = cdev_add(&echo_cdev, dev_num, 1);
+    if (ret < 0)
+        goto err_unreg;
+
+    /* 3. デバイスクラスとノードの作成 (udev が /dev/echo を作る) */
+    echo_class = class_create(DEVICE_NAME);
+    if (IS_ERR(echo_class)) {
+        ret = PTR_ERR(echo_class);
+        goto err_cdev;
+    }
+    device_create(echo_class, NULL, dev_num, NULL, DEVICE_NAME);
+
+    pr_info("echo: registered (major=%d, minor=%d)\n",
+            MAJOR(dev_num), MINOR(dev_num));
+    return 0;
+
+err_cdev:
+    cdev_del(&echo_cdev);
+err_unreg:
+    unregister_chrdev_region(dev_num, 1);
+    return ret;
+}
+
+static void __exit echo_exit(void)
+{
+    device_destroy(echo_class, dev_num);
+    class_destroy(echo_class);
+    cdev_del(&echo_cdev);
+    unregister_chrdev_region(dev_num, 1);
+    pr_info("echo: unregistered\n");
+}
+
+module_init(echo_init);
+module_exit(echo_exit);
+MODULE_LICENSE("GPL");
+```
+
+### 使い方
+
+```bash
+sudo insmod echo_dev.ko
+echo "Hello Kernel" > /dev/echo
+cat /dev/echo
+# Hello Kernel
+sudo rmmod echo_dev
+```
+
+## copy_to_user / copy_from_user
+
+ユーザ空間のポインタを直接 `memcpy` してはならない。理由:
+
+1. **ユーザポインタが無効かもしれない** — 不正アドレスで oops になる
+2. **ページがスワップアウトされているかもしれない** — ページフォルトを安全に処理する必要がある
+3. **セキュリティ境界** — カーネルがユーザ空間メモリに無条件でアクセスすると SMEP/SMAP 違反
+
+```c
+/* カーネル → ユーザ */
+if (copy_to_user(user_buf, kernel_buf, count))
+    return -EFAULT;   /* コピー失敗 */
+
+/* ユーザ → カーネル */
+if (copy_from_user(kernel_buf, user_buf, count))
+    return -EFAULT;
+
+/* 単一の値 (1/2/4/8 バイト) はより高速な API がある */
+put_user(value, user_ptr);
+get_user(value, user_ptr);
+```
+
+`-EFAULT` (Bad address) はユーザへのエラー報告であり、カーネルの panic ではない。
+
+## ioctl: デバイス固有のコマンド
+
+read/write はバイトストリームだが、構造化されたコマンドを送りたい場合は ioctl を使う。
+
+### コマンド番号のエンコーディング
+
+```c
+#include <linux/ioctl.h>
+
+#define ECHO_MAGIC 'E'
+#define ECHO_RESET     _IO(ECHO_MAGIC, 0)             /* データなし */
+#define ECHO_GET_LEN   _IOR(ECHO_MAGIC, 1, size_t)    /* カーネル→ユーザ */
+#define ECHO_SET_BUF   _IOW(ECHO_MAGIC, 2, size_t)    /* ユーザ→カーネル */
+```
+
+| マクロ | 方向 | 意味 |
+|---|---|---|
+| `_IO(type, nr)` | なし | データ転送なしのコマンド |
+| `_IOR(type, nr, size)` | Read | カーネルからユーザへデータ |
+| `_IOW(type, nr, size)` | Write | ユーザからカーネルへデータ |
+| `_IOWR(type, nr, size)` | 両方 | 双方向データ転送 |
+
+> 注意: `_IOR` の "Read" は**ユーザ空間から見た方向**。カーネルが書き込み、ユーザが読む。
+
+### 実装
+
+```c
+static long echo_ioctl(struct file *file, unsigned int cmd,
+                       unsigned long arg)
+{
+    switch (cmd) {
+    case ECHO_RESET:
+        mutex_lock(&echo_mutex);
+        memset(kbuf, 0, BUF_SIZE);
+        data_len = 0;
+        mutex_unlock(&echo_mutex);
+        return 0;
+
+    case ECHO_GET_LEN:
+        return put_user(data_len, (size_t __user *)arg);
+
+    default:
+        return -ENOTTY;  /* 標準の「不明な ioctl」エラー */
+    }
+}
+```
+
+`file_operations` に `.unlocked_ioctl = echo_ioctl` を追加する。
+
+### ユーザ空間からの呼び出し
+
+```c title="test_echo.c (ユーザランド)"
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <stdio.h>
+
+#define ECHO_MAGIC   'E'
+#define ECHO_RESET   _IO(ECHO_MAGIC, 0)
+#define ECHO_GET_LEN _IOR(ECHO_MAGIC, 1, size_t)
+
+int main(void)
+{
+    int fd = open("/dev/echo", O_RDWR);
+    size_t len;
+
+    write(fd, "test", 4);
+    ioctl(fd, ECHO_GET_LEN, &len);
+    printf("len = %zu\n", len);   /* 4 */
+
+    ioctl(fd, ECHO_RESET);
+    ioctl(fd, ECHO_GET_LEN, &len);
+    printf("len = %zu\n", len);   /* 0 */
+
+    close(fd);
+    return 0;
+}
+```
+
+## miscdevice: より簡単な登録方法
+
+上記の cdev + class_create + device_create のボイラープレートは長い。
+**miscdevice** を使うと劇的に短くなる:
+
+```c
+#include <linux/miscdevice.h>
+
+static struct miscdevice echo_misc = {
+    .minor = MISC_DYNAMIC_MINOR,  /* マイナー番号を自動割り当て */
+    .name  = "echo",              /* /dev/echo を自動作成 */
+    .fops  = &echo_fops,
+};
+
+static int __init echo_init(void) { return misc_register(&echo_misc); }
+static void __exit echo_exit(void) { misc_deregister(&echo_misc); }
+```
+
+miscdevice はメジャー番号 10 を共有し、マイナー番号は自動割り当て。
+class_create / device_create / cdev_add は全て `misc_register` 内部で行われる。
+
+[Ch 13](/part4-device-drivers/13-chardev-rust/) では、この miscdevice を Rust で実装する。
+
+## よくある罠
+
+1. **`copy_to_user` と `copy_from_user` を逆に使う** — 方向を間違えるとデータ破壊やセキュリティホール。
+2. **`_IOW` と `_IOR` の方向を間違える** — ユーザ視点の方向であることに注意。
+3. **init 関数のエラーパスで cleanup を忘れる** — `goto err_*` パターンを正しく書く。
+4. **Mutex なしで `kbuf` にアクセスする** — 複数プロセスが同時に read/write する場合がある。
+5. **不明な ioctl に `-EINVAL` を返す** — 正しくは `-ENOTTY`。
+
+## 章末演習
+
+1. 上記の `echo_dev.c` をビルドし、`echo` / `cat` で動作確認せよ。
+
+2. ioctl `ECHO_RESET` と `ECHO_GET_LEN` を追加し、ユーザ空間テストプログラムで検証せよ。
+
+3. `strace` を使って `cat /dev/echo` 時のシステムコール列を観察せよ。
+
+---
+
+次の章 → [Ch 13. 文字デバイスドライバ — Rust 版](/part4-device-drivers/13-chardev-rust/)
+
+## 参考資料
+
+- [Character device drivers (Linux Kernel Labs)](https://linux-kernel-labs.github.io/refs/heads/master/labs/device_drivers.html)
+- [Char Drivers (LDD3)](https://lwn.net/Kernel/LDD3/)
+- [Misc Device Driver (kernel.org)](https://docs.kernel.org/driver-api/misc_devices.html)
+- [ioctl based interfaces (kernel.org)](https://docs.kernel.org/driver-api/ioctl.html)

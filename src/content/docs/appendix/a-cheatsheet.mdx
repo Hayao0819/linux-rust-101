@@ -1,0 +1,166 @@
+---
+title: "付録 A. コマンドチートシート"
+description: カーネル開発で頻繁に使うコマンドのクイックリファレンス
+---
+
+## Rust ツールチェーン管理 — rustup
+
+```bash
+# 現在のツールチェーン一覧を表示
+rustup show
+
+# カーネルビルドに必要なコンポーネントを追加
+rustup component add rust-src rustfmt clippy
+```
+
+## ビルドシステム — cargo
+
+```bash
+# パッケージのビルド
+cargo build --release
+
+# テストの実行
+cargo test
+
+# フォーマットチェック
+cargo fmt --check
+```
+
+## カーネルビルド — make
+
+```bash
+# Rust サポートが有効か確認
+make LLVM=1 rustavailable
+
+# カーネル全体をビルド（Clang/LLVM 使用）
+make LLVM=1 -j$(nproc)
+
+# 外部モジュールをビルド
+make LLVM=1 -C /lib/modules/$(uname -r)/build M=$(pwd) modules
+
+# Rust のカーネルドキュメントを生成
+make LLVM=1 rustdoc
+
+# Rust の doctest を実行
+make LLVM=1 rusttest
+
+# menuconfig でカーネル設定を変更
+make LLVM=1 menuconfig
+
+# defconfig にRustサポートを追加
+make LLVM=1 defconfig
+./scripts/config -e RUST
+make LLVM=1 olddefconfig
+```
+
+## 仮想マシン — qemu-system-*
+
+```bash
+# x86_64 カーネルを起動（KVM 有効）
+qemu-system-x86_64 \
+  -kernel arch/x86/boot/bzImage \
+  -initrd rootfs.cpio.gz \
+  -append "console=ttyS0 nokaslr" \
+  -nographic \
+  -enable-kvm \
+  -m 1G
+
+# aarch64 カーネルを起動
+qemu-system-aarch64 \
+  -M virt -cpu cortex-a72 \
+  -kernel arch/arm64/boot/Image \
+  -append "console=ttyAMA0" \
+  -nographic -m 1G
+```
+
+## virtme-ng (vng)
+
+```bash
+# ホストカーネルでそのまま起動（ビルド不要）
+vng
+
+# ビルド済みカーネルを起動
+vng --build
+
+# 起動時にコマンドを実行して終了
+vng -- "uname -r && dmesg | grep rust"
+
+# QEMU に追加オプションを渡す
+vng --qemu-opts="-m 2G -smp 4"
+```
+
+## デバッグ — gdb
+
+```bash
+# QEMU の GDB スタブに接続（KASLR 無効を前提）
+gdb vmlinux -ex "target remote :1234"
+
+# Rust モジュールにブレークポイントを設定
+(gdb) break rust_module::init
+(gdb) continue
+
+# バックトレースを表示
+(gdb) bt
+
+# Rust の変数を整形表示
+(gdb) print /r my_variable
+```
+
+## モジュール管理 — insmod / rmmod / modinfo / lsmod
+
+```bash
+# モジュールをロード
+sudo insmod my_module.ko
+
+# パラメータ付きでロード
+sudo insmod my_module.ko param1=42
+
+# モジュールをアンロード
+sudo rmmod my_module
+
+# モジュール情報を表示（ライセンス、作者、パラメータ等）
+modinfo my_module.ko
+
+# 現在ロード済みのモジュール一覧
+lsmod
+lsmod | grep my_module
+```
+
+## カーネルログ — dmesg
+
+```bash
+# カーネルログ全体を表示
+dmesg
+
+# リアルタイムでログを追跡
+dmesg -w
+
+# ログレベルでフィルタ（err 以上）
+dmesg -l err,warn
+
+# ログをクリア（要 root）
+sudo dmesg -C
+
+# 人間が読みやすいタイムスタンプで表示
+dmesg -T
+```
+
+## トレーシング — trace-cmd
+
+```bash
+# 利用可能なイベントを一覧表示
+trace-cmd list -e
+
+# 特定のイベントをトレース
+trace-cmd record -e sched_switch -e irq_handler_entry sleep 5
+
+# トレース結果を表示
+trace-cmd report
+
+# 関数トレーサで特定の関数を追跡
+trace-cmd record -p function -l 'rust_*' sleep 3
+
+# 関数グラフトレーサ（呼び出し階層を表示）
+trace-cmd record -p function_graph -g my_function sleep 3
+trace-cmd report
+```

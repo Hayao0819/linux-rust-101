@@ -1,0 +1,771 @@
+---
+title: "実習: echo デバイスを一から作る"
+description: Ch 3-9 の知識を総動員して、write で書いたデータを read で返す echo 文字デバイスを C と Rust で実装する
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::miscdevice::MiscDevice`, `kernel::uaccess::UserSliceReader` / `UserSliceWriter`, `kernel::sync::Mutex<T>`
+:::
+
+## 概要
+
+この実習では、[Ch 11](/part4-device-drivers/11-chardev-c/) と [Ch 13](/part4-device-drivers/13-chardev-rust/) で学んだ文字デバイスドライバの知識を使い、実用的な **echo デバイス** を一から作る。
+
+echo デバイスの仕様:
+
+- `write()` で書き込んだデータをカーネル内バッファに保存する
+- `read()` で最後に書き込んだデータを返す
+- `ioctl` で `ECHO_RESET` (バッファクリア) と `ECHO_GET_SIZE` (現在のデータサイズ取得) をサポートする
+- `debugfs` エントリで読み書き回数の統計を表示する
+- Mutex で排他制御を行う
+
+## 前提
+
+- [Ch 4](/part2-first-module/04-hello-c/) (C モジュール), [Ch 8](/part3-kernel-concepts/08-memory/) (メモリ管理), [Ch 9](/part3-kernel-concepts/09-concurrency/) (同期), [Ch 23](/part7-observability/23-debug-tracing/) (デバッグ), [Ch 11](/part4-device-drivers/11-chardev-c/) (C 文字デバイス), [Ch 13](/part4-device-drivers/13-chardev-rust/) (Rust 文字デバイス) を完了している
+- カーネルヘッダがインストール済み (`apt install linux-headers-$(uname -r)` 等)
+
+---
+
+## Part A: C 版 echo デバイス
+
+### ステップ 1: ディレクトリ構成と Makefile の作成
+
+```bash
+mkdir -p ~/echo_dev_lab && cd ~/echo_dev_lab
+```
+
+以下のファイル構成を作る:
+
+```
+echo_dev_lab/
+├── Makefile
+├── echo_dev.c
+├── echo_ioctl.h       # ioctl コマンド定義 (カーネル/ユーザ共有)
+└── test_echo.c         # ユーザ空間テストプログラム
+```
+
+まず `Makefile` を作成する:
+
+```makefile title="Makefile"
+# カーネルモジュール用
+obj-m += echo_dev.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+all: modules test_echo
+
+modules:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+test_echo: test_echo.c echo_ioctl.h
+	gcc -Wall -o test_echo test_echo.c
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f test_echo
+```
+
+<Aside type="tip">
+`Makefile` のインデントにはスペースではなくタブを使うこと。スペースだと `make` が動かない。
+</Aside>
+
+### ステップ 2: ioctl コマンド定義ヘッダ
+
+カーネルモジュールとユーザ空間テストプログラムで共有するヘッダを作成する:
+
+```c title="echo_ioctl.h"
+#ifndef _ECHO_IOCTL_H
+#define _ECHO_IOCTL_H
+
+#include <linux/ioctl.h>
+
+#define ECHO_MAGIC 'E'
+
+/* バッファをクリアする (データ転送なし) */
+#define ECHO_RESET      _IO(ECHO_MAGIC, 0)
+
+/* 現在のデータサイズを取得する (カーネル→ユーザ) */
+#define ECHO_GET_SIZE   _IOR(ECHO_MAGIC, 1, size_t)
+
+#endif /* _ECHO_IOCTL_H */
+```
+
+### ステップ 3: echo_dev.c の作成
+
+完全なソースコードを以下に示す。コメントで各部分の役割を説明している。
+
+```c title="echo_dev.c"
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/uaccess.h>
+#include <linux/device.h>
+#include <linux/mutex.h>
+#include <linux/debugfs.h>
+#include "echo_ioctl.h"
+
+#define DEVICE_NAME "echo"
+#define BUF_SIZE    4096
+
+/* ──────────────────────────────────────────────
+ * グローバル変数
+ * ────────────────────────────────────────────── */
+static dev_t dev_num;                /* メジャー/マイナー番号 */
+static struct cdev echo_cdev;        /* キャラクタデバイス構造体 */
+static struct class *echo_class;     /* デバイスクラス (sysfs) */
+
+static char kbuf[BUF_SIZE];          /* カーネル内バッファ */
+static size_t data_len;              /* 現在保存されているデータ長 */
+static DEFINE_MUTEX(echo_mutex);     /* バッファへの排他制御 */
+
+/* 統計情報 (debugfs で表示) */
+static unsigned long read_count;
+static unsigned long write_count;
+
+/* debugfs ディレクトリ */
+static struct dentry *dbg_dir;
+
+/* ──────────────────────────────────────────────
+ * file_operations の実装
+ * ────────────────────────────────────────────── */
+
+static int echo_open(struct inode *inode, struct file *file)
+{
+    pr_info("echo: opened by pid %d\n", current->pid);
+    return 0;
+}
+
+static int echo_release(struct inode *inode, struct file *file)
+{
+    pr_info("echo: closed by pid %d\n", current->pid);
+    return 0;
+}
+
+/*
+ * echo_read - バッファの内容をユーザ空間に返す
+ *
+ * ppos (ファイルオフセット) を使い、途中からの読み出しに対応する。
+ * これにより cat コマンドなどが正しく EOF を検出できる。
+ */
+static ssize_t echo_read(struct file *file, char __user *buf,
+                         size_t count, loff_t *ppos)
+{
+    size_t to_copy;
+
+    mutex_lock(&echo_mutex);
+
+    /* オフセットがデータ長以上なら EOF */
+    if (*ppos >= data_len) {
+        mutex_unlock(&echo_mutex);
+        return 0;
+    }
+
+    to_copy = min(count, data_len - (size_t)*ppos);
+
+    if (copy_to_user(buf, kbuf + *ppos, to_copy)) {
+        mutex_unlock(&echo_mutex);
+        return -EFAULT;
+    }
+
+    *ppos += to_copy;
+    read_count++;
+
+    mutex_unlock(&echo_mutex);
+    return to_copy;
+}
+
+/*
+ * echo_write - ユーザ空間のデータをバッファに書き込む
+ *
+ * 書き込み時にバッファを上書きする (追記ではない)。
+ * BUF_SIZE を超える部分は切り捨てる。
+ */
+static ssize_t echo_write(struct file *file, const char __user *buf,
+                          size_t count, loff_t *ppos)
+{
+    size_t to_copy;
+
+    to_copy = min(count, (size_t)BUF_SIZE);
+
+    mutex_lock(&echo_mutex);
+
+    if (copy_from_user(kbuf, buf, to_copy)) {
+        mutex_unlock(&echo_mutex);
+        return -EFAULT;
+    }
+
+    data_len = to_copy;
+    *ppos = to_copy;
+    write_count++;
+
+    mutex_unlock(&echo_mutex);
+
+    pr_info("echo: wrote %zu bytes\n", to_copy);
+    return to_copy;
+}
+
+/*
+ * echo_ioctl - デバイス固有コマンドの処理
+ *
+ * ECHO_RESET:    バッファを空にする
+ * ECHO_GET_SIZE: 現在のデータ長をユーザ空間に返す
+ */
+static long echo_ioctl(struct file *file, unsigned int cmd,
+                       unsigned long arg)
+{
+    switch (cmd) {
+    case ECHO_RESET:
+        mutex_lock(&echo_mutex);
+        memset(kbuf, 0, BUF_SIZE);
+        data_len = 0;
+        mutex_unlock(&echo_mutex);
+        pr_info("echo: buffer reset\n");
+        return 0;
+
+    case ECHO_GET_SIZE:
+        /* put_user は単一の値を安全にユーザ空間に書き込む */
+        return put_user(data_len, (size_t __user *)arg);
+
+    default:
+        return -ENOTTY;   /* 不明な ioctl コマンド */
+    }
+}
+
+static const struct file_operations echo_fops = {
+    .owner          = THIS_MODULE,
+    .open           = echo_open,
+    .release        = echo_release,
+    .read           = echo_read,
+    .write          = echo_write,
+    .unlocked_ioctl = echo_ioctl,
+};
+
+/* ──────────────────────────────────────────────
+ * debugfs: /sys/kernel/debug/echo/stats
+ * ────────────────────────────────────────────── */
+
+/*
+ * debugfs の stats ファイルを読むと、読み書き回数と
+ * 現在のバッファ使用量を表示する。
+ */
+static ssize_t stats_read(struct file *file, char __user *buf,
+                          size_t count, loff_t *ppos)
+{
+    char tmp[128];
+    int len;
+
+    if (*ppos > 0)
+        return 0;   /* 1 回で全データを返す */
+
+    len = snprintf(tmp, sizeof(tmp),
+                   "read_count:  %lu\n"
+                   "write_count: %lu\n"
+                   "data_len:    %zu\n"
+                   "buf_size:    %d\n",
+                   read_count, write_count, data_len, BUF_SIZE);
+
+    if (len > count)
+        len = count;
+
+    if (copy_to_user(buf, tmp, len))
+        return -EFAULT;
+
+    *ppos += len;
+    return len;
+}
+
+static const struct file_operations stats_fops = {
+    .owner = THIS_MODULE,
+    .read  = stats_read,
+};
+
+/* ──────────────────────────────────────────────
+ * モジュール初期化 / 終了
+ * ────────────────────────────────────────────── */
+
+static int __init echo_init(void)
+{
+    int ret;
+
+    /* 1. デバイス番号の動的割り当て */
+    ret = alloc_chrdev_region(&dev_num, 0, 1, DEVICE_NAME);
+    if (ret < 0) {
+        pr_err("echo: alloc_chrdev_region failed (%d)\n", ret);
+        return ret;
+    }
+
+    /* 2. cdev の初期化と登録 */
+    cdev_init(&echo_cdev, &echo_fops);
+    echo_cdev.owner = THIS_MODULE;
+    ret = cdev_add(&echo_cdev, dev_num, 1);
+    if (ret < 0)
+        goto err_unreg;
+
+    /* 3. デバイスクラスとデバイスノードの作成 */
+    echo_class = class_create(DEVICE_NAME);
+    if (IS_ERR(echo_class)) {
+        ret = PTR_ERR(echo_class);
+        goto err_cdev;
+    }
+
+    if (IS_ERR(device_create(echo_class, NULL, dev_num, NULL, DEVICE_NAME))) {
+        ret = -ENOMEM;
+        goto err_class;
+    }
+
+    /* 4. debugfs エントリの作成 */
+    dbg_dir = debugfs_create_dir("echo", NULL);
+    debugfs_create_file("stats", 0444, dbg_dir, NULL, &stats_fops);
+
+    pr_info("echo: registered (major=%d, minor=%d)\n",
+            MAJOR(dev_num), MINOR(dev_num));
+    return 0;
+
+err_class:
+    class_destroy(echo_class);
+err_cdev:
+    cdev_del(&echo_cdev);
+err_unreg:
+    unregister_chrdev_region(dev_num, 1);
+    return ret;
+}
+
+static void __exit echo_exit(void)
+{
+    /* debugfs の削除 */
+    debugfs_remove_recursive(dbg_dir);
+
+    /* デバイスの登録解除 (init の逆順) */
+    device_destroy(echo_class, dev_num);
+    class_destroy(echo_class);
+    cdev_del(&echo_cdev);
+    unregister_chrdev_region(dev_num, 1);
+
+    pr_info("echo: unregistered (reads=%lu, writes=%lu)\n",
+            read_count, write_count);
+}
+
+module_init(echo_init);
+module_exit(echo_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Linux-Rust-101");
+MODULE_DESCRIPTION("Echo character device with ioctl and debugfs");
+```
+
+### ステップ 4: ユーザ空間テストプログラム
+
+```c title="test_echo.c"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include "echo_ioctl.h"
+
+#define DEVICE_PATH "/dev/echo"
+
+static void die(const char *msg)
+{
+    perror(msg);
+    exit(EXIT_FAILURE);
+}
+
+int main(void)
+{
+    int fd;
+    char buf[256];
+    ssize_t n;
+    size_t size;
+
+    printf("=== Echo Device Test ===\n\n");
+
+    /* 1. デバイスをオープン */
+    fd = open(DEVICE_PATH, O_RDWR);
+    if (fd < 0)
+        die("open");
+
+    /* 2. データを書き込む */
+    const char *msg = "Hello, echo device!";
+    n = write(fd, msg, strlen(msg));
+    if (n < 0)
+        die("write");
+    printf("[write] %zd bytes written: \"%s\"\n", n, msg);
+
+    /* 3. ECHO_GET_SIZE でサイズを確認 */
+    if (ioctl(fd, ECHO_GET_SIZE, &size) < 0)
+        die("ioctl ECHO_GET_SIZE");
+    printf("[ioctl] ECHO_GET_SIZE = %zu\n", size);
+
+    /* 4. データを読み戻す */
+    lseek(fd, 0, SEEK_SET);   /* オフセットを先頭に戻す */
+    memset(buf, 0, sizeof(buf));
+    n = read(fd, buf, sizeof(buf));
+    if (n < 0)
+        die("read");
+    printf("[read]  %zd bytes read:    \"%s\"\n", n, buf);
+
+    /* 5. ECHO_RESET でバッファをクリア */
+    if (ioctl(fd, ECHO_RESET) < 0)
+        die("ioctl ECHO_RESET");
+    printf("[ioctl] ECHO_RESET done\n");
+
+    /* 6. クリア後のサイズ確認 */
+    if (ioctl(fd, ECHO_GET_SIZE, &size) < 0)
+        die("ioctl ECHO_GET_SIZE");
+    printf("[ioctl] ECHO_GET_SIZE = %zu (should be 0)\n", size);
+
+    /* 7. クリア後に read すると 0 バイト (EOF) */
+    lseek(fd, 0, SEEK_SET);
+    n = read(fd, buf, sizeof(buf));
+    printf("[read]  %zd bytes read (should be 0)\n", n);
+
+    close(fd);
+    printf("\n=== All tests passed ===\n");
+    return 0;
+}
+```
+
+### ステップ 5: ビルドとテスト
+
+<Steps>
+
+1. **ビルド**
+
+   ```bash
+   cd ~/echo_dev_lab
+   make
+   ```
+
+   成功すると `echo_dev.ko` と `test_echo` が生成される。
+
+2. **モジュールのロード**
+
+   ```bash
+   sudo insmod echo_dev.ko
+   ```
+
+3. **基本動作の確認 (シェルから)**
+
+   ```bash
+   # 書き込みと読み出し
+   echo "Hello, Kernel!" > /dev/echo
+   cat /dev/echo
+   # → Hello, Kernel!
+   ```
+
+4. **テストプログラムの実行**
+
+   ```bash
+   sudo ./test_echo
+   ```
+
+   期待される出力:
+
+   ```
+   === Echo Device Test ===
+
+   [write] 19 bytes written: "Hello, echo device!"
+   [ioctl] ECHO_GET_SIZE = 19
+   [read]  19 bytes read:    "Hello, echo device!"
+   [ioctl] ECHO_RESET done
+   [ioctl] ECHO_GET_SIZE = 0 (should be 0)
+   [read]  0 bytes read (should be 0)
+
+   === All tests passed ===
+   ```
+
+5. **debugfs で統計を確認**
+
+   ```bash
+   sudo cat /sys/kernel/debug/echo/stats
+   # read_count:  2
+   # write_count: 1
+   # data_len:    0
+   # buf_size:    4096
+   ```
+
+6. **dmesg でカーネルログを確認**
+
+   ```bash
+   dmesg | tail -20
+   # echo: registered (major=XXX, minor=0)
+   # echo: opened by pid XXXX
+   # echo: wrote 19 bytes
+   # echo: closed by pid XXXX
+   # ...
+   ```
+
+7. **モジュールのアンロード**
+
+   ```bash
+   sudo rmmod echo_dev
+   dmesg | tail -1
+   # echo: unregistered (reads=2, writes=1)
+   ```
+
+</Steps>
+
+### コード解説: 排他制御
+
+このドライバでは `DEFINE_MUTEX(echo_mutex)` で定義した Mutex を使い、`kbuf` と `data_len` へのアクセスを保護している。
+
+```c
+/* 全てのバッファアクセスを Mutex で保護 */
+mutex_lock(&echo_mutex);
+/* ... kbuf, data_len を操作 ... */
+mutex_unlock(&echo_mutex);
+```
+
+Mutex を使わないと、複数プロセスが同時に read/write した場合にデータ破壊やクラッシュが発生する。
+例えば、あるプロセスが `data_len` を更新している途中で別のプロセスが `kbuf` を読むと、不整合なデータを読む可能性がある。
+
+<Aside type="caution">
+`echo_ioctl` の `ECHO_GET_SIZE` では `put_user` を使っているが、これは Mutex の外で呼んでいる。
+`data_len` は `size_t` (アーキテクチャによっては 8 バイト) なので、厳密にはアトミックではない。
+本格的なドライバでは Mutex 内で値を取得してから `put_user` する方が安全である。
+</Aside>
+
+### コード解説: debugfs
+
+`debugfs` はカーネルのデバッグ用疑似ファイルシステムである ([Ch 23](/part7-observability/23-debug-tracing/) 参照)。
+
+```c
+/* ディレクトリ /sys/kernel/debug/echo/ を作成 */
+dbg_dir = debugfs_create_dir("echo", NULL);
+
+/* ファイル /sys/kernel/debug/echo/stats を作成 (読み取り専用) */
+debugfs_create_file("stats", 0444, dbg_dir, NULL, &stats_fops);
+```
+
+`debugfs_remove_recursive(dbg_dir)` でディレクトリごと削除できる。
+本番用ドライバでは debugfs を使わず sysfs や tracepoint を使うべきだが、開発中のデバッグには非常に便利である。
+
+---
+
+## Part B: Rust 版 echo デバイス
+
+### ステップ 1: out-of-tree モジュールテンプレートの取得
+
+```bash
+git clone https://github.com/Rust-for-Linux/rust-out-of-tree-module.git ~/echo_rust_lab
+cd ~/echo_rust_lab
+```
+
+<Aside type="note">
+Rust カーネルモジュールのビルドには、Rust サポートを有効にしてビルドしたカーネルが必要である。
+[Ch 3](/part1-introduction/03-setup/) のセットアップが完了していることを前提とする。
+</Aside>
+
+### ステップ 2: MiscDevice trait の実装
+
+`rust_out_of_tree.rs` (またはテンプレートのメインファイル) を以下の内容に置き換える:
+
+```rust title="echo_rust.rs"
+// SPDX-License-Identifier: GPL-2.0
+
+//! Echo character device in Rust
+//!
+//! write で書き込んだデータを read で返す echo デバイス。
+//! C 版 (echo_dev.c) と同等の機能を Rust で実装する。
+
+use kernel::prelude::*;
+use kernel::miscdevice::{MiscDevice, MiscDeviceRegistration};
+use kernel::sync::{Mutex, Arc};
+use kernel::new_mutex;
+use kernel::alloc::KVec;
+
+module! {
+    type: EchoModule,
+    name: "echo_rust",
+    author: "Linux-Rust-101",
+    description: "Echo character device in Rust",
+    license: "GPL",
+}
+
+/// モジュール本体。Drop 時に MiscDeviceRegistration が自動で deregister される。
+struct EchoModule {
+    _reg: Pin<KBox<MiscDeviceRegistration<EchoDev>>>,
+}
+
+/// 全オープンで共有される状態。
+/// Mutex でバッファへの排他制御を行う。
+#[pin_data]
+struct SharedState {
+    #[pin]
+    buf: Mutex<KVec<u8>>,
+}
+
+/// MiscDevice trait を実装する型。
+struct EchoDev;
+
+#[vtable]
+impl MiscDevice for EchoDev {
+    /// open() ごとに SharedState を返す。
+    /// 複数の fd 間でバッファを共有するために Arc を使用する。
+    type Ptr = Arc<SharedState>;
+
+    fn open(_file: &File, _misc: &MiscDeviceRegistration<Self>) -> Result<Arc<SharedState>> {
+        let state = Arc::pin_init(pin_init!(SharedState {
+            buf <- new_mutex!(KVec::new()),
+        }), GFP_KERNEL)?;
+        Ok(state)
+    }
+
+    /// read: バッファの内容をユーザ空間に返す
+    fn read(
+        state: &SharedState,
+        _file: &File,
+        buf: &mut UserSliceWriter,
+        offset: u64,
+    ) -> Result<usize> {
+        let data = state.buf.lock();
+        let start = offset as usize;
+        if start >= data.len() {
+            return Ok(0);   // EOF
+        }
+        let to_copy = core::cmp::min(buf.len(), data.len() - start);
+        buf.write_slice(&data[start..start + to_copy])?;
+        Ok(to_copy)
+    }
+
+    /// write: ユーザ空間のデータをバッファに保存する (上書き)
+    fn write(
+        state: &SharedState,
+        _file: &File,
+        buf: &mut UserSliceReader,
+        _offset: u64,
+    ) -> Result<usize> {
+        let mut data = state.buf.lock();
+        data.clear();
+        let len = buf.len();
+        data.extend_from_reader(buf, GFP_KERNEL)?;
+        Ok(len)
+    }
+
+    /// ioctl: ECHO_RESET / ECHO_GET_SIZE
+    fn ioctl(
+        state: &SharedState,
+        _file: &File,
+        cmd: u32,
+        arg: usize,
+    ) -> Result<isize> {
+        // ECHO_RESET = _IO('E', 0)
+        const ECHO_RESET: u32 = 0x4500;
+        // ECHO_GET_SIZE = _IOR('E', 1, size_t)
+        const ECHO_GET_SIZE: u32 = 0x8008_4501;
+
+        match cmd {
+            ECHO_RESET => {
+                let mut data = state.buf.lock();
+                data.clear();
+                Ok(0)
+            }
+            ECHO_GET_SIZE => {
+                let data = state.buf.lock();
+                let len = data.len();
+                let mut writer = UserSlice::new(arg, core::mem::size_of::<usize>()).writer();
+                writer.write(&len.to_ne_bytes())?;
+                Ok(0)
+            }
+            _ => Err(code::ENOTTY),
+        }
+    }
+}
+
+impl kernel::Module for EchoModule {
+    fn init(_module: &ThisModule) -> Result<Self> {
+        pr_info!("echo_rust: initializing\n");
+        let reg = KBox::pin_init(
+            MiscDeviceRegistration::<EchoDev>::register(fmt!("echo_rust"), None),
+            GFP_KERNEL,
+        )?;
+        Ok(EchoModule { _reg: reg })
+    }
+}
+
+impl Drop for EchoModule {
+    fn drop(&mut self) {
+        pr_info!("echo_rust: unloading\n");
+    }
+}
+```
+
+<Aside type="note">
+上記コードは概念的な構造を示している。実際の API は Linux カーネルのバージョンによって異なる場合がある。
+`samples/rust/rust_misc_device.rs` を必ず参照すること。
+特に ioctl の定数値はアーキテクチャに依存するため、実運用では `uapi` から生成するのが正しい。
+</Aside>
+
+### ステップ 3: ビルドとテスト
+
+```bash
+cd ~/echo_rust_lab
+
+# Rust 対応カーネルのビルドディレクトリを指定
+make KDIR=/path/to/linux-with-rust LLVM=1
+
+# ロードとテスト
+sudo insmod echo_rust.ko
+echo "Hello Rust" > /dev/echo_rust
+cat /dev/echo_rust
+# → Hello Rust
+sudo rmmod echo_rust
+```
+
+### ステップ 4: C 版との行数・構造比較
+
+C 版と Rust 版の構造を対比する:
+
+| 要素 | C 版 (`echo_dev.c`) | Rust 版 (`echo_rust.rs`) |
+|---|---|---|
+| init 関数 | `alloc_chrdev_region` → `cdev_init` → `cdev_add` → `class_create` → `device_create` (約 30 行、goto エラーパス付き) | `MiscDeviceRegistration::register()` 1 行 |
+| cleanup 関数 | `device_destroy` → `class_destroy` → `cdev_del` → `unregister_chrdev_region` (5 行) | Drop で自動 (0 行) |
+| エラーハンドリング | `goto err_*` パターン、手動 cleanup | `?` 演算子 + Drop で自動 |
+| ユーザ空間転送 | `copy_to_user` / `copy_from_user` (方向を間違えてもコンパイルが通る) | `UserSliceReader` / `UserSliceWriter` (方向が型で固定) |
+| 排他制御 | `mutex_lock` / `mutex_unlock` ペア (unlock 忘れのリスク) | `.lock()` の戻り値がスコープ終了で自動 unlock |
+| NULL チェック | `IS_ERR` / `PTR_ERR` パターン | `Result` 型で統一 |
+
+---
+
+## まとめ: C vs Rust 比較表
+
+| 観点 | C 版 | Rust 版 |
+|---|---|---|
+| **コード行数** (概算) | 約 200 行 | 約 100 行 |
+| **エラーハンドリング** | `goto` チェーン、`IS_ERR`、手動 cleanup | `?` 演算子 + `Drop` trait で自動 |
+| **リソース管理** | `init` と `exit` で手動ペアリング。順序を間違えるとリーク | RAII: スコープ離脱で自動解放 |
+| **排他制御の安全性** | Mutex の lock/unlock を忘れるとデッドロックまたはデータ競合 | `MutexGuard` がスコープ終了で自動 unlock |
+| **ユーザ空間転送** | 方向の取り違えがコンパイル時に検出されない | `Reader` / `Writer` で型レベルで方向が固定 |
+| **TOCTOU 防止** | `copy_from_user` を複数回呼べる (double-fetch 脆弱性のリスク) | `UserSliceReader` は消費型 (一度しか読めない) |
+| **ioctl の safety** | 任意の `unsigned long` をキャストできる | 型安全な `UserSlice` 経由で転送 |
+| **debugfs / 統計** | 手動実装が必要 | (現時点では Rust 抽象が不十分なため C と同程度の手間) |
+
+<Aside type="tip">
+C 版は「全てを手動で管理する」代わりに最大限の柔軟性がある。
+Rust 版は「コンパイラが安全性を保証する」代わりに API がまだ発展途上である。
+両方を実装して比較することで、それぞれの長所と短所が体感できる。
+</Aside>
+
+---
+
+## 発展課題
+
+1. **バッファサイズをモジュールパラメータにする** — C 版では `module_param(buf_size, int, 0444)` で、Rust 版ではカーネルの `module_param` 相当 API で実装してみよ。
+
+2. **複数クライアント対応** — 現在の C 版はグローバルバッファだが、`file->private_data` に per-fd バッファを持たせ、各クライアントが独立したバッファを持つよう変更せよ。
+
+3. **proc エントリの追加** — `/proc/echo_info` にデバイスの情報を表示するエントリを追加せよ。
+
+---
+
+## 参考資料
+
+- [Ch 11. 文字デバイスドライバ — C 版](/part4-device-drivers/11-chardev-c/)
+- [Ch 13. 文字デバイスドライバ — Rust 版](/part4-device-drivers/13-chardev-rust/)
+- [Character device drivers (Linux Kernel Labs)](https://linux-kernel-labs.github.io/refs/heads/master/labs/device_drivers.html)
+- [samples/rust/rust_misc_device.rs](https://github.com/torvalds/linux/blob/master/samples/rust/rust_misc_device.rs)
+- [debugfs (kernel.org)](https://docs.kernel.org/filesystems/debugfs.html)

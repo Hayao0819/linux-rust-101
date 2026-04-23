@@ -1,0 +1,675 @@
+---
+title: "デバッグ・トレーシング・eBPF"
+description: "oops, GDB, KASAN, ftrace, kprobe, uprobe, bpftrace, Aya — カーネルの観測とデバッグ"
+---
+
+## この章で学ぶこと
+
+- カーネル oops のスタックトレースを読めるようになる
+- QEMU + GDB でカーネルモジュールをステップ実行できる
+- KASAN / KCSAN / UBSAN でバグを自動検出する方法を把握する
+- `pr_info` / `dev_info` / dynamic debug の使い分けを理解する
+- ftrace でカーネル関数の呼び出しをトレースできる
+- kprobe / uprobe / tracepoint による動的計装を理解する
+- bpftrace でワンライナー解析を行える
+- eBPF の仕組みと Aya (Rust) による eBPF プログラミングを知る
+---
+
+カーネル開発では「何が起きているか分からない」が最大の敵である。
+printk デバッグだけで戦うのは非効率であり、カーネルは強力な観測・デバッグ基盤を備えている。
+この章ではクラッシュ解析から動的トレーシング、eBPF まで一貫して扱う。
+
+## カーネル oops の読み方
+
+カーネル oops はカーネル版のセグメンテーション違反である。
+NULL ポインタ参照やページフォルト違反が起きると、カーネルが詳細なレポートを出力する。
+
+### oops メッセージの構造
+
+```
+BUG: unable to handle page fault for address: 0000000000001234
+#PF: supervisor read access in kernel mode
+#PF: error_code(0x0000) - not-present page
+RIP: 0010:my_driver_read+0x42/0x100 [my_module]
+RSP: 0018:ffffc90000a3be50 EFLAGS: 00010246
+RAX: 0000000000000000 RBX: ffff888100a5c000 ...
+Call Trace:
+ <TASK>
+ vfs_read+0x9d/0x1a0
+ ksys_read+0x67/0xe0
+ do_syscall_64+0x82/0x170
+ </TASK>
+```
+
+**読み方:**
+
+| 行 | 意味 |
+|---|---|
+| `BUG: unable to handle page fault` | 何が起きたか |
+| `RIP: 0010:my_driver_read+0x42/0x100` | **どの関数の何バイト目** でクラッシュしたか |
+| `[my_module]` | どのモジュールか |
+| `Call Trace:` | 呼び出し経路 (一番上が直近) |
+
+### デコードツール
+
+```bash
+# アドレスからソースファイル:行番号を取得
+addr2line -e vmlinux ffffffff81234567
+
+# oops 全体をデコード
+./scripts/decode_stacktrace.sh vmlinux < oops.txt
+
+# モジュールの逆アセンブル (ソース付き)
+objdump -d -S my_module.ko
+```
+
+## QEMU + GDB によるカーネルデバッグ
+
+### カーネルの設定
+
+```bash
+scripts/config --enable DEBUG_INFO
+scripts/config --enable DEBUG_INFO_DWARF_TOOLCHAIN_DEFAULT
+scripts/config --enable GDB_SCRIPTS
+scripts/config --disable RANDOMIZE_BASE   # KASLR を無効化 (アドレスを固定)
+make LLVM=1 olddefconfig
+make LLVM=1 -j$(nproc)
+```
+
+### QEMU の起動
+
+```bash
+qemu-system-x86_64 \
+    -kernel arch/x86/boot/bzImage \
+    -initrd /path/to/initramfs.img \
+    -append "console=ttyS0 nokaslr" \
+    -nographic \
+    -s -S   # -s: GDB ポート 1234, -S: 起動時に停止
+```
+
+### GDB の接続
+
+```bash
+gdb vmlinux
+(gdb) target remote :1234
+(gdb) continue
+```
+
+### カーネル専用 GDB コマンド
+
+`CONFIG_GDB_SCRIPTS=y` を有効にすると、`scripts/gdb/` 配下のヘルパーが使える:
+
+| コマンド | 用途 |
+|---|---|
+| `lx-dmesg` | カーネルログ (dmesg) を表示 |
+| `lx-symbols` | カーネル/モジュールのシンボルをロード |
+| `lx-lsmod` | ロード済みモジュール一覧 |
+| `lx-ps` | 全タスクの一覧 |
+| `lx-cmdline` | カーネルコマンドライン |
+
+```bash
+(gdb) lx-symbols          # モジュールシンボルをロード
+(gdb) break my_driver_read # ブレークポイント設定
+(gdb) continue
+# デバイスに read すると停止する
+(gdb) print *file          # struct file の中身を表示
+(gdb) next                 # ステップ実行
+```
+
+## KASAN / KCSAN / UBSAN
+
+### KASAN: メモリバグの自動検出
+
+KASAN (Kernel Address Sanitizer) はコンパイラ計装を使って
+use-after-free やバッファオーバーフローを実行時に検出する。
+
+#### 有効化
+
+```bash
+scripts/config --enable KASAN
+scripts/config --enable KASAN_GENERIC
+make LLVM=1 olddefconfig
+make LLVM=1 -j$(nproc)
+```
+
+#### 検出できるバグ
+
+| バグ | 検出方法 |
+|---|---|
+| Use-after-free | 解放後のメモリを「毒」でマーク |
+| Out-of-bounds | オブジェクト周囲にレッドゾーンを配置 |
+| Stack out-of-bounds | スタック変数の周囲にレッドゾーン |
+| Global out-of-bounds | グローバル変数の周囲にレッドゾーン |
+
+#### 動作原理
+
+KASAN は 8 バイトの実メモリに対して 1 バイトの**シャドウメモリ**を割り当てる。
+コンパイラが全てのメモリアクセスの前にシャドウバイトをチェックするコードを挿入する。
+
+```
+シャドウバイトの値:
+  0x00 = 全 8 バイトアクセス可能
+  0x01-0x07 = 先頭 N バイトのみアクセス可能
+  0xFF = 解放済み (use-after-free 検出)
+  0xFC = レッドゾーン (out-of-bounds 検出)
+```
+
+**コスト:** 2-3 倍の速度低下、1.5-3 倍のメモリ消費。開発・CI 用。
+
+### KCSAN: データ競合の検出
+
+```bash
+scripts/config --enable KCSAN
+```
+
+KCSAN (Kernel Concurrency Sanitizer) はロックなしの並行メモリアクセスを検出する。
+同期プリミティブを正しく使っていない箇所を自動的に見つけてくれる。
+
+### UBSAN: 未定義動作の検出
+
+```bash
+scripts/config --enable UBSAN
+scripts/config --enable UBSAN_BOUNDS
+```
+
+UBSAN (Undefined Behavior Sanitizer) は C 言語の未定義動作を実行時に検出する。
+
+| 検出項目 | 例 |
+|---|---|
+| 符号付き整数オーバーフロー | `INT_MAX + 1` |
+| 配列境界外アクセス | `arr[size]` (UBSAN_BOUNDS) |
+| アラインメント違反 | `*(int *)unaligned_ptr` |
+| NULL ポインタのメンバアクセス | `((struct foo *)NULL)->bar` |
+
+```
+UBSAN: shift-out-of-bounds in drivers/my_module/core.c:42:15
+shift exponent 33 is too large for 32-bit type 'unsigned int'
+```
+
+KASAN と異なりオーバーヘッドが小さいため、CI だけでなく一部の本番カーネルでも有効化される場合がある。
+
+## ロギングのベストプラクティス
+
+### pr_info vs dev_info
+
+カーネルのログ出力には `pr_*` 系と `dev_*` 系の 2 系統がある。
+
+```c
+/* pr_* 系 — デバイスと紐づかない汎用ログ */
+pr_info("module loaded, version=%s\n", VERSION);
+pr_err("failed to allocate buffer\n");
+
+/* dev_* 系 — デバイスドライバ用 (推奨) */
+dev_info(&pdev->dev, "probe successful, irq=%d\n", irq);
+dev_err(&pdev->dev, "firmware load failed: %d\n", ret);
+```
+
+`dev_*` はデバイス名を自動で付加するため、同じドライバが複数デバイスを管理する場合にログが区別できる:
+
+```
+[  1.234] my_driver 0000:03:00.0: probe successful, irq=42
+[  1.235] my_driver 0000:04:00.0: probe successful, irq=43
+```
+
+**原則:** `struct device *` にアクセスできる場所では常に `dev_*` を使う。
+
+### pr_debug / dev_dbg と dynamic debug
+
+`pr_debug()` と `dev_dbg()` はデフォルトではコンパイルされるが出力されない。
+dynamic debug (dyndbg) を使って実行時に個別に有効化できる。
+
+```bash
+# 特定ファイルの全 pr_debug を有効化
+echo 'file drivers/my_driver/core.c +p' > \
+    /sys/kernel/debug/dynamic_debug/control
+
+# 特定モジュールの全デバッグログを有効化
+echo 'module my_driver +p' > \
+    /sys/kernel/debug/dynamic_debug/control
+
+# 特定関数のみ有効化
+echo 'func my_driver_probe +p' > \
+    /sys/kernel/debug/dynamic_debug/control
+
+# 無効化 (-p)
+echo 'module my_driver -p' > \
+    /sys/kernel/debug/dynamic_debug/control
+
+# 現在有効なデバッグポイントの確認
+cat /sys/kernel/debug/dynamic_debug/control | grep my_driver
+```
+
+`+p` 以外にも `+f` (関数名付与)、`+l` (行番号付与)、`+t` (スレッド ID 付与) が指定できる。
+
+## ftrace
+
+ftrace は Linux カーネル組み込みのトレーシングフレームワークである。
+カーネルのリビルド不要で、関数呼び出しの追跡が可能である。
+
+### 基本操作
+
+ftrace は `/sys/kernel/tracing/` (旧 `/sys/kernel/debug/tracing/`) を通じて制御する。
+
+```bash
+# 利用可能なトレーサの確認
+cat /sys/kernel/tracing/available_tracers
+# nop function function_graph ...
+
+# function tracer — 呼ばれた関数を記録
+echo function > /sys/kernel/tracing/current_tracer
+
+# 特定の関数だけをフィルタ
+echo 'vfs_read' > /sys/kernel/tracing/set_ftrace_filter
+
+# トレース開始
+echo 1 > /sys/kernel/tracing/tracing_on
+
+# ... 何らかの操作 ...
+
+# トレース停止・確認
+echo 0 > /sys/kernel/tracing/tracing_on
+cat /sys/kernel/tracing/trace
+```
+
+出力例:
+
+```
+# tracer: function
+#
+#  TASK-PID   CPU#  ||||    TIMESTAMP  FUNCTION
+#     | |       |   ||||       |         |
+    cat-1234  [002] .... 12345.678: vfs_read <-ksys_read
+```
+
+### function_graph tracer
+
+関数の呼び出しツリーと実行時間を可視化する:
+
+```bash
+echo function_graph > /sys/kernel/tracing/current_tracer
+echo 'vfs_*' > /sys/kernel/tracing/set_graph_function
+echo 1 > /sys/kernel/tracing/tracing_on
+```
+
+```
+ 1)               |  vfs_read() {
+ 1)               |    rw_verify_area() {
+ 1)   0.452 us    |      security_file_permission();
+ 1)   1.023 us    |    }
+ 1)               |    new_sync_read() {
+ 1)   5.678 us    |      my_driver_read();
+ 1)   6.890 us    |    }
+ 1) + 12.345 us   |  }
+```
+
+### trace-cmd
+
+`/sys/kernel/tracing/` を直接操作するのは煩雑である。`trace-cmd` はそれをラップするツールである。
+
+```bash
+# function_graph トレースを録画
+trace-cmd record -p function_graph -g vfs_read
+
+# 結果を表示
+trace-cmd report
+
+# 特定のイベントを記録
+trace-cmd record -e sched:sched_switch -e irq:irq_handler_entry
+
+# GUI で可視化 (kernelshark)
+kernelshark trace.dat
+```
+
+## kprobe と uprobe
+
+### kprobe: カーネル関数の動的計装
+
+kprobe を使うと、カーネル関数の**任意の命令**にフックを仕込める。
+カーネルの再ビルドは不要である。
+
+ftrace 経由で手軽に使える:
+
+```bash
+# vfs_read の入口にプローブを設置
+echo 'p:my_probe vfs_read' > /sys/kernel/tracing/kprobe_events
+
+# 引数を記録 (x86_64: arg1=%di, arg2=%si, ...)
+echo 'p:my_probe vfs_read file=%di count=%dx' > \
+    /sys/kernel/tracing/kprobe_events
+
+# 有効化
+echo 1 > /sys/kernel/tracing/events/kprobes/my_probe/enable
+
+# トレース確認
+cat /sys/kernel/tracing/trace
+
+# クリーンアップ
+echo '-:my_probe' >> /sys/kernel/tracing/kprobe_events
+```
+
+### kretprobe: 戻り値の取得
+
+```bash
+# vfs_read の戻り値を記録
+echo 'r:my_retprobe vfs_read ret=$retval' > \
+    /sys/kernel/tracing/kprobe_events
+echo 1 > /sys/kernel/tracing/events/kprobes/my_retprobe/enable
+```
+
+### uprobe: ユーザ空間関数のフック
+
+uprobe はユーザ空間のバイナリに対してフックを仕込む。
+カーネル側の仕組みで動作するため、対象プロセスの変更は不要である。
+
+```bash
+# bash の readline 関数にプローブを設置
+echo 'p:bash_readline /usr/bin/bash:readline' > \
+    /sys/kernel/tracing/uprobe_events
+echo 1 > /sys/kernel/tracing/events/uprobes/bash_readline/enable
+
+# bash でコマンドを入力するたびにトレースが記録される
+cat /sys/kernel/tracing/trace
+```
+
+### tracepoint: 静的 vs 動的の比較
+
+| 特性 | tracepoint (静的) | kprobe (動的) |
+|---|---|---|
+| 定義場所 | カーネルソースに埋め込み | 任意の命令アドレス |
+| 安定性 | API として維持される | 関数名変更で壊れる |
+| オーバーヘッド | 無効時ほぼゼロ | 設置時のみ |
+| 引数アクセス | 型付きで安全 | レジスタ番号で指定 |
+| 用途 | 長期的な監視・ツール連携 | アドホックな調査 |
+
+```bash
+# 利用可能な tracepoint の一覧
+cat /sys/kernel/tracing/available_events | head -20
+
+# スケジューラの tracepoint を有効化
+echo 1 > /sys/kernel/tracing/events/sched/sched_switch/enable
+```
+
+## bpftrace
+
+bpftrace は DTrace/SystemTap に相当するワンライナートレーシングツールである。
+内部的に eBPF を使用するが、簡潔なスクリプト言語で記述できる。
+
+### ワンライナー例
+
+```bash
+# システムコールの呼び出し回数をカウント
+bpftrace -e 'tracepoint:raw_syscalls:sys_enter { @[comm] = count(); }'
+
+# vfs_read のレイテンシ分布 (ヒストグラム)
+bpftrace -e '
+kprobe:vfs_read { @start[tid] = nsecs; }
+kretprobe:vfs_read /@start[tid]/ {
+    @usecs = hist((nsecs - @start[tid]) / 1000);
+    delete(@start[tid]);
+}'
+
+# プロセスごとの read バイト数
+bpftrace -e '
+tracepoint:syscalls:sys_exit_read /args->ret > 0/ {
+    @bytes[comm] = sum(args->ret);
+}'
+
+# uprobe: malloc の呼び出しサイズ分布
+bpftrace -e 'uprobe:/lib/x86_64-linux-gnu/libc.so.6:malloc {
+    @size = hist(arg0);
+}'
+
+# 新規プロセスの起動をリアルタイム表示
+bpftrace -e 'tracepoint:syscalls:sys_enter_execve {
+    printf("%s -> %s\n", comm, str(args->filename));
+}'
+```
+
+### bpftrace の仕組み
+
+```
+bpftrace スクリプト
+    ↓ (パース・コンパイル)
+BPF バイトコード
+    ↓ (bpf() syscall)
+カーネル内 BPF verifier → JIT コンパイル → 実行
+    ↓ (BPF map 経由)
+ユーザ空間へ結果を返却
+```
+
+bpftrace はプロトタイピング向きである。
+複雑なロジックやデーモン化が必要な場合は、後述の eBPF + Aya を検討する。
+
+## eBPF と Aya
+
+### eBPF の概要
+
+eBPF (extended Berkeley Packet Filter) は、カーネル内で安全にサンドボックス実行される
+バイトコードプログラムの仕組みである。元はパケットフィルタだったが、
+現在はトレーシング、セキュリティ、ネットワーキングなどカーネル全般に適用されている。
+
+```
+ユーザ空間                          カーネル空間
+┌──────────┐                   ┌────────────────┐
+│  Loader  │ ── bpf() ──→    │  BPF Verifier  │
+│ (Aya等)  │                   │   ↓ (安全性検証) │
+└──────────┘                   │  JIT Compiler  │
+      ↑                        │   ↓             │
+      │ BPF Map               │  実行エンジン    │
+      │ (共有メモリ)            │  (フック先で実行) │
+      ↓                        └────────────────┘
+┌──────────┐
+│ 結果表示  │
+└──────────┘
+```
+
+**主要な構成要素:**
+
+| 要素 | 役割 |
+|---|---|
+| **Verifier** | プログラムの安全性を静的に検証 (無限ループ禁止、境界チェック等) |
+| **BPF Map** | カーネル/ユーザ空間でデータを共有するキーバリューストア |
+| **Program Types** | アタッチ先を決定 (kprobe, tracepoint, XDP, cgroup 等) |
+| **Helper Functions** | カーネル機能を呼び出す安全な API (`bpf_probe_read`, `bpf_map_update_elem` 等) |
+
+### Aya: Rust で eBPF を書く
+
+Aya は Rust で eBPF プログラムを記述するためのフレームワークである。
+libbpf-sys への依存がなく、純粋な Rust でローダーとカーネル側プログラムの両方を書ける。
+
+#### プロジェクト作成
+
+```bash
+cargo install cargo-generate bpf-linker
+cargo generate https://github.com/aya-rs/aya-template
+```
+
+#### XDP パケットカウンタの例
+
+**カーネル側 (eBPF プログラム):**
+
+```rust title="myapp-ebpf/src/main.rs"
+#![no_std]
+#![no_main]
+
+use aya_ebpf::{bindings::xdp_action, macros::{map, xdp}, maps::PerCpuArray, programs::XdpContext};
+
+#[map]
+static PACKET_COUNT: PerCpuArray<u64> = PerCpuArray::with_max_entries(1, 0);
+
+#[xdp]
+pub fn count_packets(ctx: XdpContext) -> u32 {
+    match try_count(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => xdp_action::XDP_ABORTED,
+    }
+}
+
+fn try_count(_ctx: &XdpContext) -> Result<u32, ()> {
+    let counter = PACKET_COUNT.get_ptr_mut(0).ok_or(())?;
+    // Safety: PerCpuArray なので CPU ごとに独立 — ロック不要
+    unsafe { *counter += 1 };
+    Ok(xdp_action::XDP_PASS)
+}
+
+#[panic_handler]
+fn panic(_info: &core::panic::PanicInfo) -> ! {
+    loop {}
+}
+```
+
+**ユーザ空間 (ローダー):**
+
+```rust title="myapp/src/main.rs"
+use anyhow::Context as _;
+use aya::{programs::{Xdp, XdpFlags}, maps::PerCpuArray, Ebpf};
+use std::{thread, time::Duration};
+
+fn main() -> anyhow::Result<()> {
+    let mut bpf = Ebpf::load(aya::include_bytes_aligned!(concat!(
+        env!("OUT_DIR"), "/myapp-ebpf"
+    )))?;
+
+    let program: &mut Xdp = bpf.program_mut("count_packets")
+        .context("program not found")?
+        .try_into()?;
+
+    program.load()?;
+    program.attach("eth0", XdpFlags::default())?;
+
+    let counters: PerCpuArray<_, u64> = PerCpuArray::try_from(
+        bpf.map("PACKET_COUNT").context("map not found")?
+    )?;
+
+    loop {
+        thread::sleep(Duration::from_secs(1));
+        let total: u64 = counters.get(&0, 0)?
+            .iter()
+            .sum();
+        println!("packets: {total}");
+    }
+}
+```
+
+```bash
+# ビルド・実行
+cargo xtask build-ebpf
+cargo build
+sudo ./target/debug/myapp
+```
+
+### eBPF vs カーネルモジュールの使い分け
+
+| 観点 | eBPF | カーネルモジュール |
+|---|---|---|
+| **安全性** | Verifier が保証 (カーネルクラッシュ不可) | バグ即 oops / panic |
+| **デプロイ** | カーネル再起動不要、動的ロード | insmod で動的ロード可能 |
+| **機能範囲** | 観測・フィルタ・軽量処理 | カーネル API 全体にアクセス可能 |
+| **パフォーマンス** | JIT で高速だが Helper 経由のみ | 制限なし、最高性能 |
+| **カーネル改変** | 不可 (読み取り+軽量操作のみ) | 自由に改変可能 |
+| **開発言語** | C, Rust (Aya) | C, Rust (kernel crate) |
+| **適用例** | 監視, パケットフィルタ, セキュリティポリシー | ドライバ, ファイルシステム, スケジューラ |
+
+**判断基準:** カーネルの振る舞いを**観測**したいなら eBPF、**変更**したいならカーネルモジュール。
+
+## 静的解析: Sparse と Coccinelle
+
+Sparse はカーネル専用の静的解析ツールである。`__user`, `__iomem`, `__kernel` アノテーションの正しさ、エンディアン型 (`__be32`, `__le32`) の混用、ロック違反などを検出する。
+
+```bash
+# Sparse で全コードをチェック
+make C=1 LLVM=1
+
+# 変更ファイルのみチェック
+make C=2 LLVM=1
+```
+
+Coccinelle は「セマンティックパッチ」ツールである。SmPL (Semantic Patch Language) でパターンを記述し、コードの検索と自動変換を行う:
+
+```bash
+# カーネル組み込みの Coccinelle チェックを全て実行
+make coccicheck MODE=report
+
+# 特定のパターンのみ
+make coccicheck COCCI=scripts/coccinelle/api/kfree.cocci
+```
+
+upstream にパッチを送る前に `make C=1` と `make coccicheck` を通すことが強く推奨される。
+
+## perf によるパフォーマンスプロファイリング
+
+`perf` はカーネル組み込みのプロファイリングツールで、ハードウェアパフォーマンスカウンタやソフトウェアイベントを使って CPU 使用状況を解析する。
+
+```bash
+# リアルタイムの CPU 使用率トップ (カーネル + ユーザ空間)
+sudo perf top
+
+# 特定コマンドの実行をプロファイリング
+sudo perf record -g insmod my_module.ko
+sudo perf report
+
+# システム全体の統計 (5秒間)
+sudo perf stat -a sleep 5
+
+# フレームグラフ生成
+sudo perf record -g -a sleep 10
+sudo perf script | stackcollapse-perf.pl | flamegraph.pl > flamegraph.svg
+```
+
+| サブコマンド | 用途 |
+|---|---|
+| `perf top` | リアルタイムプロファイリング |
+| `perf record` + `perf report` | 記録して後から解析 |
+| `perf stat` | ハードウェアカウンタ統計 |
+| `perf probe` | 動的トレースポイントの追加 |
+
+`perf` はカーネルモジュールのホットスポット特定に不可欠なツールである。
+
+## よくある罠
+
+1. **`CONFIG_RANDOMIZE_BASE=y` のまま GDB を使う** — KASLR が有効だとアドレスがランダム化され、シンボルが一致しない。`nokaslr` カーネル引数を忘れずに。
+2. **`lx-symbols` を実行し忘れる** — モジュールのシンボルは手動でロードする必要がある。
+3. **oops の `RIP` 行だけ見る** — Call Trace 全体を見て呼び出し経路を追うこと。
+4. **KASAN を本番カーネルで有効にする** — パフォーマンスが大幅に低下する。開発用のみ。
+5. **`pr_info` をデバイスドライバで使う** — `dev_info` を使わないと、複数デバイス管理時にどのデバイスのログか判別できなくなる。
+6. **ftrace を有効にしたまま放置する** — トレース中はオーバーヘッドが発生する。調査が終わったら `echo 0 > tracing_on` と `echo nop > current_tracer` を忘れずに。
+7. **kprobe でインライン関数をフックしようとする** — インライン展開された関数には kprobe を設置できない。`/sys/kernel/tracing/available_filter_functions` で確認すること。
+8. **eBPF の Verifier エラーを無視する** — Verifier のエラーメッセージは難解だが、ほとんどの場合は境界チェックの不足が原因である。`bpf_probe_read_kernel` で安全に読むか、ポインタの NULL チェックを追加する。
+
+## 章末演習
+
+1. 故意に NULL ポインタを参照するモジュールを書き、oops メッセージを `decode_stacktrace.sh` でデコードせよ。
+
+2. QEMU + GDB で自作モジュールの `init` 関数にブレークポイントを設定し、ステップ実行せよ。
+
+3. `CONFIG_KASAN=y` でビルドしたカーネル上で、故意に use-after-free を起こすモジュールを書き、KASAN の検出メッセージを確認せよ。
+
+4. `pr_debug` を含むモジュールを書き、dynamic debug でログを有効化/無効化できることを確認せよ。
+
+5. ftrace の `function_graph` トレーサで `vfs_write` の呼び出しツリーを取得し、自分のモジュールの `write` ハンドラが含まれていることを確認せよ。
+
+6. bpftrace で以下のワンライナーを実行し、結果を解釈せよ:
+   ```bash
+   bpftrace -e 'tracepoint:syscalls:sys_enter_openat { printf("%s %s\n", comm, str(args->filename)); }'
+   ```
+
+7. (発展) Aya で kprobe プログラムを書き、`vfs_read` が呼ばれるたびに BPF Map にカウントを記録し、ユーザ空間から読み出すプログラムを実装せよ。
+
+## 参考資料
+
+- [Bug Hunting (kernel.org)](https://docs.kernel.org/admin-guide/bug-hunting.html)
+- [GDB Kernel Debugging (kernel.org)](https://docs.kernel.org/dev-tools/gdb-kernel-debugging.html)
+- [KASAN (kernel.org)](https://docs.kernel.org/dev-tools/kasan.html)
+- [KCSAN (kernel.org)](https://docs.kernel.org/dev-tools/kcsan.html)
+- [UBSAN (kernel.org)](https://docs.kernel.org/dev-tools/ubsan.html)
+- [ftrace (kernel.org)](https://docs.kernel.org/trace/ftrace.html)
+- [Kprobes (kernel.org)](https://docs.kernel.org/trace/kprobes.html)
+- [Uprobes (kernel.org)](https://docs.kernel.org/trace/uprobetracer.html)
+- [bpftrace Reference Guide](https://github.com/bpftrace/bpftrace/blob/master/docs/reference_guide.md)
+- [Aya Book](https://aya-rs.dev/book/)
+- [BPF Performance Tools (Brendan Gregg)](https://www.brendangregg.com/bpf-performance-tools-book.html)
+- [Dynamic Debug (kernel.org)](https://docs.kernel.org/admin-guide/dynamic-debug-howto.html)
+- [Sparse (kernel.org)](https://docs.kernel.org/dev-tools/sparse.html)
+- [Coccinelle (kernel.org)](https://docs.kernel.org/dev-tools/coccinelle.html)
+- [perf examples (Brendan Gregg)](https://www.brendangregg.com/perf.html)
+- [perf tutorial (kernel.org)](https://docs.kernel.org/admin-guide/perf/index.html)

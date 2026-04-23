@@ -1,0 +1,1246 @@
+---
+title: "メモリ管理の深層"
+description: "ページテーブル, TLB, Huge Pages, NUMA, ページフォルト, OOM Killer, CoW, mmap 内部 — カーネルメモリ管理の高度なトピック"
+---
+
+## この章で学ぶこと
+
+- ページテーブルの 5 階層構造とウォーク関数を理解する
+- TLB の役割と TLB shootdown の仕組みを説明できる
+- Huge Pages (THP, mTHP, hugetlbfs) の違いと使い分けを把握する
+- NUMA トポロジと NUMA-aware なメモリ割り当てができる
+- ページフォルト処理パスを辿れる
+- OOM Killer の判定基準とチューニング方法を知る
+- Copy-on-Write の仕組みとデバイスドライバへの影響を理解する
+- mmap 内部の VMA 管理とドライバコールバックを使える
+- メモリコンパクション、SLUB デバッグ、kmemleak、メモリホットプラグの概要を把握する
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::alloc::KBox<T>`, `kernel::alloc::KVec<T>`
+🟡 **開発中**: `kernel::mm` (VMA ラッパー — 6.16+, GPU ドライバ向け)
+❌ **未実装**: folio, page table 操作, NUMA API の Rust バインディング
+:::
+
+## 前提
+
+- [Ch 8](/part3-kernel-concepts/08-memory/) (カーネルのメモリ管理) を完了している
+- x86_64 アドレス空間のレイアウト、kmalloc / vmalloc / GFP フラグの基礎を理解している
+
+---
+
+Ch 8 では kmalloc / vmalloc / GFP フラグといったカーネルメモリ管理の基礎を学んだ。
+この章ではその下にある仕組み、すなわちページテーブルがどのようにアドレス変換を行い、
+TLB がどのようにそれを高速化し、ページフォルトが何を引き起こすのかという
+**メモリ管理サブシステムの深層** に踏み込む。
+デバイスドライバ開発者にとっても、mmap コールバックの実装や DMA 後の TLB 整合性、
+NUMA を考慮した割り当てなど、ここで扱う知識は不可欠である。
+
+---
+
+## 1. ページテーブル階層
+
+### 5 レベルページテーブル (x86_64)
+
+x86_64 では、仮想アドレスから物理アドレスへの変換に **多段ページテーブル** を使う。
+Linux 4.14 で 5 レベルページテーブル (57 ビット仮想アドレス) のサポートが追加された。
+現在のカーネルは以下の 5 階層を持つ:
+
+```
+ 63    57 56    48 47    39 38    30 29    21 20    12 11     0
+ ┌──────┬────────┬────────┬────────┬────────┬────────┬────────┐
+ │ sign │ PGD    │ P4D    │ PUD    │ PMD    │ PTE    │ offset │
+ │ ext  │ index  │ index  │ index  │ index  │ index  │        │
+ │(7bit)│ (9bit) │ (9bit) │ (9bit) │ (9bit) │ (9bit) │(12bit) │
+ └──────┴────┬───┴───┬────┴───┬────┴───┬────┴───┬────┴────────┘
+             │       │        │        │        │
+             ▼       ▼        ▼        ▼        ▼
+           ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐ ┌─────┐
+     CR3──▶│ PGD │─▶│ P4D │─▶│ PUD │─▶│ PMD │─▶│ PTE │──▶ 物理ページ
+           │     │  │     │  │     │  │     │  │     │    + offset
+           │512  │  │512  │  │512  │  │512  │  │512  │
+           │entries│ │entries│ │entries│ │entries│ │entries│
+           └─────┘  └─────┘  └─────┘  └─────┘  └─────┘
+```
+
+各レベルのテーブルは **512 個のエントリ** (各 8 バイト = 64 ビット) を持ち、
+テーブル全体で 1 ページ (4096 バイト) に収まる。
+
+### 4 レベルモードでの folding
+
+多くの実環境では 4 レベルページテーブル (48 ビット仮想アドレス) が使われる。
+この場合、P4D レベルは **folding** (折り畳み) される。
+P4D テーブルは物理的に存在せず、PGD エントリが直接 PUD テーブルを指す。
+カーネルコード上は P4D のウォーク関数が呼ばれるが、
+内部で PGD と同一のポインタを返すだけでオーバーヘッドはない。
+
+```c
+/* 5 レベルが無効なら p4d_offset() は pgd をそのまま返す */
+static inline p4d_t *p4d_offset(pgd_t *pgd, unsigned long addr)
+{
+    if (!pgtable_l5_enabled())
+        return (p4d_t *)pgd;
+    return (p4d_t *)pgd_page_vaddr(*pgd) + p4d_index(addr);
+}
+```
+
+### ページテーブルウォーク関数
+
+カーネルがあるプロセスの仮想アドレス `addr` に対応する PTE を見つけるには、
+次のように各レベルを順にたどる:
+
+```c
+#include <linux/mm.h>
+#include <asm/pgtable.h>
+
+pgd_t *pgd;
+p4d_t *p4d;
+pud_t *pud;
+pmd_t *pmd;
+pte_t *pte;
+
+/* mm はプロセスの struct mm_struct */
+pgd = pgd_offset(mm, addr);       /* PGD エントリを取得 */
+if (pgd_none(*pgd) || pgd_bad(*pgd))
+    return -EFAULT;
+
+p4d = p4d_offset(pgd, addr);      /* P4D エントリを取得 */
+if (p4d_none(*p4d) || p4d_bad(*p4d))
+    return -EFAULT;
+
+pud = pud_offset(p4d, addr);      /* PUD エントリを取得 */
+if (pud_none(*pud) || pud_bad(*pud))
+    return -EFAULT;
+
+pmd = pmd_offset(pud, addr);      /* PMD エントリを取得 */
+if (pmd_none(*pmd) || pmd_bad(*pmd))
+    return -EFAULT;
+
+pte = pte_offset_map(pmd, addr);  /* PTE エントリを取得 */
+if (!pte)
+    return -EFAULT;
+
+/* pte_val(*pte) で PTE の生の値を読める */
+pte_unmap(pte);
+```
+
+各 `*_offset()` 関数は上位テーブルのエントリから下位テーブルの仮想アドレスを算出し、
+`addr` のインデックスビットで該当エントリを返す。
+
+### ページテーブルエントリのフラグ
+
+PTE (および上位エントリ) の下位ビットには、ハードウェアとカーネルが使うフラグが格納される:
+
+| ビット | フラグ名 | 意味 |
+|---|---|---|
+| 0 | `_PAGE_PRESENT` | エントリが有効。0 ならページフォルト発生 |
+| 1 | `_PAGE_RW` | 書き込み可能。0 なら読み取り専用 |
+| 2 | `_PAGE_USER` | ユーザモードからアクセス可能。0 ならカーネルのみ |
+| 5 | `_PAGE_ACCESSED` | ハードウェアが読み取り時にセット。ページ回収で参照 |
+| 6 | `_PAGE_DIRTY` | ハードウェアが書き込み時にセット。ライトバックが必要 |
+| 7 | `_PAGE_PSE` | Huge page (PMD レベルで 2 MB, PUD レベルで 1 GB) |
+| 63 | `_PAGE_NX` | No-Execute。実行不可 (NX ビット、セキュリティ向上) |
+
+カーネルはこれらのフラグを操作するヘルパー関数を提供する:
+
+```c
+pte_present(pte)    /* PRESENT フラグが立っているか */
+pte_write(pte)      /* RW フラグが立っているか */
+pte_dirty(pte)      /* DIRTY フラグが立っているか */
+pte_young(pte)      /* ACCESSED フラグが立っているか */
+pte_mkwrite(pte)    /* RW フラグをセットした PTE を返す */
+pte_mkdirty(pte)    /* DIRTY フラグをセットした PTE を返す */
+pte_mkyoung(pte)    /* ACCESSED フラグをセットした PTE を返す */
+pte_wrprotect(pte)  /* RW フラグをクリアした PTE を返す */
+```
+
+---
+
+## 2. TLB (Translation Lookaside Buffer)
+
+### TLB とは
+
+ページテーブルウォークは 4-5 回のメモリアクセスを伴い、非常にコストが高い。
+**TLB** は CPU 内のハードウェアキャッシュで、最近変換した
+**仮想アドレス → 物理アドレス** のマッピングを保持する。
+
+TLB ヒット時はページテーブルウォークが不要になり、メモリアクセスは 1 サイクル程度で完了する。
+TLB ミス時は CPU がページテーブルウォークを実行し (x86 ではハードウェアウォーカーが自動実行)、
+結果を TLB にキャッシュする。
+
+```
+  CPU
+  ┌───────────────────────────────────────────────┐
+  │              仮想アドレス                       │
+  │                   │                             │
+  │              ┌────▼────┐                        │
+  │              │   TLB   │                        │
+  │              │ VA → PA │                        │
+  │              └────┬────┘                        │
+  │           ┌───────┴───────┐                     │
+  │       ヒット             ミス                    │
+  │           │               │                     │
+  │      物理アドレス    ページテーブル               │
+  │           │          ウォーク                    │
+  │           │               │                     │
+  │           └───────┬───────┘                     │
+  │              物理アドレス                        │
+  └───────────────────┬───────────────────────────┘
+                      ▼
+                  物理メモリ
+```
+
+### TLB shootdown
+
+マルチプロセッサ環境では、各 CPU が独自の TLB を持つ。
+あるプロセスのページテーブルを変更した場合 (ページの unmap、パーミッション変更など)、
+そのプロセスが過去に実行された **全 CPU の TLB を無効化** しなければならない。
+これを **TLB shootdown** と呼ぶ。
+
+TLB shootdown の手順は以下の通り:
+
+1. ページテーブルエントリを変更する
+2. 自 CPU の該当 TLB エントリを無効化する
+3. 他の CPU に **IPI (Inter-Processor Interrupt)** を送信する
+4. IPI を受けた各 CPU が自身の TLB エントリを無効化する
+5. 全 CPU の完了を待つ
+
+カーネルが提供する主な TLB 無効化関数:
+
+```c
+flush_tlb_all()          /* 全 CPU の全 TLB エントリをフラッシュ */
+flush_tlb_mm(mm)         /* mm に関連する全 TLB エントリをフラッシュ */
+flush_tlb_range(vma, start, end)  /* 指定範囲の TLB エントリをフラッシュ */
+flush_tlb_page(vma, addr)         /* 1 ページ分の TLB エントリをフラッシュ */
+flush_tlb_kernel_range(start, end) /* カーネル空間の範囲をフラッシュ */
+```
+
+### TLB フラッシュの性能影響
+
+TLB shootdown は IPI 送信と全 CPU での同期を伴うため、非常にコストが高い。
+特に CPU コア数が多いシステム (数百コア) では、IPI のオーバーヘッドが深刻になる。
+以下のケースで頻繁な TLB フラッシュが発生する:
+
+- `munmap()` や `mprotect()` の頻繁な呼び出し
+- 大量のプロセス fork/exit
+- `vmalloc` / `vfree` の繰り返し (カーネル空間のページテーブル変更)
+
+パフォーマンスチューニングでは、`perf stat` で `tlb:tlb_flush` トレースポイントを
+監視し、フラッシュ頻度が異常に高くないか確認する:
+
+```bash
+perf stat -e tlb:tlb_flush -a -- sleep 10
+```
+
+### PCID (Process Context ID)
+
+**PCID** は x86_64 (Haswell 以降) で利用できるハードウェア機能で、
+TLB エントリにプロセス識別子 (12 ビット、最大 4096 個) をタグ付けする。
+コンテキストスイッチ時にTLB を全フラッシュする代わりに、
+新プロセスの PCID でフィルタリングするだけで済む。
+
+PCID がない場合、`CR3` レジスタを書き換えるたびに全 TLB エントリが無効化されていた。
+PCID が有効なら、異なるプロセスの TLB エントリが共存でき、
+コンテキストスイッチのコストが大幅に削減される。
+
+```bash
+# PCID がサポートされているか確認
+grep pcid /proc/cpuinfo
+```
+
+Linux は `CR3` の bit 63 に `NOFLUSH` ビットをセットすることで、
+CR3 書き換え時の暗黙的 TLB フラッシュを抑制する。
+`CONFIG_PAGE_TABLE_ISOLATION` (KPTI、Meltdown 対策) では
+カーネル空間とユーザ空間で異なるページテーブルを使い分けるため、
+PCID なしでは CR3 切り替えのたびに TLB フラッシュが発生し、
+性能劣化が深刻であった。PCID によりこのオーバーヘッドは大幅に軽減されている。
+
+---
+
+## 3. Huge Pages
+
+### なぜ Huge Pages が必要か
+
+通常のページサイズは 4 KB である。しかし大量のメモリ (数十 GB) を扱うアプリケーションでは、
+ページ数が膨大になり、以下の問題が生じる:
+
+- **TLB ミスの増加**: TLB エントリ数は有限 (数百～数千)。4 KB ページでは数 MB しかカバーできない
+- **ページテーブルのメモリ消費**: 1 TB のメモリに対して数 GB のページテーブルが必要
+- **ページテーブルウォークの増加**: TLB ミスのたびに 4-5 回のメモリアクセス
+
+Huge Pages はページサイズを大きくすることで、これらの問題を解決する。
+
+### ページサイズとテーブルレベルの関係
+
+| ページサイズ | テーブルレベル | 1 TLB エントリのカバー範囲 |
+|---|---|---|
+| 4 KB | PTE | 4 KB |
+| 2 MB | PMD (Huge Page) | 2 MB (= 512 x 4 KB) |
+| 1 GB | PUD (Huge Page) | 1 GB (= 512 x 2 MB) |
+
+2 MB の Huge Page は PMD エントリに `_PAGE_PSE` フラグを立てることで実現される。
+この場合、PMD エントリが直接物理ページ (2 MB) を指し、PTE レベルのテーブルは存在しない。
+同様に 1 GB の Huge Page は PUD エントリに `_PAGE_PSE` を立てる。
+
+```
+ 通常 (4 KB ページ):
+   PGD → P4D → PUD → PMD → PTE → 4 KB ページ
+
+ 2 MB Huge Page:
+   PGD → P4D → PUD → PMD ──────→ 2 MB ページ
+                          (PSE=1)
+
+ 1 GB Huge Page:
+   PGD → P4D → PUD ──────────→ 1 GB ページ
+                    (PSE=1)
+```
+
+### THP (Transparent Huge Pages)
+
+THP はカーネルが **自動的に** 4 KB ページを 2 MB の Huge Page に昇格させる機能である。
+アプリケーション側のコード変更は不要で、カーネルがバックグラウンドで以下を行う:
+
+1. 連続する 512 個の 4 KB ページが同一プロセスに属しているかチェック
+2. 物理メモリ上で 2 MB 境界に整列した連続領域が確保可能か確認
+3. 条件を満たせば、512 個の PTE を 1 つの PMD エントリ (Huge Page) に統合
+
+THP の制御:
+
+```bash
+# THP の現在の設定を確認
+cat /sys/kernel/mm/transparent_hugepage/enabled
+# [always] madvise never
+
+# always: 常に THP を試みる
+# madvise: madvise(MADV_HUGEPAGE) を呼んだ領域のみ
+# never:  THP を無効化
+echo madvise > /sys/kernel/mm/transparent_hugepage/enabled
+```
+
+**注意**: THP はデータベース (PostgreSQL など) のワークロードでレイテンシスパイクを
+引き起こすことがある。これは `khugepaged` デーモンがページの統合 (compaction) を
+行う際に mmap_lock を長時間保持するためである。
+本番環境では `madvise` モードを推奨する。
+
+### mTHP (multi-size THP)
+
+Linux 6.8 で導入された mTHP は、2 MB 固定ではなく、
+**2 のべき乗サイズ** (16 KB, 32 KB, 64 KB, ..., 2 MB) の Huge Page をサポートする。
+これにより、2 MB の連続物理メモリが確保できない場合でも、
+64 KB や 256 KB 単位で部分的に Huge Page を構成できる。
+
+```bash
+# mTHP の設定を確認 (例: 64 KB)
+cat /sys/kernel/mm/transparent_hugepage/hugepages-64kB/enabled
+```
+
+mTHP はメモリ断片化が進んだ環境でも Huge Page の恩恵を受けやすくする。
+
+### hugetlbfs: 事前確保型 Huge Pages
+
+hugetlbfs は Huge Pages を **事前に確保** してプールしておく仕組みである。
+THP と異なり、確保は起動時やシステム管理者の操作で明示的に行う。
+
+```bash
+# 2 MB Huge Pages を 1024 個確保 (= 2 GB)
+echo 1024 > /proc/sys/vm/nr_hugepages
+
+# 確保状況を確認
+cat /proc/meminfo | grep Huge
+# HugePages_Total:    1024
+# HugePages_Free:     1024
+# HugePages_Rsvd:        0
+# Hugepagesize:       2048 kB
+
+# 1 GB Huge Pages は起動時にカーネルパラメータで指定
+# (起動後の確保は困難: 連続 1 GB 物理メモリが必要)
+# カーネルパラメータ: hugepagesz=1G hugepages=4
+```
+
+hugetlbfs はファイルシステムとしてマウントし、`mmap` 経由で使用する:
+
+```bash
+mount -t hugetlbfs none /mnt/hugepages
+```
+
+```c
+#include <sys/mman.h>
+
+/* 2 MB Huge Page を使った mmap */
+void *p = mmap(NULL, 2 * 1024 * 1024,
+               PROT_READ | PROT_WRITE,
+               MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB,
+               -1, 0);
+```
+
+hugetlbfs は DPDK や大規模データベースで広く使われている。
+THP と比べてレイテンシスパイクが発生しにくいという利点がある。
+
+---
+
+## 4. NUMA (Non-Uniform Memory Access)
+
+### NUMA トポロジ
+
+マルチソケットシステムでは、CPU ごとに **ローカルメモリ** が接続されている。
+自ソケットのメモリ (ローカル) へのアクセスは高速だが、
+他ソケットのメモリ (リモート) へのアクセスはインターコネクト (QPI / UPI / Infinity Fabric)
+を経由するため遅い。
+
+```
+  ┌─────────────────────────┐     ┌─────────────────────────┐
+  │      NUMA Node 0        │     │      NUMA Node 1        │
+  │                         │     │                         │
+  │  ┌─────┐  ┌─────┐      │     │      ┌─────┐  ┌─────┐  │
+  │  │CPU 0│  │CPU 1│      │     │      │CPU 2│  │CPU 3│  │
+  │  └──┬──┘  └──┬──┘      │     │      └──┬──┘  └──┬──┘  │
+  │     └────┬───┘          │     │         └────┬───┘     │
+  │     ┌────▼────┐         │     │         ┌────▼────┐    │
+  │     │ Memory  │         │     │         │ Memory  │    │
+  │     │ (ローカル)│       │     │         │ (ローカル)│  │
+  │     │  32 GB  │         │     │         │  32 GB  │    │
+  │     └─────────┘         │     │         └─────────┘    │
+  └────────────┬────────────┘     └─────────────┬──────────┘
+               │          インターコネクト        │
+               └────────── (UPI / QPI) ──────────┘
+                     アクセス遅延: ~100 ns
+```
+
+ローカルメモリへのアクセスレイテンシが約 80 ns だとすると、
+リモートメモリへは約 130-150 ns かかる (約 1.5-2 倍)。
+
+### カーネルでの NUMA
+
+カーネルはメモリを **ノード** 単位で管理する。
+各ノードは `struct pglist_data` (= `pg_data_t`) で表現され、
+ゾーン (ZONE_DMA, ZONE_NORMAL, ZONE_MOVABLE) を持つ。
+
+```c
+#include <linux/topology.h>
+#include <linux/slab.h>
+
+/* 現在の CPU が属する NUMA ノード ID を取得 */
+int node = numa_node_id();
+pr_info("current NUMA node: %d\n", node);
+
+/* 特定ノードからメモリを確保 */
+void *buf = kmalloc_node(4096, GFP_KERNEL, node);
+if (!buf)
+    return -ENOMEM;
+
+/* ノード 0 に確保 (明示的) */
+void *buf0 = kmalloc_node(4096, GFP_KERNEL, 0);
+```
+
+NUMA-aware なメモリ割り当ては、ネットワークドライバで特に重要である。
+NIC が接続された PCIe バスに最も近い NUMA ノードからバッファを確保することで、
+パケット処理のレイテンシを削減できる:
+
+```c
+#include <linux/device.h>
+
+/* デバイスが接続されている NUMA ノードから確保 */
+int node = dev_to_node(&pdev->dev);
+struct my_ring *ring = kmalloc_node(sizeof(*ring), GFP_KERNEL, node);
+```
+
+### ページマイグレーション
+
+カーネルはページを NUMA ノード間で移動 (**マイグレーション**) できる。
+プロセスが別のノードの CPU にスケジュールされた場合、
+メモリをローカルノードに移動することで性能を改善する。
+
+ユーザ空間からは `move_pages(2)` や `mbind(2)` システムコールで制御する。
+カーネル内部では `migrate_pages()` が使用される。
+
+### NUMA 情報の確認
+
+```bash
+# NUMA トポロジを表示
+numactl --hardware
+# available: 2 nodes (0-1)
+# node 0 cpus: 0 1 2 3
+# node 0 size: 32768 MB
+# node 1 cpus: 4 5 6 7
+# node 1 size: 32768 MB
+# node distances:
+# node   0   1
+#   0:  10  21
+#   1:  21  10
+
+# NUMA ノードごとのメモリ統計
+numastat
+
+# 特定ノードにバインドして実行
+numactl --membind=0 --cpunodebind=0 ./my_app
+
+# ページがどのノードに配置されているか確認
+cat /proc/<pid>/numa_maps
+```
+
+`node distances` の値はアクセスレイテンシの相対値で、10 がローカル、
+21 がリモートの場合、リモートはローカルの約 2.1 倍遅いことを意味する。
+
+---
+
+## 5. ページフォルト処理パス
+
+### ページフォルトとは
+
+CPU が仮想アドレスにアクセスした際に、
+対応するページテーブルエントリが「有効でない」場合に発生する例外である。
+ページフォルトは必ずしもエラーではなく、以下のような正常な処理を行うために利用される:
+
+- **デマンドページング**: まだ物理メモリを割り当てていないページに初めてアクセスした
+- **Copy-on-Write**: 読み取り専用マークされた共有ページに書き込もうとした
+- **スワップイン**: スワップアウトされたページを再読み込みする
+- **スタック拡張**: スタックの限界を超えたアクセスでスタックを自動拡張する
+
+### 処理フローの全体像
+
+```
+  ユーザ空間 / カーネル空間でメモリアクセス
+                   │
+                   ▼
+          ┌────────────────┐
+          │  CPU 例外発生   │  PTE が present=0, または権限違反
+          │  #PF (x86)     │
+          └───────┬────────┘
+                  │
+                  ▼
+         ┌─────────────────┐
+         │ do_page_fault() │  arch/x86/mm/fault.c
+         │                 │  - フォルトアドレス: CR2 レジスタから取得
+         │                 │  - error_code: 読み/書き, ユーザ/カーネル等
+         └────────┬────────┘
+                  │
+          ┌───────┴───────┐
+          │               │
+     カーネル空間      ユーザ空間
+     フォルト          フォルト
+          │               │
+          ▼               ▼
+   vmalloc fault    ┌───────────────┐
+   等の処理         │ VMA を検索     │  find_vma(mm, addr)
+                    │ (maple tree)  │
+                    └───────┬───────┘
+                            │
+                    ┌───────┴──────────┐
+                    │                  │
+                VMA あり           VMA なし
+                    │                  │
+                    ▼                  ▼
+          ┌─────────────────┐    SIGSEGV 送信
+          │ アクセス権チェック│   (セグフォ)
+          │ vm_flags vs     │
+          │ error_code      │
+          └────────┬────────┘
+                   │ 権限 OK
+                   ▼
+          ┌────────────────────┐
+          │ handle_mm_fault()  │  mm/memory.c
+          └────────┬───────────┘
+                   │
+                   ▼
+          ┌────────────────────┐
+          │ __handle_mm_fault()│  ページテーブルの各レベルを確認/作成
+          │                    │  PGD → P4D → PUD → PMD を確保
+          └────────┬───────────┘
+                   │
+                   ▼
+          ┌────────────────────┐
+          │ handle_pte_fault() │
+          └────────┬───────────┘
+                   │
+           ┌───────┼───────┬──────────┐
+           │       │       │          │
+           ▼       ▼       ▼          ▼
+        PTE なし  swap   CoW 発生   その他
+        (初回     エントリ  (後述)
+         アクセス)   │
+           │       │
+           ▼       ▼
+      do_anonymous  do_swap_page()
+      _page() or    スワップから
+      do_fault()    読み込み
+      ページ確保
+      PTE 設定
+```
+
+### デマンドページング
+
+`malloc()` や `mmap()` でメモリを「確保」しても、
+カーネルは即座に物理ページを割り当てない。
+VMA (仮想メモリ領域) を作成するだけで、ページテーブルエントリは設定しない。
+実際にアクセスが発生した時点で初めてページフォルトが発生し、
+カーネルが物理ページを割り当てて PTE を設定する。これが **デマンドページング** である。
+
+```c
+/* ユーザ空間 */
+char *p = malloc(1024 * 1024);   /* 1 MB "確保" */
+/* この時点では物理メモリは未割り当て */
+
+p[0] = 'A';  /* ページフォルト → 最初の 4 KB ページが割り当てられる */
+p[4096] = 'B';  /* ページフォルト → 2 番目の 4 KB ページが割り当てられる */
+/* 残りの ~254 ページはまだ未割り当て */
+```
+
+### スタック拡張
+
+スタックの末端を超えてアクセスした場合、VMA の `vm_flags` に `VM_GROWSDOWN` が
+設定されていれば、カーネルはスタック VMA を自動的に拡張する。
+`expand_stack()` が呼ばれ、VMA の `vm_start` を下方に移動し、
+新しいページテーブルエントリを設定する。
+
+ただし、`RLIMIT_STACK` (通常 8 MB) を超える拡張はできず、
+SIGSEGV が送信される (スタックオーバーフロー)。
+
+---
+
+## 6. OOM Killer
+
+### OOM Killer とは
+
+物理メモリもスワップも枯渇し、あらゆるメモリ回収手段を試しても
+空きメモリが確保できない状態を **OOM (Out of Memory)** と呼ぶ。
+この時、カーネルの **OOM Killer** がプロセスを強制終了して
+メモリを解放する。
+
+### OOM スコアの計算
+
+OOM Killer はどのプロセスを殺すかを **oom_score** に基づいて判定する。
+スコアが最も高いプロセスが選ばれる。
+
+```
+oom_score = RSS に基づくベーススコア + oom_score_adj の補正
+```
+
+- **ベーススコア**: プロセスの RSS (Resident Set Size) に比例。
+  メモリを大量に使っているプロセスほどスコアが高い
+- **oom_score_adj**: -1000 から 1000 の範囲でユーザが調整可能
+
+```bash
+# プロセスの OOM スコアを確認
+cat /proc/<pid>/oom_score
+
+# OOM スコア調整値を確認 / 設定
+cat /proc/<pid>/oom_score_adj
+echo -500 > /proc/<pid>/oom_score_adj
+
+# -1000 に設定すると OOM Killer の対象から除外
+# (重要なデーモン用: systemd, sshd 等)
+echo -1000 > /proc/<pid>/oom_score_adj
+```
+
+oom_score_adj の値は以下のように作用する:
+
+| 値 | 効果 |
+|---|---|
+| -1000 | OOM Killer の対象外。絶対に殺されない |
+| -500 | スコアが大幅に低下。殺されにくくなる |
+| 0 | デフォルト。通常の判定 |
+| +500 | スコアが大幅に上昇。殺されやすくなる |
+| +1000 | 最優先で殺される |
+
+### Per-cgroup OOM (cgroups v2)
+
+cgroups v2 では、cgroup 単位でメモリ制限を設定でき、
+cgroup 内で OOM が発生した場合はそのcgroup 内のプロセスだけが
+OOM Killer の対象になる。システム全体に影響しない。
+
+```bash
+# cgroup のメモリ上限を設定 (cgroups v2)
+echo 512M > /sys/fs/cgroup/my_app/memory.max
+
+# 現在のメモリ使用量を確認
+cat /sys/fs/cgroup/my_app/memory.current
+
+# OOM イベントの監視
+cat /sys/fs/cgroup/my_app/memory.events
+# oom 3        ← OOM が 3 回発生
+# oom_kill 2   ← OOM Kill が 2 回実行
+```
+
+`memory.max` を超えてメモリを割り当てようとすると、
+まず cgroup 内のメモリ回収が試みられ、それでも不足する場合に
+cgroup 内の OOM Killer が発動する。
+
+### OOM のデバッグ
+
+OOM が発生すると、`dmesg` に詳細なログが出力される:
+
+```
+[  345.678] Out of memory: Killed process 12345 (my_app) total-vm:1234567kB,
+            anon-rss:987654kB, file-rss:1234kB, shmem-rss:0kB, UID:1000
+            pgtables:5678kB oom_score_adj:0
+```
+
+このログから、どのプロセスがどれだけのメモリを使用していたか、
+oom_score_adj はいくつだったかを確認できる。
+
+---
+
+## 7. Copy-on-Write (CoW)
+
+### CoW の仕組み
+
+`fork()` システムコールでプロセスを複製する際、
+カーネルは親プロセスの全ページを子プロセスに **コピーしない**。
+代わりに、親子で同じ物理ページを **共有** し、
+両者のページテーブルエントリを **読み取り専用** に設定する。
+
+どちらかのプロセスがページに **書き込もうとした** 時点でページフォルトが発生し、
+カーネルがそのページだけを **コピー** して書き込み可能にする。
+これが **Copy-on-Write (CoW)** である。
+
+```
+  fork() 直後:
+  ┌──────────────────┐     ┌──────────────────┐
+  │  親プロセス        │     │  子プロセス        │
+  │  PTE: RO ─────────┼──┬──┼─ PTE: RO          │
+  │  PTE: RO ─────────┼──┼──┼─ PTE: RO          │
+  │  PTE: RO ─────────┼──┼──┼─ PTE: RO          │
+  └──────────────────┘  │  └──────────────────┘
+                        │
+                   物理ページ (共有, refcount=2)
+
+  子が書き込み:
+  ┌──────────────────┐     ┌──────────────────┐
+  │  親プロセス        │     │  子プロセス        │
+  │  PTE: RO ─────────┼──┐  │                   │
+  │  PTE: RO ─────────┼──┼──┼─ PTE: RO          │
+  │  PTE: RO ─────────┼──┼──┼─ PTE: RO          │
+  └──────────────────┘  │  └──────┬───────────┘
+                        │         │
+                   元ページ    コピーされたページ
+                  (refcount=1) (RW, refcount=1)
+```
+
+### CoW とデバイスドライバ
+
+デバイスドライバが `mmap` でデバイスメモリをユーザ空間にマッピングしている場合、
+`fork()` 後の CoW の扱いに注意が必要である。
+
+`remap_pfn_range()` でマッピングした領域は `VM_PFNMAP` フラグが設定され、
+通常の CoW は行われない。しかし、`vm_insert_page()` などでマッピングした場合は
+CoW の対象になりうる。fork 後に親子両方がデバイスメモリに書き込むと、
+意図しないコピーが発生する可能性がある。
+
+これを防ぐには、VMA に `VM_DONTCOPY` フラグを設定する:
+
+```c
+static int my_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+    /* fork 時にこの VMA を子プロセスにコピーしない */
+    vm_flags_set(vma, VM_DONTCOPY);
+
+    return remap_pfn_range(vma, vma->vm_start,
+                           phys >> PAGE_SHIFT,
+                           vma->vm_end - vma->vm_start,
+                           vma->vm_page_prot);
+}
+```
+
+ユーザ空間からは `madvise(addr, len, MADV_DONTFORK)` で同様の効果を得られる。
+
+---
+
+## 8. mmap 内部
+
+### struct vm_area_struct (VMA)
+
+プロセスの仮想アドレス空間は、**VMA** (Virtual Memory Area) のリストで管理される。
+各 VMA は連続した仮想アドレス範囲を表し、同じ属性 (権限、バッキングファイル等) を持つ。
+
+```c
+struct vm_area_struct {
+    unsigned long vm_start;     /* 開始仮想アドレス (含む) */
+    unsigned long vm_end;       /* 終了仮想アドレス (含まない) */
+    pgoff_t vm_pgoff;           /* ファイル内のオフセット (ページ単位) */
+    vm_flags_t vm_flags;        /* アクセス権限、挙動フラグ */
+    struct file *vm_file;       /* バッキングファイル (NULL = anonymous) */
+    const struct vm_operations_struct *vm_ops;  /* 操作コールバック */
+    struct mm_struct *vm_mm;    /* 所属する mm_struct */
+    /* ... */
+};
+```
+
+主な `vm_flags`:
+
+| フラグ | 意味 |
+|---|---|
+| `VM_READ` | 読み取り可能 |
+| `VM_WRITE` | 書き込み可能 |
+| `VM_EXEC` | 実行可能 |
+| `VM_SHARED` | 共有マッピング (変更がファイルに反映) |
+| `VM_GROWSDOWN` | 下方に拡張可能 (スタック用) |
+| `VM_PFNMAP` | ページフレームナンバーベースのマッピング |
+| `VM_DONTCOPY` | fork 時にコピーしない |
+| `VM_DONTEXPAND` | mremap で拡張不可 |
+| `VM_IO` | I/O メモリ領域 |
+
+### VMA の管理: Maple Tree
+
+Linux 6.1 以前は、VMA を赤黒木 (`rb_tree`) で管理していた。
+Linux 6.1 で **Maple Tree** に置き換えられた。Maple Tree は B-tree の変種で、
+以下の利点がある:
+
+- RCU (Read-Copy-Update) との親和性が高く、読み取り側がロックフリー
+- キャッシュライン効率が良い (B-tree のノード構造)
+- VMA 検索 (`find_vma`) の性能が向上
+
+```c
+/* VMA の検索 */
+struct vm_area_struct *vma = find_vma(mm, addr);
+/* addr を含む、または addr より後ろにある最初の VMA を返す */
+
+/* addr を含む VMA だけを返す */
+struct vm_area_struct *vma = vma_lookup(mm, addr);
+```
+
+プロセスの VMA 一覧は `/proc/<pid>/maps` で確認できる:
+
+```bash
+cat /proc/self/maps
+# アドレス範囲          権限 オフセット デバイス inode  パス
+# 55d4a8a00000-55d4a8a02000 r--p 00000000 08:01 1234  /usr/bin/cat
+# 55d4a8a02000-55d4a8a06000 r-xp 00002000 08:01 1234  /usr/bin/cat
+# 7f8e12000000-7f8e12021000 rw-p 00000000 00:00 0     [heap]
+# 7ffd34100000-7ffd34121000 rw-p 00000000 00:00 0     [stack]
+```
+
+### ドライバの .mmap コールバック
+
+デバイスドライバが `mmap` をサポートするには、
+`file_operations` に `.mmap` コールバックを実装する。
+
+```c
+static int my_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+    unsigned long size = vma->vm_end - vma->vm_start;
+    unsigned long pfn = virt_to_phys(my_buffer) >> PAGE_SHIFT;
+
+    /* キャッシュ無効化 (デバイスメモリ用) */
+    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+    /* 物理ページをユーザ空間にマッピング */
+    if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot))
+        return -EAGAIN;
+
+    return 0;
+}
+
+static const struct file_operations my_fops = {
+    .owner = THIS_MODULE,
+    .mmap  = my_mmap,
+    /* ... */
+};
+```
+
+`remap_pfn_range()` は指定した物理ページフレームナンバー (`pfn`) を
+VMA の仮想アドレス範囲にマッピングするページテーブルエントリを作成する。
+
+### .fault コールバック: オンデマンドページ割り当て
+
+すべてのページを一度にマッピングするのではなく、
+アクセスされた時点で 1 ページずつ割り当てることもできる。
+これには `vm_operations_struct` の `.fault` コールバックを使う:
+
+```c
+static vm_fault_t my_fault(struct vm_fault *vmf)
+{
+    struct page *page;
+    unsigned long offset = vmf->pgoff << PAGE_SHIFT;
+
+    /* offset に対応するページを確保・取得 */
+    page = alloc_page(GFP_KERNEL);
+    if (!page)
+        return VM_FAULT_OOM;
+
+    /* ページの内容を初期化 */
+    memset(page_address(page), 0, PAGE_SIZE);
+
+    /* vmf にページをセット */
+    vmf->page = page;
+    return 0;
+}
+
+static const struct vm_operations_struct my_vm_ops = {
+    .fault = my_fault,
+};
+
+static int my_mmap(struct file *filp, struct vm_area_struct *vma)
+{
+    vma->vm_ops = &my_vm_ops;
+    return 0;
+}
+```
+
+`.fault` コールバックはページフォルト処理パスから呼ばれる。
+`handle_pte_fault()` → `do_fault()` → `vma->vm_ops->fault()` という流れである。
+
+---
+
+## 9. メモリコンパクション
+
+### コンパクションとは
+
+Buddy アロケータは連続した物理ページのブロック (order-0 = 4 KB, order-1 = 8 KB, ... order-10 = 4 MB) を管理している。
+システムが長時間稼働すると、空きページが断片化し、
+**高 order の連続ページが確保できなくなる** ことがある。
+Huge Pages (2 MB = order-9) の確保は特にこの影響を受ける。
+
+**メモリコンパクション** は、使用中のページを移動して
+連続した空き領域を作り出す処理である。
+
+```
+ コンパクション前:
+ [使用][空き][使用][空き][使用][空き][使用][空き]
+
+ コンパクション後:
+ [使用][使用][使用][使用][空き][空き][空き][空き]
+                          └─── 連続空き領域 ───┘
+```
+
+### コンパクションの仕組み
+
+コンパクションは 2 つのスキャナが物理メモリ領域の両端から走査する:
+
+1. **Migration scanner**: 低アドレス側から走査し、移動可能なページを見つける
+2. **Free scanner**: 高アドレス側から走査し、空きページを見つける
+
+2 つのスキャナが出会った時点でコンパクションが完了する。
+移動可能なページは `MIGRATE_MOVABLE` タイプのページで、
+ユーザプロセスの anonymous ページやファイルキャッシュが該当する。
+カーネルのスラブオブジェクトは通常移動できない (`MIGRATE_UNMOVABLE`)。
+
+### movable_operations コールバック
+
+カーネルオブジェクトを移動可能にするには、`movable_operations` 構造体を実装する:
+
+```c
+static const struct movable_operations my_movable_ops = {
+    .isolate_page  = my_isolate_page,   /* ページを LRU から分離 */
+    .migrate_page  = my_migrate_page,   /* ページを新しい場所にコピー */
+    .putback_page  = my_putback_page,   /* 移動失敗時にページを元に戻す */
+};
+```
+
+### 手動でのコンパクション実行
+
+```bash
+# システム全体のコンパクションを実行
+echo 1 > /proc/sys/vm/compact_memory
+
+# 断片化の状態を確認
+cat /proc/buddyinfo
+# Node 0, zone   Normal  12345  6789  3456  1234  567  234  89  23  5  1  0
+#                 order-0  ord1  ord2  ord3  ord4 ord5 ord6 ord7 ord8 ord9 ord10
+
+# /proc/pagetypeinfo で移動可能性ごとの内訳を確認
+cat /proc/pagetypeinfo
+```
+
+`/proc/buddyinfo` の各数値は、その order の空きブロック数を示す。
+order-9 (2 MB) のブロック数が 0 なら、THP の新規確保は失敗する。
+
+---
+
+## 10. SLUB デバッグ
+
+### SLUB デバッグとは
+
+[Ch 8](/part3-kernel-concepts/08-memory/) で学んだ SLUB アロケータには、
+メモリ破壊やリーク検出のための強力なデバッグ機能が組み込まれている。
+`CONFIG_SLUB_DEBUG` を有効にしてカーネルを構成する必要がある。
+
+### slub_debug ブートパラメータ
+
+```
+slub_debug=FPZU
+```
+
+各文字の意味:
+
+| フラグ | 名前 | 機能 |
+|---|---|---|
+| `F` | Sanity checks | 各割り当て/解放時にメタデータの整合性をチェック |
+| `P` | Poisoning | 解放時にオブジェクトを特定パターン (`0x6b`) で埋める |
+| `Z` | Red zoning | オブジェクトの前後にガードバイトを配置 |
+| `U` | User tracking | 割り当て/解放のコールサイトを記録 |
+
+特定のスラブキャッシュだけにデバッグを適用することもできる:
+
+```bash
+# kmalloc-256 だけに全デバッグを有効化
+slub_debug=FPZU,kmalloc-256
+```
+
+### Red Zone (バッファオーバーフロー検出)
+
+Red Zone はオブジェクトの前後に配置されるガードバイト (`0xcc`) である。
+`kfree()` 時にガードバイトが書き換えられていないかチェックし、
+バッファオーバーフローを検出する。
+
+```
+  ┌──────────┬──────────────────┬──────────┐
+  │ Red Zone │   オブジェクト     │ Red Zone │
+  │ (0xcc...)│   (ユーザデータ)   │ (0xcc...)│
+  └──────────┴──────────────────┴──────────┘
+
+  バッファオーバーフローが発生した場合:
+  ┌──────────┬──────────────────┬──────────┐
+  │ Red Zone │   オブジェクト     │XXXXXXXXX│ ← 0xcc 以外の値
+  │ (0xcc...)│   (ユーザデータ)   │ (破壊!) │    → 検出!
+  └──────────┴──────────────────┴──────────┘
+```
+
+検出時のカーネルログ例:
+
+```
+BUG kmalloc-64 (Not tainted): Right Redzone overwritten
+Redzone  00000000deadbeef: cc cc cc cc cc cc cc cc  ........
+Object   0000000012345678: 41 41 41 41 41 41 41 41  AAAAAAAA
+Redzone  00000000cafebabe: 41 41 41 41 cc cc cc cc  AAAA....
+                           ^^^^^^^^^^^ 書き過ぎ!
+```
+
+### Poisoning (Use-After-Free 検出)
+
+`kfree()` 時にオブジェクトを `0x6b` で埋める。
+再度 `kmalloc()` で取得した際に `0x6b` パターンが壊れていれば、
+解放後のメモリに不正アクセスがあったことがわかる。
+
+```c
+/* 典型的な Use-After-Free バグ */
+struct my_struct *p = kmalloc(sizeof(*p), GFP_KERNEL);
+p->value = 42;
+kfree(p);
+/* ここから p は無効 */
+pr_info("value = %d\n", p->value);  /* ← Use-After-Free! */
+/* Poisoning が有効なら p->value は 0x6b6b6b6b になっている */
+```
+
+### User Tracking (コールサイト記録)
+
+`U` フラグを有効にすると、各オブジェクトの割り当てと解放のコールスタックが記録される。
+メモリ破壊が検出された際に、どの関数が割り当て/解放を行ったかを特定できる:
+
+```
+Object 0000000012345678: 6b 6b 6b 6b 6b 6b 6b 6b  kkkkkkkk
+Allocated in my_driver_init+0x34/0x80 age=12 cpu=0 pid=1234
+    kmalloc+0x20/0x30
+    my_driver_init+0x34/0x80
+    do_one_initcall+0x40/0xb0
+Freed in my_driver_remove+0x18/0x40 age=3 cpu=1 pid=5678
+    kfree+0x20/0x30
+    my_driver_remove+0x18/0x40
+    platform_remove+0x28/0x50
+```
+
+### SLUB 情報の確認
+
+```bash
+# 特定キャッシュの詳細情報 (CONFIG_SLUB_DEBUG 有効時)
+cat /sys/kernel/slab/kmalloc-256/red_zone
+# 1 (有効)
+
+cat /sys/kernel/slab/kmalloc-256/poison
+# 1 (有効)
+
+cat /sys/kernel/slab/kmalloc-256/alloc_calls
+# 各割り当てコールサイトの統計
+
+cat /sys/kernel/slab/kmalloc-256/free_calls
+# 各解放コールサイトの統計
+```
+
+---
+
+## 11. kmemleak
+
+### kmemleak とは
+
+`kmemleak` は、カーネル内のメモリリークを GC (ガベージコレクション) に似た手法で検出する。
+ユーザ空間の Valgrind に相当する機能である。
+
+仕組みは以下の通り:
+
+1. `kmalloc`, `vmalloc` 等のメモリ割り当てを全て記録する
+2. 定期的に (デフォルト 10 分ごと) カーネルメモリ全体をスキャンし、
+   割り当て済みオブジェクトのアドレスへの参照が存在するか調べる
+3. どこからも参照されていないオブジェクトを **orphan (孤立)** として報告する
+
+### 使い方
+
+```bash
+# kmemleak を有効にしてカーネルをビルド
+# CONFIG_DEBUG_KMEMLEAK=y
+
+# スキャンを手動実行
+echo scan > /sys/kernel/debug/kmemleak
+
+# 検出されたリークを表示
+cat /sys/kernel/debug/kmemleak
+# unreferenced object 0xffff888012345678 (size 64):
+#   comm "my_driver", pid 1234, jiffies 4294967890 (age 123.456s)
+#   backtrace:
+#     kmalloc+0x20/0x30
+#     my_driver_init+0x50/0x80
+#     do_one_initcall+0x40/0xb0
+
+# 検出結果をクリア
+echo clear > /sys/kernel/debug/kmemleak
+
+# 自動スキャン間隔を変更 (秒)
+echo scan=60 > /sys/kernel/debug/kmemleak
+```
+
+### 制限事項
+
+- **性能オーバーヘッド**: メモリスキャンは時間がかかる。本番環境では無効にすべき
+- **偽陽性**: ポインタを XOR やハッシュで変換して保持している場合、
+  kmemleak はそれを参照とみなせず、偽の「リーク」として報告する
+- **偽陰性**: ポインタ値がたまたまスキャン対象のメモリに存在すると、
+  実際のリークが検出されない
+
+偽陽性を抑制するには `kmemleak_not_leak()` や `kmemleak_ignore()` を使う:
+
+```c
+void *p = kmalloc(64, GFP_KERNEL);
+/* このオブジェクトはリークではないと kmemleak に通知 */
+kmemleak_not_leak(p);
+```
+
+---
+
+## 12. メモリホットプラグ
+
+### メモリホットプラグとは
+
+物理メモリをシステム稼働中に **追加** または **削除** する機能である。
+仮想化環境 (KVM, Hyper-V) でゲストのメモリをホストから動的に調整する場合や、
+大規模サーバでメモリボードを交換する場合に使われる。
+
+### メモリの追加 (hot-add)
+
+メモリの追加は比較的単純で、新しい物理メモリ領域をカーネルに通知し、
+ページテーブルとゾーン管理構造を更新する。
+
+```bash
+# メモリブロックの状態を確認
+ls /sys/devices/system/memory/
+# memory0  memory1  memory2  ...
+
+cat /sys/devices/system/memory/memory3/state
+# offline
+
+# メモリブロックをオンラインにする
+echo online > /sys/devices/system/memory/memory3/state
+```
+
+### メモリの削除 (hot-remove)
+
+メモリの削除は追加よりもはるかに困難である。
+削除対象の物理メモリ上にあるページを **全て他の場所に移動** しなければならない。
+
+移動できないページ (カーネルの slab オブジェクトなど) があると、
+ホットリムーブは失敗する。これが `GFP_MOVABLE` フラグの重要性である:
+
+```c
+/* MOVABLE ゾーンに割り当て → ホットリムーブ時に移動可能 */
+struct page *page = alloc_pages(GFP_HIGHUSER_MOVABLE, 0);
+```
+
+`ZONE_MOVABLE` に配置されたページは、全てマイグレーション可能であることが
+保証されるため、ホットリムーブが成功しやすい。
+
+```bash
+# ZONE_MOVABLE のサイズを設定 (カーネルパラメータ)
+# kernelcore=4G  → 最初の 4 GB を ZONE_NORMAL, 残りを ZONE_MOVABLE に
+# movablecore=8G → 8 GB を ZONE_MOVABLE に確保
+
+# メモリブロックをオフラインにする (ホットリムーブ準備)
+echo offline > /sys/devices/system/memory/memory3/state
+```
+
+---
+
+## まとめ: メモリ管理サブシステムの全体像
+
+```
+ ユーザ空間
+ ─────────────────────────────────────────────────────────────
+   malloc()  mmap()   fork()
+      │        │        │
+      ▼        ▼        ▼
+ ┌──────────────────────────────────────────────────────────┐
+ │                    VMA 管理 (Maple Tree)                 │
+ │          vm_area_struct: vm_start, vm_end, vm_flags      │
+ └──────────────────────────┬───────────────────────────────┘
+                            │ ページフォルト
+                            ▼
+ ┌──────────────────────────────────────────────────────────┐
+ │                ページテーブル管理                          │
+ │    PGD → P4D → PUD → PMD → PTE    TLB キャッシュ        │
+ │    Huge Pages (PMD/PUD レベル)      PCID                 │
+ └──────────────────────────┬───────────────────────────────┘
+                            │
+                            ▼
+ ┌──────────────────────────────────────────────────────────┐
+ │             物理メモリ管理                                │
+ │   Buddy アロケータ   SLUB   メモリコンパクション           │
+ │   NUMA ノード管理    OOM Killer   メモリホットプラグ       │
+ └──────────────────────────────────────────────────────────┘
+```
+
+この章で学んだ各トピックは、独立しているようで実は密接に関連している。
+Huge Pages はページテーブルの階層構造を利用し、
+THP はメモリコンパクションに依存し、
+NUMA はページマイグレーションと連携し、
+OOM Killer はページ回収の最終手段として機能する。
+
+デバイスドライバ開発者にとっては、特に以下のポイントが実践的に重要である:
+
+- `mmap` コールバックでの `remap_pfn_range` と `.fault` ハンドラの実装
+- NUMA-aware な `kmalloc_node` でのバッファ確保
+- `VM_DONTCOPY` による fork 後の意図しない CoW の防止
+- SLUB デバッグと kmemleak を使ったメモリバグの検出
+
+---
+
+## 章末演習
+
+1. `/proc/self/maps` の出力を読み、各 VMA の権限フラグ (`r-xp`, `rw-p` 等) が
+   `vm_flags` のどのビットに対応するか説明せよ。
+
+2. `numactl --hardware` の出力を確認し、自分のシステムの NUMA トポロジを図示せよ。
+   シングルソケットの場合は Node 0 のみ存在する。
+
+3. 以下のブートパラメータで QEMU を起動し、意図的なバッファオーバーフローを
+   SLUB デバッグで検出せよ:
+   ```
+   slub_debug=FPZ
+   ```
+   ヒント: `kmalloc(64, GFP_KERNEL)` で確保した 64 バイトの領域に
+   65 バイト以上書き込み、`kfree()` 時のカーネルログを `dmesg` で確認する。
+
+4. `/proc/buddyinfo` を確認し、order-9 (2 MB) の空きブロック数を記録せよ。
+   `echo 1 > /proc/sys/vm/compact_memory` を実行した後、
+   再度確認して値がどう変化するか観察せよ。
+
+5. `cat /proc/<pid>/oom_score` で複数のプロセスの OOM スコアを比較し、
+   RSS (Resident Set Size) との相関を確認せよ。
+
+---
+
+## 参考資料
+
+- [Linux Kernel Memory Management Documentation (kernel.org)](https://docs.kernel.org/mm/)
+- [x86_64 5-Level Paging (kernel.org)](https://docs.kernel.org/arch/x86/x86_64/5level-paging.html)
+- [Transparent Huge Pages (kernel.org)](https://docs.kernel.org/admin-guide/mm/transhuge.html)
+- [NUMA Memory Policy (kernel.org)](https://docs.kernel.org/admin-guide/mm/numa_memory_policy.html)
+- [SLUB Debug (kernel.org)](https://docs.kernel.org/mm/slub.html)
+- [kmemleak (kernel.org)](https://docs.kernel.org/dev-tools/kmemleak.html)
+- [Memory Hotplug (kernel.org)](https://docs.kernel.org/admin-guide/mm/memory-hotplug.html)
+- [LWN: The Maple Tree (2022)](https://lwn.net/Articles/845507/)
+- [LWN: Multi-size THP (2024)](https://lwn.net/Articles/937239/)

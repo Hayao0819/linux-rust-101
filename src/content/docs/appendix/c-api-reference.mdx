@@ -1,0 +1,180 @@
+---
+title: "付録 C. kernel crate API 早見表"
+description: kernel crate の主要な型・トレイトをサブシステムごとに整理した早見表
+---
+
+import { LinkCard } from '@astrojs/starlight/components';
+
+## 凡例
+
+- **型**: 構造体 (`struct`) や列挙型 (`enum`)
+- **トレイト**: 振る舞いを定義するインターフェース (`trait`)
+- **マクロ**: コンパイル時にコードを生成するマクロ (`macro`)
+
+ドキュメントのベース URL: [`https://rust.docs.kernel.org/kernel/`](https://rust.docs.kernel.org/kernel/)
+
+---
+
+## prelude
+
+`use kernel::prelude::*;` で一括インポートされるもの。日常的に使う型・トレイト・マクロが集約されている。
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`module!`](https://rust.docs.kernel.org/kernel/macro.module.html) | マクロ | カーネルモジュールのエントリポイントを定義する |
+| [`Module`](https://rust.docs.kernel.org/kernel/trait.Module.html) | トレイト | モジュールの `init()` を実装するためのトレイト |
+| [`ThisModule`](https://rust.docs.kernel.org/kernel/struct.ThisModule.html) | 型 | 現在のモジュールへの参照を保持する |
+| `pr_info!`, `pr_err!`, `pr_warn!`, `pr_debug!` | マクロ | カーネルログ出力（printk 相当） |
+| [`Result`](https://rust.docs.kernel.org/kernel/error/type.Result.html) | 型エイリアス | `core::result::Result<T, Error>` のエイリアス |
+| [`Error`](https://rust.docs.kernel.org/kernel/error/struct.Error.html) | 型 | カーネルエラーコードのラッパ |
+
+---
+
+## alloc — メモリ確保
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`KBox<T>`](https://rust.docs.kernel.org/kernel/alloc/struct.KBox.html) | 型 | `kmalloc` ベースのヒープ確保。`Box` のカーネル版 |
+| [`KVec<T>`](https://rust.docs.kernel.org/kernel/alloc/struct.KVec.html) | 型 | カーネルアロケータを使う可変長配列 |
+| [`Flags`](https://rust.docs.kernel.org/kernel/alloc/struct.Flags.html) | 型 | `GFP_KERNEL`, `GFP_ATOMIC` 等のアロケーションフラグ |
+
+---
+
+## sync — 同期プリミティブ
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`Mutex<T>`](https://rust.docs.kernel.org/kernel/sync/struct.Mutex.html) | 型 | スリープ可能なミューテックス。データを内包する |
+| [`SpinLock<T>`](https://rust.docs.kernel.org/kernel/sync/struct.SpinLock.html) | 型 | スピンロック。割り込みコンテキストでも使用可能 |
+| [`Arc<T>`](https://rust.docs.kernel.org/kernel/sync/struct.Arc.html) | 型 | アトミック参照カウントによる共有所有権 |
+| [`ARef<T>`](https://rust.docs.kernel.org/kernel/types/struct.ARef.html) | 型 | C カーネルオブジェクトの参照カウントラッパ |
+| [`Guard`](https://rust.docs.kernel.org/kernel/sync/struct.Guard.html) | 型 | ロックガード。スコープ終了で自動アンロック |
+| [`CondVar`](https://rust.docs.kernel.org/kernel/sync/struct.CondVar.html) | 型 | 条件変数。`Mutex` と組み合わせて使用する |
+| [`new_mutex!`](https://rust.docs.kernel.org/kernel/macro.new_mutex.html) | マクロ | `Mutex` の pin 初期化を行うヘルパ |
+| [`new_spinlock!`](https://rust.docs.kernel.org/kernel/macro.new_spinlock.html) | マクロ | `SpinLock` の pin 初期化を行うヘルパ |
+
+---
+
+## error — エラー処理
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`Result<T>`](https://rust.docs.kernel.org/kernel/error/type.Result.html) | 型エイリアス | `Result<T, Error>` の短縮形 |
+| [`Error`](https://rust.docs.kernel.org/kernel/error/struct.Error.html) | 型 | Linux エラーコードを保持する構造体 |
+| [`code::*`](https://rust.docs.kernel.org/kernel/error/code/index.html) | 定数 | `EINVAL`, `ENOMEM`, `ENOENT` 等のエラーコード定数 |
+
+---
+
+## miscdevice — misc デバイス
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`MiscDevice`](https://rust.docs.kernel.org/kernel/miscdevice/trait.MiscDevice.html) | トレイト | misc デバイスの `open`/`read`/`write`/`ioctl` を定義する |
+| [`MiscDeviceRegistration`](https://rust.docs.kernel.org/kernel/miscdevice/struct.MiscDeviceRegistration.html) | 型 | misc デバイスの登録を RAII で管理する |
+| [`MiscDeviceOptions`](https://rust.docs.kernel.org/kernel/miscdevice/struct.MiscDeviceOptions.html) | 型 | デバイス名やモード等のオプションを保持する |
+
+---
+
+## uaccess — ユーザ空間アクセス
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`UserSlice`](https://rust.docs.kernel.org/kernel/uaccess/struct.UserSlice.html) | 型 | ユーザ空間バッファを表す。読み書き用に分割可能 |
+| [`UserSliceReader`](https://rust.docs.kernel.org/kernel/uaccess/struct.UserSliceReader.html) | 型 | ユーザ空間からカーネル空間へデータを読み取る |
+| [`UserSliceWriter`](https://rust.docs.kernel.org/kernel/uaccess/struct.UserSliceWriter.html) | 型 | カーネル空間からユーザ空間へデータを書き込む |
+
+---
+
+## task — タスク（プロセス）
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`Task`](https://rust.docs.kernel.org/kernel/task/struct.Task.html) | 型 | `struct task_struct` のラッパ。PID やコマンド名を取得できる |
+| [`CurrentTask`](https://rust.docs.kernel.org/kernel/task/struct.CurrentTask.html) | 型 | 現在実行中のタスクへの参照 |
+
+---
+
+## workqueue — ワークキュー
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`Work`](https://rust.docs.kernel.org/kernel/workqueue/struct.Work.html) | 型 | カーネルワークキューの作業単位 |
+| [`WorkItem`](https://rust.docs.kernel.org/kernel/workqueue/trait.WorkItem.html) | トレイト | ワークの `run()` メソッドを定義するトレイト |
+| [`Queue`](https://rust.docs.kernel.org/kernel/workqueue/struct.Queue.html) | 型 | ワークキュー本体 |
+| [`system()`](https://rust.docs.kernel.org/kernel/workqueue/fn.system.html) | 関数 | デフォルトのシステムワークキューを取得する |
+
+---
+
+## platform — プラットフォームドライバ
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`platform::Driver`](https://rust.docs.kernel.org/kernel/platform/trait.Driver.html) | トレイト | プラットフォームドライバの `probe`/`remove` を定義する |
+| [`platform::Registration`](https://rust.docs.kernel.org/kernel/platform/struct.Registration.html) | 型 | ドライバ登録を RAII で管理する |
+
+---
+
+## pci — PCI ドライバ
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`pci::Driver`](https://rust.docs.kernel.org/kernel/pci/trait.Driver.html) | トレイト | PCI ドライバの `probe`/`remove` を定義する |
+| [`pci::Device`](https://rust.docs.kernel.org/kernel/pci/struct.Device.html) | 型 | PCI デバイスを表す構造体 |
+| [`pci::Bar`](https://rust.docs.kernel.org/kernel/pci/struct.Bar.html) | 型 | PCI BAR (Base Address Register) へのアクセスを提供する |
+
+---
+
+## irq — 割り込み
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`irq::Registration`](https://rust.docs.kernel.org/kernel/irq/struct.Registration.html) | 型 | 割り込みハンドラの登録を RAII で管理する |
+| [`irq::Handler`](https://rust.docs.kernel.org/kernel/irq/trait.Handler.html) | トレイト | 割り込みハンドラを定義するトレイト |
+| [`irq::IrqReturn`](https://rust.docs.kernel.org/kernel/irq/enum.IrqReturn.html) | 型 | 割り込み処理の結果（`Handled` / `None`） |
+
+---
+
+## debugfs — デバッグファイルシステム
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| `debugfs::Dir` | 型 | debugfs ディレクトリを作成・管理する |
+| `debugfs::File` | 型 | debugfs ファイルを作成・管理する |
+
+---
+
+## configfs — 設定ファイルシステム
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| `configfs::Subsystem` | 型 | configfs サブシステムの登録を管理する |
+| `configfs::ItemOperations` | トレイト | configfs アイテムの操作を定義するトレイト |
+
+---
+
+## types — 基盤ユーティリティ型
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`Opaque<T>`](https://rust.docs.kernel.org/kernel/types/struct.Opaque.html) | 型 | C 構造体を Rust 側で安全にラップする不透明型 |
+| [`ForeignOwnable`](https://rust.docs.kernel.org/kernel/types/trait.ForeignOwnable.html) | トレイト | `void *` との安全な相互変換を提供する |
+| [`ScopeGuard`](https://rust.docs.kernel.org/kernel/types/struct.ScopeGuard.html) | 型 | スコープ終了時にクリーンアップを実行する |
+
+---
+
+## init — Pin 初期化
+
+| 名前 | 種別 | 説明 |
+|---|---|---|
+| [`pin_init!`](https://rust.docs.kernel.org/kernel/macro.pin_init.html) | マクロ | 構造体の pin 初期化を宣言的に記述する |
+| [`try_pin_init!`](https://rust.docs.kernel.org/kernel/macro.try_pin_init.html) | マクロ | 失敗しうる pin 初期化を記述する |
+| [`PinInit<T>`](https://rust.docs.kernel.org/kernel/init/trait.PinInit.html) | トレイト | pin 初期化可能な型であることを示す |
+| [`InPlaceInit`](https://rust.docs.kernel.org/kernel/init/trait.InPlaceInit.html) | トレイト | `pin_init!` で初期化されたオブジェクトをインプレースで確保する |
+| [`init!`](https://rust.docs.kernel.org/kernel/macro.init.html) | マクロ | pin でない通常の初期化を宣言的に記述する |
+
+---
+
+## 参考リンク
+
+- [kernel crate トップページ](https://rust.docs.kernel.org/kernel/) — 全モジュールの一覧
+- [Rust for Linux ソースツリー](https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/tree/rust/kernel) — カーネルソース内の実装

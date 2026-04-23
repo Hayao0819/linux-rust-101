@@ -1,0 +1,119 @@
+---
+title: "Ch 1. なぜカーネルを Rust で書くのか"
+description: Linux カーネルのメモリ安全性問題と Rust for Linux の意義を理解する
+---
+
+## この章で学ぶこと
+
+- Linux カーネルが直面するメモリ安全性問題の規模を数字で把握する
+- Rust for Linux (RfL) が「if ではなく when」の段階に入った経緯を理解する
+- 他の Rust OS (Redox, Hubris, Tock) との違いを説明できる
+## Linux カーネルとメモリ安全性
+
+Linux カーネルは約 3500 万行の C コードで構成されている。
+この規模のコードベースでは、メモリ安全性バグが不可避的に混入する。
+
+Google の研究によれば、Android における深刻なセキュリティ脆弱性の **約 70% がメモリ安全性バグ** である。
+これは Linux カーネル全体にも当てはまる傾向で、
+use-after-free、バッファオーバーフロー、二重解放、未初期化メモリ読み取りが主要な原因となっている。
+
+### メモリ安全性バグの代表例
+
+| バグの種類 | 内容 | 典型的な結果 |
+|---|---|---|
+| Use-after-free | 解放済みメモリへのアクセス | 特権昇格、情報漏洩 |
+| Buffer overflow | バッファ境界外への書き込み | コード実行、DoS |
+| Double free | 同じメモリを 2 回解放 | ヒープ破壊 |
+| NULL deref | NULL ポインタの参照外し | カーネル panic |
+| Data race | 同期なしの並行アクセス | データ破壊 |
+
+CISA (米サイバーセキュリティ庁) と NSA は 2023 年の共同声明で、
+新規プロジェクトではメモリ安全な言語の使用を推奨している。
+
+## Rust for Linux の歩み
+
+| 年 | 出来事 |
+|---|---|
+| 2020 | Linux Storage, Filesystem & Memory Management Summit で RFC 発表 |
+| 2022 | **Linux 6.1** に Rust サポートが初めてマージ (最小限のインフラ) |
+| 2023 | Linux 6.2-6.6 で `kernel` crate の基本型が整備される |
+| 2024 | PHY ドライバ (`ax88796b_rust`) が初の Rust ドライバとして upstream |
+| 2024 | Android Binder の Rust 書き直しが開始 |
+| 2025 | **Linux 6.13** で Binder Rust 版がマージ。DRM サブシステムで「新規 C ドライバ受け入れ停止」方針 |
+| 2025-2026 | Nova (NVIDIA GPU), Tyr (Mali GPU) など大規模ドライバの開発が進行 |
+
+### 主要メンテナ
+
+- **Miguel Ojeda** — RfL プロジェクト全体のリード
+- **Alice Ryhl** — Binder Rust 実装、`kernel::sync` の設計者
+- **Benno Lossin** — `pin-init` crate の作者
+- **Danilo Krummrich** — Nova GPU ドライバ、`kernel::alloc` の設計者
+- **Andreas Hindborg** — null block driver (`rnull`) の作者
+
+## なぜ「Rust で新しい OS を作る」ではないのか
+
+Rust で OS を書くプロジェクトは複数存在する:
+
+| プロジェクト | アプローチ | 特徴 |
+|---|---|---|
+| **Redox OS** | フルスクラッチ microkernel | POSIX 互換目標、独自カーネル |
+| **Hubris** (Oxide) | 組込み向け microkernel | 静的タスク、メモリ保護 |
+| **Tock OS** | 組込み向け | Capability ベース、MCU 向け |
+| **BlogOS** | 教育目的 | ベアメタルから書く学習教材 |
+| **Rust for Linux** | **既存カーネルへの増分追加** | 世界中のデバイスで動作する実績 |
+
+Rust for Linux が他と根本的に異なるのは、
+**既に世界中の数十億台のデバイスで動作している Linux カーネルの中に Rust を導入する** という点である。
+新しい OS を作るのではなく、既存の巨大なエコシステムを段階的に安全にしていくアプローチである。
+
+## 政治的な文脈
+
+RfL の道のりは純粋に技術的なものだけではない。
+
+2024 年から 2025 年にかけて、一部のカーネル開発者が Rust の導入に強い反発を示した。
+C の既存コードに対する Rust 抽象層の追加が「メンテナンス負荷を増やす」「C 開発者に Rust の学習を強いる」
+という懸念が主な理由である。
+
+一方で、DRM (GPU ドライバ) サブシステムのメンテナ Dave Airlie は
+「新規の C DRM ドライバは受け入れない」方針を宣言し、Rust への移行を積極的に推進している。
+
+この教材では、こうした議論の存在を認識した上で、技術的な内容に集中する。
+
+## Rust がカーネルで解決するもの・しないもの
+
+**解決するもの:**
+
+- コンパイル時のメモリ安全性検査 (use-after-free, 二重解放)
+- 型システムによるロック規律の強制 (データがロックの中に入る設計)
+- RAII による確実なリソース解放
+
+**解決しないもの:**
+
+- 論理バグ (デッドロック、レースコンディション)
+- 設計レベルの並行性ミス (Rust Binder の CVE-2025-68260 が好例)
+- パフォーマンス問題
+
+Rust は万能薬ではない。しかし、メモリ安全性バグという最大のカテゴリを型システムで排除できることの価値は大きい。
+
+## 章末演習
+
+1. [Rust for Linux 公式サイト](https://rust-for-linux.com/) にアクセスし、
+   トップページに記載されている upstream 済みのドライバを 3 つ列挙せよ。
+
+2. Linux 6.1 と Linux 6.13 のリリースノートから、Rust 関連の変更を
+   それぞれ 3 項目ずつ見つけ、「何ができるようになったか」を説明せよ。
+
+3. [CISA のメモリ安全性に関する声明](https://www.cisa.gov/resources-tools/resources/case-memory-safe-roadmaps)
+   を読み、推奨されている言語を列挙せよ。
+
+---
+
+次の章 → [Ch 3. 開発環境の構築](/part1-introduction/03-setup/)
+
+## 参考資料
+
+- [Rust for Linux 公式サイト](https://rust-for-linux.com/)
+- [Rust for Linux (Wikipedia)](https://en.wikipedia.org/wiki/Rust_for_Linux)
+- [Memory Safety — CISA](https://www.cisa.gov/resources-tools/resources/case-memory-safe-roadmaps)
+- [The Case for Memory Safe Roadmaps (White House ONCD)](https://www.whitehouse.gov/oncd/briefing-room/2024/02/26/memory-safety-fact-sheet/)
+- [Writing an OS in Rust (BlogOS)](https://os.phil-opp.com/)

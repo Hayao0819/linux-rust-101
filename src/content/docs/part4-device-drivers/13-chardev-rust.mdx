@@ -1,0 +1,215 @@
+---
+title: "Ch 9. 文字デバイスドライバ — Rust 版"
+description: MiscDevice trait, UserSlice, kernel::Result で Ch 8 の echo デバイスを Rust に移植する
+---
+
+## この章で学ぶこと
+
+- `kernel::miscdevice::MiscDevice` trait を実装できる
+- `UserSliceReader` / `UserSliceWriter` で安全にユーザ空間データを転送する
+- `kernel::Result` と errno 定数を適切に使い分ける
+- C 版ドライバとの 1:1 対比で Rust の設計上の利点を理解する
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::miscdevice::MiscDevice` trait, `kernel::miscdevice::MiscDeviceRegistration`
+🟢 **安定**: `kernel::uaccess::UserSliceReader`, `kernel::uaccess::UserSliceWriter`
+🟢 **安定**: `kernel::error::code::*` (ENOTTY, EFAULT 等)
+:::
+
+## 前提
+
+- [Ch 11](/part4-device-drivers/11-chardev-c/) (C 版文字デバイス) を完了している
+- [Ch 5](/part2-first-module/05-hello-rust/) (Rust モジュール基礎) を復習済み
+
+## MiscDevice trait
+
+[Ch 11](/part4-device-drivers/11-chardev-c/) の最後で紹介した miscdevice は、Rust では `MiscDevice` trait として抽象化されている。
+C 版の `struct file_operations` + `misc_register` に相当する全てが、この trait の実装に集約される。
+
+```rust title="echo_rust.rs"
+use kernel::prelude::*;
+use kernel::miscdevice::{MiscDevice, MiscDeviceRegistration};
+use kernel::sync::{Mutex, Arc};
+use kernel::new_mutex;
+use kernel::alloc::KVec;
+
+module! {
+    type: EchoModule,
+    name: "echo_rust",
+    author: "Your Name",
+    description: "Echo character device in Rust",
+    license: "GPL",
+}
+
+struct EchoModule {
+    _reg: Pin<KBox<MiscDeviceRegistration<EchoDev>>>,
+}
+
+#[pin_data]
+struct SharedState {
+    #[pin]
+    buf: Mutex<KVec<u8>>,
+}
+
+struct EchoDev;
+
+#[vtable]
+impl MiscDevice for EchoDev {
+    type Ptr = Arc<SharedState>;
+
+    fn open(_file: &File, misc: &MiscDeviceRegistration<Self>) -> Result<Arc<SharedState>> {
+        let state = Arc::pin_init(pin_init!(SharedState {
+            buf <- new_mutex!(KVec::new()),
+        }), GFP_KERNEL)?;
+        Ok(state)
+    }
+
+    fn read(state: &SharedState, _file: &File, buf: &mut UserSliceWriter, offset: u64) -> Result<usize> {
+        let data = state.buf.lock();
+        let start = offset as usize;
+        if start >= data.len() {
+            return Ok(0);
+        }
+        let to_copy = core::cmp::min(buf.len(), data.len() - start);
+        buf.write_slice(&data[start..start + to_copy])?;
+        Ok(to_copy)
+    }
+
+    fn write(state: &SharedState, _file: &File, buf: &mut UserSliceReader, _offset: u64) -> Result<usize> {
+        let mut data = state.buf.lock();
+        data.clear();
+        let len = buf.len();
+        data.extend_from_reader(buf, GFP_KERNEL)?;
+        Ok(len)
+    }
+}
+
+impl kernel::Module for EchoModule {
+    fn init(_module: &ThisModule) -> Result<Self> {
+        let reg = KBox::pin_init(
+            MiscDeviceRegistration::<EchoDev>::register(fmt!("echo_rust"), None),
+            GFP_KERNEL,
+        )?;
+        Ok(EchoModule { _reg: reg })
+    }
+}
+```
+
+> 上記コードは概念的な構造を示している。実際の API は Linux バージョンにより異なる場合がある。
+> `samples/rust/rust_misc_device.rs` を参照すること。
+
+## C ⇔ Rust 対比
+
+### 初期化とクリーンアップ
+
+| C | Rust |
+|---|---|
+| `alloc_chrdev_region()` | (MiscDeviceRegistration 内部で自動) |
+| `cdev_init()` + `cdev_add()` | (MiscDeviceRegistration 内部で自動) |
+| `class_create()` + `device_create()` | (MiscDeviceRegistration 内部で自動) |
+| `device_destroy()` + `class_destroy()` + `cdev_del()` + `unregister_chrdev_region()` | (Drop で自動) |
+
+C 版の `echo_init` は 20 行以上の初期化コードと `goto err_*` パターンが必要だった。
+Rust 版では `MiscDeviceRegistration::register()` 一行で全てが完了し、
+失敗時のクリーンアップは `?` 演算子 + Drop が自動で行う。
+
+### ユーザ空間データ転送
+
+| C | Rust |
+|---|---|
+| `copy_to_user(ubuf, kbuf, len)` | `writer.write_slice(&kbuf)?` |
+| `copy_from_user(kbuf, ubuf, len)` | `reader.read_slice(&mut kbuf)?` |
+| 手動の NULL チェック | `?` で自動伝播 |
+| 方向の取り違えがコンパイル時に検出されない | `UserSliceReader` / `UserSliceWriter` で型レベルで方向が固定 |
+
+### TOCTOU (double-fetch) の防止
+
+C 版の `copy_from_user` は同じユーザバッファを何度でも読める。
+悪意あるユーザプロセスが 1 回目と 2 回目の間にバッファの内容を変えると、
+セキュリティ脆弱性 (TOCTOU: Time-of-Check to Time-of-Use) になる。
+
+Rust の `UserSliceReader` は**消費型**である。一度読んだら同じデータは読めない:
+
+```rust
+// UserSliceReader は read 操作で消費される
+let mut reader = user_slice.reader();
+reader.read_slice(&mut buf1)?;
+// reader は既に消費されている — 同じデータを二重に読むことは型レベルで不可能
+```
+
+## kernel::Result とエラーハンドリング
+
+```rust
+use kernel::error::code;
+
+// Err を返す
+return Err(code::EINVAL);   // -EINVAL に対応
+return Err(code::ENOMEM);   // -ENOMEM に対応
+return Err(code::EFAULT);   // -EFAULT に対応
+return Err(code::ENOTTY);   // -ENOTTY に対応
+```
+
+C の `return -EINVAL;` が Rust では `return Err(code::EINVAL);` になる。
+`?` 演算子と組み合わせることで、エラーチェーンが自然に書ける:
+
+```rust
+fn init() -> Result<Self> {
+    let buf = KVec::with_capacity(256, GFP_KERNEL)?;  // ENOMEM を自動伝播
+    let reg = register_device()?;                       // 任意のエラーを自動伝播
+    Ok(Self { buf, reg })
+    // エラー時は buf と reg が自動 drop される
+}
+```
+
+## ioctl の Rust 実装
+
+```rust
+fn ioctl(state: &SharedState, _file: &File, cmd: u32, arg: usize) -> Result<isize> {
+    match cmd {
+        ECHO_RESET => {
+            let mut data = state.buf.lock();
+            data.clear();
+            Ok(0)
+        }
+        ECHO_GET_LEN => {
+            let data = state.buf.lock();
+            let len = data.len();
+            // UserSlice で安全にユーザ空間に書き込む
+            let mut writer = UserSlice::new(arg, core::mem::size_of::<usize>()).writer();
+            writer.write(&len.to_ne_bytes())?;
+            Ok(0)
+        }
+        _ => Err(code::ENOTTY),
+    }
+}
+```
+
+## よくある罠
+
+1. **`Ok(())` を返そうとする** — `MiscDevice::open` は `Result<Self::Ptr>` を返す。per-fd 状態を返す必要がある。
+
+2. **ロックの粒度が粗すぎる** — read と write で同じ Mutex を取ると並行性が下がる。ただし初学者はまず正確さを優先すべき。
+
+3. **`UserSliceReader` を捨てる** — ユーザが送ったデータを全て読み切らないと、残りのバイト数がおかしくなる。
+
+4. **`samples/rust/rust_misc_device.rs` を読まない** — 公式サンプルが最も信頼できるリファレンスである。
+
+## 章末演習
+
+1. `samples/rust/rust_misc_device.rs` を読み、open/read/write/ioctl の各メソッドがどのように実装されているか説明せよ。
+
+2. [Ch 11](/part4-device-drivers/11-chardev-c/) の C 版 echo デバイスと同等の機能を Rust で実装し、動作を比較せよ。
+
+3. ioctl `ECHO_RESET` を追加し、ユーザ空間のテストプログラムから呼び出せることを確認せよ。
+
+---
+
+次の章 → [Ch 14. カーネル抽象層のインターフェース設計](/part4-device-drivers/14-interfaces/)
+
+## 参考資料
+
+- [kernel::miscdevice (rustdoc)](https://rust.docs.kernel.org/kernel/miscdevice/)
+- [kernel::uaccess (rustdoc)](https://rust.docs.kernel.org/kernel/uaccess/)
+- [kernel::error (rustdoc)](https://rust.docs.kernel.org/kernel/error/)
+- [samples/rust/rust_misc_device.rs](https://github.com/torvalds/linux/blob/master/samples/rust/rust_misc_device.rs)
+- [LWN: How to write Rust in the kernel: part 2](https://lwn.net/Articles/1025232/)

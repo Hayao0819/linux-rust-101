@@ -1,0 +1,90 @@
+---
+title: "付録 B. C ⇔ Rust 用語対応辞典"
+description: C カーネルの概念と Rust for Linux での対応を一覧にまとめたクイックリファレンス
+---
+
+## 対応表の読み方
+
+左列に C カーネルで馴染みの深い関数・マクロ・パターンを、右列に Rust for Linux (RfL) での対応物を示す。
+完全に 1 対 1 で対応しないものもあるが、最も近い概念を対応させている。
+
+## メモリ管理
+
+| C カーネル | Rust for Linux | 補足 |
+|---|---|---|
+| `kmalloc(size, GFP_KERNEL)` | `KBox::new(value, GFP_KERNEL)` | `KBox` はカーネルアロケータを使う `Box` 相当。フラグを明示的に渡す |
+| `kzalloc(size, GFP_KERNEL)` | `KBox::new(T::default(), GFP_KERNEL)` | Rust では初期化と確保を分離しない |
+| `kfree(ptr)` | `Drop` トレイト（自動解放） | スコープを抜けると自動で `kfree` が呼ばれる |
+| `kvmalloc()` | `KVec::new(GFP_KERNEL)` | 大きな連続メモリが必要な場合に使用 |
+| `vmalloc()` | `KVec` + 適切なフラグ | 仮想的に連続なメモリ確保 |
+| `GFP_KERNEL`, `GFP_ATOMIC` | `GFP_KERNEL`, `GFP_ATOMIC` | `kernel::alloc::Flags` として同名で定義されている |
+
+## エラーハンドリング
+
+| C カーネル | Rust for Linux | 補足 |
+|---|---|---|
+| `ERR_PTR(-ENOMEM)` | `Err(ENOMEM)` | `kernel::error::Result<T>` を返す |
+| `IS_ERR(ptr)` | `.is_err()` | パターンマッチや `?` 演算子で処理 |
+| `PTR_ERR(ptr)` | `Err(e)` の `e` | エラーコードは `kernel::error::code::*` で定義 |
+| `-EINVAL` を返す | `return Err(EINVAL)` | `?` 演算子で伝播可能 |
+
+## 同期プリミティブ
+
+| C カーネル | Rust for Linux | 補足 |
+|---|---|---|
+| `DEFINE_MUTEX(name)` | `new_mutex!(MyData, "lock_name")` | データとロックが一体化（型安全） |
+| `mutex_lock(&m)` | `m.lock()` | `Guard` を返し、スコープ終了で自動アンロック |
+| `mutex_unlock(&m)` | （`Guard` の `Drop`） | 明示的なアンロック不要 |
+| `spin_lock(&s)` | `s.lock()` | `SpinLock` も同様のパターン |
+| `spin_unlock(&s)` | （`Guard` の `Drop`） | |
+| `kref` / `kref_get` / `kref_put` | `Arc<T>` | 参照カウントによる共有所有権 |
+| `struct device` の参照管理 | `ARef<Device>` | カーネルオブジェクトの always-refcounted ラッパ |
+
+## ファイル操作・デバイス
+
+| C カーネル | Rust for Linux | 補足 |
+|---|---|---|
+| `struct file_operations` | `MiscDevice` トレイト | `open`, `read`, `write`, `ioctl` をトレイトメソッドで実装 |
+| `module_init(fn)` / `module_exit(fn)` | `Module` トレイト + `module!` マクロ | `init()` が `Module` トレイトの実装 |
+| `copy_from_user()` | `UserSliceReader::read()` | 型安全なユーザ空間読み取り |
+| `copy_to_user()` | `UserSliceWriter::write()` | 型安全なユーザ空間書き込み |
+| `container_of(ptr, type, member)` | トレイトに組み込み | Rust ではトレイトオブジェクトや `self` で自然に解決 |
+
+## ログ・デバッグ
+
+| C カーネル | Rust for Linux | 補足 |
+|---|---|---|
+| `printk(KERN_INFO "...")` | `pr_info!("...")` | フォーマットは Rust の `format_args!` 構文 |
+| `printk(KERN_ERR "...")` | `pr_err!("...")` | `pr_warn!`, `pr_debug!` 等も用意されている |
+| `pr_fmt(fmt)` | （モジュールマクロで自動設定） | モジュール名が自動でプレフィクスに付く |
+| `WARN_ON(cond)` | `warn!()` マクロ | スタックトレース付き警告 |
+
+## ドライバモデル
+
+| C カーネル | Rust for Linux | 補足 |
+|---|---|---|
+| `struct platform_driver` | `platform::Driver` トレイト | `probe()` と `remove()` をトレイトメソッドで実装 |
+| `struct pci_driver` | `pci::Driver` トレイト | PCI デバイスドライバ用 |
+| `request_irq()` | `irq::Registration` | RAII パターンで自動解放 |
+| `INIT_WORK(&work, fn)` | `WorkItem` トレイト | `run()` メソッドを実装する |
+| `devm_*` 系関数 | `Devres` (Device Resource) | `devres::Registration` で管理 |
+
+## モジュール定義
+
+| C カーネル | Rust for Linux | 補足 |
+|---|---|---|
+| `MODULE_LICENSE("GPL")` | `module!` マクロ内の `license: "GPL"` | |
+| `MODULE_AUTHOR("...")` | `module!` マクロ内の `author: "..."` | |
+| `MODULE_DESCRIPTION("...")` | `module!` マクロ内の `description: "..."` | |
+| `__init` / `__exit` | `#[used]`（リンカ制御） | Rust ではコンパイラとリンカが最適化を管理 |
+| `module_param` | （現在制限付きサポート） | 今後のカーネルバージョンで拡充予定 |
+
+## 型・ユーティリティ
+
+| C カーネル | Rust for Linux | 補足 |
+|---|---|---|
+| 不透明な C 構造体 | `Opaque<T>` | C 側が所有する構造体を安全にラップ |
+| `void *private_data` | `ForeignOwnable` トレイト | 型安全なポインタ変換を提供 |
+| `likely()` / `unlikely()` | コンパイラの最適化に委ねる | Rust の nightly には `likely`/`unlikely` intrinsic があるが、カーネルでは未使用 |
+| `BUILD_BUG_ON(cond)` | `const_assert!` / コンパイル時評価 | Rust では `const` 評価でコンパイル時チェックが可能 |
+| `typedef` | `type` エイリアス | Rust では `type NewName = OldType;` |

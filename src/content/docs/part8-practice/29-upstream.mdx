@@ -1,0 +1,640 @@
+---
+title: "Ch 19. upstream への道"
+description: "git format-patch, checkpatch.pl, KUnit, コミュニティへの貢献"
+---
+
+## この章で学ぶこと
+
+- `git format-patch` / `git send-email` によるパッチ投稿ワークフローを習得する
+- `checkpatch.pl` と `get_maintainer.pl` の使い方を理解する
+- DCO と各種タグ (Signed-off-by, Reviewed-by 等) の意味と運用を知る
+- KUnit と doctest による Rust カーネルコードのテスト手法を学ぶ
+- Rust for Linux コミュニティのリソースと今後の方向性を把握する
+---
+
+## パッチ投稿ワークフロー
+
+Linux カーネルの開発は **メーリングリスト駆動** である。
+GitHub の Pull Request ではなく、パッチをメールで送る。
+この文化は数十年にわたって機能してきた仕組みであり、Rust for Linux もこれに従う。
+
+### git format-patch でパッチを生成する
+
+```bash
+# 直近 1 コミットをパッチファイルに変換
+git format-patch -1
+
+# 直近 3 コミットをパッチシリーズとして生成
+git format-patch -3
+
+# カバーレター付きで生成 (シリーズの概要を記述する)
+git format-patch -3 --cover-letter
+
+# 出力先ディレクトリを指定
+git format-patch -3 -o ~/patches/
+```
+
+生成されるファイルは `0001-subsystem-description.patch` のような名前になる。
+カバーレターは `0000-cover-letter.patch` として出力される。
+
+### git send-email でパッチを送信する
+
+```bash
+# git send-email の初期設定 (Gmail の場合)
+git config --global sendemail.smtpserver smtp.gmail.com
+git config --global sendemail.smtpserverport 587
+git config --global sendemail.smtpencryption tls
+git config --global sendemail.smtpuser your.email@gmail.com
+# Gmail ではアプリパスワードを生成して使用する
+
+# パッチを送信
+git send-email ~/patches/*.patch
+
+# 送信先を明示的に指定
+git send-email \
+  --to rust-for-linux@vger.kernel.org \
+  --cc linux-kernel@vger.kernel.org \
+  ~/patches/*.patch
+```
+
+:::caution[Gmail のアプリパスワード]
+2025 年以降、Gmail では「安全性の低いアプリのアクセス」が廃止されている。
+Google アカウントの設定からアプリパスワードを生成し、それを `git send-email` の認証に使用する必要がある。
+:::
+
+### 送信前のドライラン
+
+実際に送信する前に、必ずドライランで確認する。
+
+```bash
+git send-email --dry-run ~/patches/*.patch
+```
+
+`--dry-run` を付けると、メールの送信先とパッチの内容が表示されるが、実際には送信されない。
+
+---
+
+## checkpatch.pl によるスタイルチェック
+
+`scripts/checkpatch.pl` は、パッチがカーネルのコーディング規約に準拠しているかを検査する Perl スクリプトである。
+
+### 基本的な使い方
+
+```bash
+# パッチファイルに対して実行
+scripts/checkpatch.pl 0001-rust-sample-fix-typo.patch
+
+# 複数パッチをまとめてチェック
+scripts/checkpatch.pl ~/patches/*.patch
+
+# ソースファイルに直接実行 (--file オプション)
+scripts/checkpatch.pl --file drivers/net/phy/ax88796b_rust.rs
+
+# 厳格モードで実行
+scripts/checkpatch.pl --strict 0001-rust-sample-fix-typo.patch
+```
+
+### 出力の読み方
+
+```
+WARNING: Missing Signed-off-by: line
+#42: FILE: samples/rust/rust_minimal.rs:15:
++    // This is a sample comment
+
+total: 0 errors, 1 warnings, 5 lines checked
+```
+
+出力は 3 段階に分類される:
+
+| レベル | 意味 |
+|---|---|
+| **ERROR** | 必ず修正すべき問題 |
+| **WARNING** | 修正が推奨される問題 |
+| **CHECK** | `--strict` モードでのみ表示される提案 |
+
+:::note[checkpatch は絶対ではない]
+checkpatch はヒューリスティックに基づくツールであり、常に正しいとは限らない。
+Rust コードに対しては C のスタイルルールが誤って適用されることもある。
+最終的には自分の判断とメンテナのレビューが優先される。
+:::
+
+---
+
+## get_maintainer.pl で送信先を特定する
+
+カーネルには `MAINTAINERS` ファイルに各サブシステムの担当者が記載されている。
+`scripts/get_maintainer.pl` はこのファイルを解析し、パッチを送るべき相手を教えてくれる。
+
+```bash
+# パッチファイルから送信先を取得
+scripts/get_maintainer.pl 0001-rust-sample-fix-typo.patch
+
+# 出力例:
+# Miguel Ojeda <ojeda@kernel.org> (maintainer:RUST)
+# Alex Gaynor <alex.gaynor@gmail.com> (reviewer:RUST)
+# Boqun Feng <boqun.feng@gmail.com> (reviewer:RUST)
+# rust-for-linux@vger.kernel.org (open list:RUST)
+# linux-kernel@vger.kernel.org (open list)
+
+# ソースファイルから送信先を取得
+scripts/get_maintainer.pl --file drivers/net/phy/ax88796b_rust.rs
+
+# git send-email と組み合わせる
+git send-email \
+  $(scripts/get_maintainer.pl --separator , --nokeywords 0001-*.patch) \
+  0001-*.patch
+```
+
+`get_maintainer.pl` の出力には以下の役割が含まれる:
+
+| 役割 | 説明 |
+|---|---|
+| **maintainer** | サブシステムの責任者。最終的な採否を決定する |
+| **reviewer** | コードレビューを行う開発者 |
+| **open list** | 関連するメーリングリスト |
+| **subscriber** | 変更の通知を受け取る開発者 |
+
+---
+
+## DCO とコミットタグ
+
+### Developer Certificate of Origin (DCO)
+
+Linux カーネルへの貢献には **DCO (Developer Certificate of Origin)** への同意が必要である。
+これは CLA (Contributor License Agreement) とは異なり、
+「このコードを投稿する権利を自分が持っている」ことを宣言するものである。
+
+DCO の全文は [`Documentation/process/submitting-patches.rst`](https://www.kernel.org/doc/html/latest/process/submitting-patches.html) に記載されている。
+
+### Signed-off-by
+
+DCO への同意は `Signed-off-by` タグで表明する。
+コミット時に `-s` オプションを付けると自動で追加される。
+
+```bash
+git commit -s -m "rust: sample: fix typo in module description"
+```
+
+これにより、コミットメッセージの末尾に以下が追加される:
+
+```
+Signed-off-by: Your Name <your.email@example.com>
+```
+
+**`Signed-off-by` のないパッチはカーネルにマージされない。** これは例外なく適用されるルールである。
+
+### その他の主要タグ
+
+| タグ | 意味 | 誰が付けるか |
+|---|---|---|
+| `Signed-off-by:` | DCO への同意 | パッチの作者、および転送した全員 |
+| `Reviewed-by:` | コードレビュー完了 | レビューア |
+| `Tested-by:` | テスト実施済み | テスト実施者 |
+| `Acked-by:` | 内容に同意 (詳細レビューはしていない場合も) | サブシステムメンテナ |
+| `Reported-by:` | バグ報告者 | パッチ作者が記載 |
+| `Fixes:` | 修正対象のコミット | パッチ作者が記載 |
+| `Link:` | 関連する議論やバグレポートの URL | パッチ作者またはメンテナ |
+
+`Fixes:` タグのフォーマットには特定の書式がある:
+
+```
+Fixes: 247b365dc8dc ("rust: add `kernel` crate")
+```
+
+この 12 文字のハッシュは `git log --oneline` で確認できる。
+
+---
+
+## Subject prefix の規約
+
+カーネルパッチの Subject 行には厳密な規約がある。
+
+### 基本形式
+
+```
+[PATCH] subsystem: short description
+```
+
+### バージョン付き (再投稿)
+
+```
+[PATCH v2] rust: sample: fix typo in module description
+```
+
+### シリーズの場合 (n/m 表記)
+
+```
+[PATCH v2 0/7] rust: add GPIO abstraction layer
+[PATCH v2 1/7] rust: types: add Opaque::as_ptr method
+[PATCH v2 2/7] rust: gpio: add basic chip abstraction
+...
+[PATCH v2 7/7] MAINTAINERS: add entry for Rust GPIO
+```
+
+### RFC (議論段階)
+
+```
+[RFC PATCH] rust: mm: initial VMA abstraction
+```
+
+### その他の prefix
+
+| Prefix | 用途 |
+|---|---|
+| `[PATCH]` | 通常のパッチ |
+| `[PATCH v2]` | 2 回目の投稿 |
+| `[PATCH 3/7]` | 7 パッチシリーズの 3 番目 |
+| `[RFC PATCH]` | 議論用の草案 |
+| `[RESEND PATCH]` | 再送 (レビューがなかった場合) |
+
+`git format-patch` で prefix を変更するには:
+
+```bash
+# バージョン指定
+git format-patch -3 -v 2
+
+# RFC 付き
+git format-patch -3 --subject-prefix="RFC PATCH"
+```
+
+### サブシステム prefix の慣習
+
+Subject の `subsystem:` 部分は、変更するファイルが属するサブシステムに合わせる。
+
+```
+rust: types: add Opaque::as_ptr method
+rust: sync: fix lock guard lifetime
+rust: kernel: add GPIO chip abstraction
+samples: rust: fix compilation warning
+MAINTAINERS: add entry for Rust GPIO
+```
+
+`git log --oneline` でそのファイルの過去のコミットを確認し、慣習に合わせるのが確実である。
+
+```bash
+git log --oneline -- rust/kernel/sync.rs | head -20
+```
+
+---
+
+## KUnit と doctest: Rust カーネルコードのテスト
+
+Linux カーネルには **KUnit** というユニットテストフレームワークがある。
+Rust for Linux では、KUnit を直接利用する方法と、doctest を KUnit に変換する仕組みの 2 つがある。
+
+### KUnit テストの基本
+
+KUnit テストはカーネル内で実行される。
+Rust からは `kernel::kunit` モジュールを通じて KUnit テストを記述する。
+
+```rust
+// rust/kernel/sync/lock/mutex.rs 内のテスト例
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kernel::prelude::*;
+
+    #[test]
+    fn mutex_basic() {
+        let m = KBox::pin_init(new_mutex!(42))?;
+        let val = m.lock();
+        assert_eq!(*val, 42);
+    }
+}
+```
+
+KUnit テストの実行には `kunit.py` を使用する:
+
+```bash
+# KUnit テストを実行 (QEMU 上で)
+./tools/testing/kunit/kunit.py run \
+  --make_options LLVM=1 \
+  --arch x86_64 \
+  --kconfig_add CONFIG_RUST=y
+```
+
+### doctest (ドキュメンテーションテスト)
+
+Rust の doctest は、ドキュメントコメント内のコード例が正しく動作することを検証する仕組みである。
+カーネルでは、doctest が自動的に **KUnit テストスイートに変換** される。
+つまり、doctest はホストではなく実際のカーネル上で実行される。
+
+```rust
+/// 2 つの値を加算する。
+///
+/// # Examples
+///
+/// ```
+/// let result = mymod::add(2, 3);
+/// assert_eq!(result, 5);
+/// ```
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+```
+
+doctest を有効にするには、カーネルコンフィグで以下を設定する:
+
+```
+CONFIG_KUNIT=y
+CONFIG_RUST_KERNEL_DOCTESTS=y
+```
+
+:::tip[doctest の利点]
+doctest はドキュメントとテストを兼ねる。API の使用例がそのままテストになるため、
+ドキュメントの劣化 (コードと例が乖離する状態) を防ぐことができる。
+カーネルの Rust コードでは、doctest に `assert!` や `assert_eq!` マクロを使用する。
+これらはカーネル内部で KUnit のアサーションに自動変換される。
+:::
+
+### make LLVM=1 rusttest
+
+`rusttest` Make ターゲットは、`#[test]` 属性が付いたテストを **ホスト上** で実行する。
+
+```bash
+make LLVM=1 rusttest
+```
+
+これはカーネルの `.config` を参照し、ホスト上で動作するテストを実行する。
+カーネルの機能に依存しない純粋なロジック (パーサー、データ構造など) のテストに適している。
+
+ただし、カーネル API に依存するテストはホスト上では実行できない。
+そのため、Rust for Linux では `rusttest` のテストを KUnit に移行する作業が進められている。
+**可能な限り KUnit と doctest を使い、ホストテストは補助的に使う** のが現在の方針である。
+
+| テスト手法 | 実行場所 | 用途 |
+|---|---|---|
+| KUnit テスト | カーネル内 (QEMU 等) | カーネル API を使うテスト |
+| doctest | カーネル内 (KUnit 変換) | API のドキュメント兼テスト |
+| `make rusttest` | ホスト | カーネル非依存のロジックテスト |
+
+---
+
+## git bisect によるリグレッション追跡
+
+```bash
+# 二分探索の開始
+git bisect start
+git bisect bad          # 現在のコミットは壊れている
+git bisect good v6.17   # v6.17 では動いていた
+
+# カーネルが自動でチェックアウトする。ビルド & テストして:
+git bisect good   # このコミットは OK
+# or
+git bisect bad    # このコミットはダメ
+
+# 原因コミットが特定されるまで繰り返す
+# Bisecting: 42 revisions left to test after this (roughly 5 steps)
+
+# 自動化
+git bisect run ./test_script.sh
+
+# 終了
+git bisect reset
+```
+
+カーネルコミュニティでバグ報告する際、bisect 結果を添えると修正が大幅に加速する。`Fixes:` タグのコミットハッシュを特定するのにも使う。
+
+---
+
+## カーネル ABI の安定性
+
+Linux カーネルには **内部 API の安定性保証がない**。これは意図的な設計方針である。
+
+Greg Kroah-Hartman の名文 [*"Linux Kernel Driver Interface"*](https://docs.kernel.org/process/stable-api-nonsense.html) (通称 "Stable API Nonsense") にこう書かれている:
+
+> "You will not find a reason to need a stable kernel interface in this document."
+
+実践的な意味:
+- out-of-tree モジュールはカーネルバージョン更新で壊れる可能性がある
+- `CONFIG_MODVERSIONS` は CRC チェックで不一致を検出するが、完全ではない
+- **DKMS** (Dynamic Kernel Module Support) は out-of-tree モジュールをカーネル更新時に自動再ビルドする仕組み
+
+```bash
+# DKMS でモジュールを登録
+sudo dkms add ./my_module/
+sudo dkms build my_module/1.0
+sudo dkms install my_module/1.0
+
+# カーネル更新時に自動再ビルドされる
+```
+
+### モジュール署名と Secure Boot
+
+Secure Boot が有効な環境では、署名されていないモジュールのロードが拒否される:
+
+```bash
+# MOK (Machine Owner Key) を生成
+openssl req -new -x509 -newkey rsa:2048 -keyout MOK.priv -outform DER -out MOK.der -nodes -days 36500 -subj "/CN=My Module Signing Key/"
+
+# MOK を登録 (再起動が必要)
+sudo mokutil --import MOK.der
+
+# モジュールに署名
+/usr/src/linux-headers-$(uname -r)/scripts/sign-file sha256 MOK.priv MOK.der my_module.ko
+```
+
+---
+
+## この教材で扱わなかった領域
+
+本教材では Rust for Linux の基礎を広くカバーしたが、カーネルは巨大であり、
+多くのサブシステムは扱えていない。
+以下に、現時点 (2026 年 4 月) での各領域の Rust 対応状況をまとめる。
+
+| サブシステム | Rust 対応状況 | 備考 |
+|---|---|---|
+| **USB** | 抽象化が進行中 | Linux 6.18 で USB の Rust 抽象化が追加された |
+| **サウンド (ALSA)** | 初期段階 | C API が複雑で抽象化の難易度が高い |
+| **スケジューラ (sched)** | 実験的 | sched_ext (BPF) が先行、Rust での記述は研究段階 |
+| **メモリ管理 (mm)** | 初期的な VMA 抽象化 | `kernel::mm` の基盤が整備されつつある |
+| **ファイルシステム** | 研究段階 | `puzzlefs` など実験的な実装が存在する |
+| **ネットワーク (net)** | 部分的 | PHY ドライバが upstream 済み |
+| **DRM (GPU)** | 活発に開発中 | Nova (NVIDIA), Tyr (Mali) が主要プロジェクト |
+| **ブロックデバイス** | upstream 済み | rnull (null block driver) が存在 |
+
+Linux 7.0 (2026 年 4 月リリース) では Rust サポートが正式に stable 扱いとなり、
+Rust ドライバやカーネルモジュールがファーストクラスの市民として扱われるようになった。
+
+これらの領域は今後急速に発展する可能性が高い。
+**今まさに参入する好機** である。
+
+---
+
+## コミュニティリソース
+
+Rust for Linux に貢献するために知っておくべきコミュニティとイベントを紹介する。
+
+### Kangrejos
+
+[Kangrejos](https://kangrejos.com/) は Rust for Linux 開発者が一堂に会するワークショップである。
+スペイン・オビエドで開催され、約 30 名の招待制イベントとして、
+LPC (Linux Plumbers Conference) の直前に行われる。
+2 日間にわたり、抽象化の設計、ドライバの実装戦略、upstream の課題などが議論される。
+
+### Linux Plumbers Conference — Rust Microconference
+
+[LPC Rust MC](https://lpc.events/) は Linux Plumbers Conference 内の Rust マイクロカンファレンスである。
+Rust for Linux の状況報告、新しい抽象化の提案、ツールチェインの改善、
+アーキテクチャサポートなどが議論される。
+2024 年、2025 年と連続で開催されており、Rust for Linux の主要な意思決定の場のひとつである。
+
+### Rust.Tokyo / Rust Global: Tokyo
+
+[Rust Global: Tokyo](https://rustfoundation.org/event/rust-global-tokyo/) は
+Open Source Summit Japan と併催される Rust イベントである。
+日本で Rust for Linux に関する発表が行われることもあり、
+日本語での情報収集やネットワーキングに適している。
+
+### Zulip
+
+[Rust for Linux Zulip](https://rust-for-linux.zulipchat.com/) は
+プロジェクトの公式チャットプラットフォームである。
+質問、議論、フィードバックの場として活用されている。
+コードに関する質問やパッチの事前相談にも使える。
+
+初めて貢献する場合、Zulip で事前に相談するのは非常に良い戦略である。
+メンテナやレビューアが直接フィードバックをくれることが多い。
+
+### メーリングリスト
+
+- **rust-for-linux@vger.kernel.org** — Rust for Linux の主要 ML
+- **linux-kernel@vger.kernel.org** — LKML (Linux カーネル全体)
+
+[lore.kernel.org](https://lore.kernel.org/) でアーカイブを検索できる。
+
+---
+
+## Rust Project Goals 2026 と Linux カーネル
+
+Rust プロジェクトは 2026 年のロードマップにおいて、
+[Rust for Linux を主要目標のひとつ](https://rust-lang.github.io/rust-project-goals/2026/roadmap-rust-for-linux.html)として掲げている。
+
+### 主要な目標
+
+1. **stable Rust でカーネルをビルドできるようにする**: 現在、Rust for Linux は stable 版の Rust コンパイラを使用しているが、いくつかの不安定な言語機能に `#![feature(...)]` 宣言で依存している。2026 年の目標は、すべての必要な機能を安定化し、feature gate なしでビルドできるようにすることである。
+
+2. **Arbitrary Self Types の安定化**: カーネルの抽象化で多用される `self: Pin<&Self>` などの記法を安定化する。
+
+3. **Derive CoercePointee の安定化**: スマートポインタの型変換に関する derive マクロの安定化。
+
+4. **プラットフォームサポートの拡充**: Linux がサポートするすべてのアーキテクチャで Rust が動作することを目指す。主要アーキテクチャ (x86_64, ARM64, RISC-V) は既にサポートされているが、ロングテールのアーキテクチャが残っている。
+
+5. **Debian stable の Rust バージョンでビルド可能にする**: 最新の Debian stable リリースに含まれる Rust コンパイラでカーネルをビルドできる状態を維持する。
+
+### 隔週ミーティング
+
+Rust プロジェクトと Rust for Linux チームの間で隔週の同期ミーティングが行われており、
+feature の安定化に向けた進捗を追跡している。
+このミーティングの議事録は公開されており、安定化の進捗を確認するのに役立つ。
+
+---
+
+## あなたが解決する次の課題は何か?
+
+この教材を通じて、Rust for Linux の基礎を学んできた。
+カーネルモジュールの構造、デバイスモデル、割り込み処理、同期プリミティブ、
+所有権と `unsafe` の境界、FFI の設計原則――これらはすべて、
+**実際のカーネルコードを読み、書き、そして upstream に送るための土台** である。
+
+Rust for Linux はまだ若いプロジェクトである。
+多くのサブシステムで抽象化が不足しており、ドキュメントも充実しているとは言えない。
+これは裏を返せば、**あらゆる場所に貢献の機会がある** ということだ。
+
+最初の貢献は小さなものでよい:
+
+- ドキュメントの typo 修正
+- doctest の追加
+- コンパイラ警告の修正
+- 既存の抽象化への `// SAFETY:` コメントの改善
+
+小さなパッチでも、`git format-patch` で生成し、`checkpatch.pl` を通し、
+`get_maintainer.pl` で送信先を確認し、`git send-email` で送信する。
+この一連の流れを一度経験すれば、次からは自然にできるようになる。
+
+Linux カーネルは、世界中のサーバー、スマートフォン、組込み機器、スーパーコンピュータで動作している。
+あなたが書いた Rust コードが、数十億台のデバイスで走る可能性がある。
+
+**あなたが解決する次の課題は何か?**
+
+---
+
+## 章末演習
+
+### 演習 1: typo 修正パッチの作成
+
+Linux カーネルソースツリーの `samples/rust/` ディレクトリにあるファイルを確認し、
+以下の手順で typo 修正パッチを作成せよ (実際に送信する必要はない)。
+
+1. カーネルソースツリーで作業ブランチを作成する:
+   ```bash
+   git checkout -b fix/rust-sample-typo
+   ```
+
+2. `samples/rust/` 内のコメントやドキュメントに修正すべき箇所を見つける (あるいは練習用に意図的な変更を加える)。
+
+3. 修正をコミットする:
+   ```bash
+   git commit -s -m "samples: rust: fix typo in module description"
+   ```
+
+4. パッチを生成する:
+   ```bash
+   git format-patch -1 -o ~/patches/
+   ```
+
+5. `checkpatch.pl` でチェックする:
+   ```bash
+   scripts/checkpatch.pl ~/patches/0001-*.patch
+   ```
+
+6. 警告やエラーがあれば修正し、再度パッチを生成してチェックを通す。
+
+### 演習 2: get_maintainer.pl の実行
+
+演習 1 で作成したパッチに対して `get_maintainer.pl` を実行し、以下を確認せよ。
+
+```bash
+scripts/get_maintainer.pl ~/patches/0001-*.patch
+```
+
+1. 出力されたメンテナとメーリングリストを列挙せよ。
+2. `--nogit` オプションを付けた場合と付けない場合で出力がどう変わるか比較せよ。
+3. `git send-email --dry-run` で送信内容を確認せよ。
+
+### 演習 3: KUnit テストの実行
+
+以下のコマンドで Rust の KUnit テストを実行し、結果を確認せよ。
+
+```bash
+./tools/testing/kunit/kunit.py run \
+  --make_options LLVM=1 \
+  --arch x86_64 \
+  --kconfig_add CONFIG_RUST=y \
+  --kconfig_add CONFIG_RUST_KERNEL_DOCTESTS=y
+```
+
+1. テストが何件実行され、何件成功したかを報告せよ。
+2. 失敗したテストがあれば、その原因を調査せよ。
+
+---
+
+## 参考資料
+
+- [Submitting patches: the essential guide to getting your code into the kernel](https://www.kernel.org/doc/html/latest/process/submitting-patches.html) — カーネルパッチ投稿の公式ガイド
+- [Linux Kernel patch submission checklist](https://www.kernel.org/doc/html/latest/process/submit-checklist.html) — パッチ投稿チェックリスト
+- [Email clients info for Linux](https://www.kernel.org/doc/html/latest/process/email-clients.html) — メールクライアントの設定ガイド
+- [git-send-email.io](https://git-send-email.io/) — `git send-email` のチュートリアル
+- [Checkpatch — The Linux Kernel documentation](https://docs.kernel.org/dev-tools/checkpatch.html) — checkpatch.pl の公式ドキュメント
+- [Testing — The Linux Kernel documentation (Rust)](https://docs.kernel.org/rust/testing.html) — Rust カーネルコードのテスト方法
+- [KUnit — Linux Kernel Unit Testing](https://docs.kernel.org/dev-tools/kunit/index.html) — KUnit の公式ドキュメント
+- [Rust for Linux 公式サイト](https://rust-for-linux.com/) — プロジェクト全体の情報
+- [Rust for Linux — Rust Project Goals 2026](https://rust-lang.github.io/rust-project-goals/2026/roadmap-rust-for-linux.html) — Rust プロジェクトの RfL 向けロードマップ
+- [Kangrejos](https://kangrejos.com/) — Rust for Linux ワークショップ
+- [Rust for Linux Zulip](https://rust-for-linux.zulipchat.com/) — コミュニティチャット
+- [lore.kernel.org](https://lore.kernel.org/) — カーネルメーリングリストアーカイブ
+- [KernelNewbies — FirstKernelPatch](https://kernelnewbies.org/FirstKernelPatch) — 初めてのカーネルパッチ投稿ガイド
+- [Stable API Nonsense (kernel.org)](https://docs.kernel.org/process/stable-api-nonsense.html)
+- [Bisecting a regression (kernel.org)](https://docs.kernel.org/admin-guide/bug-bisect.html)
+- [DKMS (GitHub)](https://github.com/dell/dkms)

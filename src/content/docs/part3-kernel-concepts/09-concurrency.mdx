@@ -1,0 +1,358 @@
+---
+title: "Ch 6. 並行性と同期プリミティブ"
+description: Mutex, SpinLock, lockdep, 割込コンテキストの制約, Rust の型安全な同期を理解する
+---
+
+## この章で学ぶこと
+
+- カーネルが本質的に並行である理由を理解する
+- Mutex と Spinlock の選択基準を説明できる
+- 「sleep できるか」がなぜ決定的な判断基準なのかを理解する
+- Rust の `Mutex<T>` / `SpinLock<T>` がデータをロック内に閉じ込める設計を把握する
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::sync::Mutex<T>`, `kernel::sync::SpinLock<T>`, `kernel::sync::CondVar`, `new_mutex!`, `new_spinlock!`
+🟢 **安定**: `kernel::sync::atomic::Atomic<T>` (6.18+)
+🟡 **開発中**: RCU の Rust 抽象化 (API 未安定)
+:::
+
+## 前提
+
+- [Ch 8](/part3-kernel-concepts/08-memory/) (メモリ管理) を完了している
+- GFP_KERNEL と GFP_ATOMIC の違いを理解している
+
+## なぜカーネルは並行なのか
+
+ユーザランドのシンプルなプログラムは「main から順に実行される」と考えて大きな問題はない。
+しかしカーネルは常に並行動作している:
+
+1. **SMP (対称型マルチプロセッシング)** — 複数の CPU が同じカーネルコードを同時に実行する
+2. **プリエンプション** — カーネルコード実行中にスケジューラが別のタスクに切り替える場合がある
+3. **割り込み** — ハードウェアからの割り込みがいつでも現在の処理を中断する
+
+つまり、カーネル内のあらゆるデータは**何の保護もなければ壊れる**。
+共有データへのアクセスには必ず同期プリミティブが必要である。
+
+## プロセスコンテキスト vs 割込コンテキスト
+
+カーネルコードは 2 つのコンテキストのどちらかで実行される:
+
+| | プロセスコンテキスト | 割込コンテキスト |
+|---|---|---|
+| 実行契機 | システムコール、workqueue、カーネルスレッド | ハード割り込み、softirq、tasklet |
+| `current` | 有効 (呼び出し元プロセス) | 無意味 (中断されたプロセスを指す) |
+| sleep 可能か | **Yes** | **No** |
+| Mutex 使用可 | **Yes** | **No** |
+| ユーザメモリアクセス | **Yes** | **No** |
+| ページフォルト | **Yes** | **No** |
+
+**この区分を覚えていないと、デッドロックや panic の原因になる。**
+
+割込コンテキストで sleep する (= Mutex を取る、`GFP_KERNEL` で `kmalloc` する、`copy_from_user` する)
+と、カーネルは `BUG: sleeping function called from invalid context` を出力して停止する。
+
+## Mutex
+
+Mutex はプロセスコンテキストで使うロックである。
+ロックが取れない場合、**呼び出し元タスクを sleep させて** 他のタスクに CPU を譲る。
+
+```c title="C の Mutex"
+#include <linux/mutex.h>
+
+static DEFINE_MUTEX(my_mutex);
+static int shared_counter;
+
+void increment(void)
+{
+    mutex_lock(&my_mutex);      /* 取れなければ sleep */
+    shared_counter++;
+    mutex_unlock(&my_mutex);
+}
+```
+
+**特徴:**
+
+- sleep するので **割込コンテキストでは使えない**
+- コンテンション時のオーバーヘッドはコンテキストスイッチのコスト
+- ロックを取ったタスクだけが解放できる (所有権追跡)
+
+## Spinlock
+
+Spinlock は **ビジーウェイト** するロックである。
+ロックが取れるまで CPU がループし続ける (spin)。
+
+```c title="C の Spinlock"
+#include <linux/spinlock.h>
+
+static DEFINE_SPINLOCK(my_lock);
+static int shared_counter;
+
+void increment_irqsafe(void)
+{
+    unsigned long flags;
+    spin_lock_irqsave(&my_lock, flags);   /* ローカル IRQ を無効化 + ロック取得 */
+    shared_counter++;
+    spin_unlock_irqrestore(&my_lock, flags);
+}
+```
+
+**特徴:**
+
+- sleep しないので **割込コンテキストで使える**
+- コンテンション時は CPU を浪費する (short critical section 向け)
+- `spin_lock_irqsave` はローカル CPU の割り込みを無効化する
+
+### なぜ IRQ を無効化するのか
+
+プロセスコンテキストで spinlock を持っている最中にハード割り込みが発生し、
+その割り込みハンドラが同じ spinlock を取ろうとすると、**デッドロック** する:
+
+1. CPU がプロセスコンテキストで spinlock を保持
+2. 割り込み発生 → 同じ CPU で割り込みハンドラが実行
+3. ハンドラが同じ spinlock を取ろうとして spin
+4. しかし spinlock を持っているプロセスコンテキストは再開できない → **永久ループ**
+
+`spin_lock_irqsave` はこの問題を防ぐため、ロック取得前にローカル IRQ を無効化する。
+
+## 選択基準
+
+```
+sleep できる状況か?
+  ├─ Yes → 保護期間が長い or sleep が必要 → Mutex
+  ├─ Yes → 保護期間が非常に短い          → Spinlock でも可 (コンテキストスイッチ回避)
+  └─ No  → (割込コンテキスト)            → Spinlock のみ
+```
+
+| | Spinlock | Mutex |
+|---|---|---|
+| Blocking | ビジーウェイト | sleep |
+| 割込コンテキスト | **可** | **不可** |
+| 保持中に sleep | **不可** | 可 |
+| 保持中に kmalloc(GFP_KERNEL) | **不可** | 可 |
+| オーバーヘッド (非コンテンション時) | 極小 | 小 |
+| オーバーヘッド (コンテンション時) | CPU 浪費 | コンテキストスイッチ |
+
+## lockdep: ロック順序の動的検証
+
+lockdep は `CONFIG_PROVE_LOCKING=y` で有効になるカーネルの機能で、
+ロック取得順序を実行時に追跡し、デッドロックの **可能性** を検出する。
+
+検出する問題:
+
+- **ABBA デッドロック**: タスク 1 が A→B の順にロック、タスク 2 が B→A の順にロック
+- **IRQ 安全性違反**: プロセスコンテキストで IRQ 無効化なしにロックを取り、同じロックを割り込みハンドラでも取る
+- **再帰ロック**: 同じロックを 2 回取ろうとする
+
+lockdep はロックの**インスタンス**ではなく**クラス**を追跡するため、
+全パターンを 1 回観測するだけで問題を検出できる。
+
+## PREEMPT_RT: sleep する spinlock
+
+`PREEMPT_RT` (リアルタイムパッチ) カーネルでは:
+
+- `spinlock_t` が内部的に **rt_mutex** (sleep するロック) に変わる
+- 優先度逆転を防ぐ優先度継承が組み込まれる
+- 割り込みハンドラは自動的にカーネルスレッドに昇格 (threaded IRQ)
+
+`raw_spinlock_t` だけが真のスピンロックとして残る (スケジューラ内部など特殊な用途)。
+
+## Rust 側の同期プリミティブ
+
+### C と Rust の根本的な設計の違い
+
+C のロック:
+
+```c
+static DEFINE_MUTEX(lock);
+static int data;      /* lock で保護される... と書いてあるが強制力はない */
+
+/* ロックを取り忘れても data にアクセスできてしまう */
+data++;  /* バグ! ロックなし */
+```
+
+Rust のロック:
+
+```rust
+use kernel::sync::Mutex;
+
+// data は Mutex の "中" にある。ロックなしにはアクセスできない
+let m: Mutex<i32> = /* ... */;
+
+// ロックを取ると Guard が返る。Guard 経由でのみ data にアクセスできる
+let mut guard = m.lock();
+*guard += 1;
+// guard が drop されると自動で unlock
+```
+
+**Rust では「データがロックの中にある」。** ロックを取らずにデータにアクセスすることは
+型システムレベルで不可能である。
+
+### Mutex\<T\>
+
+```rust
+use kernel::sync::Mutex;
+use kernel::sync::lock::mutex::MutexBackend;
+use kernel::new_mutex;
+
+// Pin + init が必要 (Ch 16 で詳しく扱う)
+let m = KBox::pin_init(new_mutex!(0_i32), GFP_KERNEL)?;
+
+let mut guard = m.lock();
+*guard += 1;
+pr_info!("counter = {}\n", *guard);
+// guard が scope を抜けると自動 unlock
+```
+
+### SpinLock\<T\>
+
+```rust
+use kernel::sync::SpinLock;
+use kernel::new_spinlock;
+
+let s = KBox::pin_init(new_spinlock!(0_i32), GFP_KERNEL)?;
+
+let mut guard = s.lock();
+*guard += 1;
+// guard が scope を抜けると自動 unlock + IRQ 復元
+```
+
+### C ⇔ Rust 対比
+
+| C | Rust |
+|---|---|
+| `DEFINE_MUTEX(m)` + `int data` | `Mutex<i32>` |
+| `mutex_lock(&m)` | `let guard = m.lock()` |
+| `data++` | `*guard += 1` |
+| `mutex_unlock(&m)` | (guard の Drop で自動) |
+| `goto err; ... mutex_unlock(&m);` | (スコープ離脱で自動) |
+
+## RCU の概念
+
+RCU (Read-Copy-Update) は、読み取りが圧倒的に多く書き込みが稀なデータ構造に最適化された同期メカニズムである。
+ルーティングテーブル、モジュールリスト、ファイルシステムのデントリキャッシュなど、
+カーネル内の多くのデータ構造がこのパターンに該当する。
+
+### 基本原理
+
+- **読者 (reader)** はロックを取らずにデータを読める (ロックフリー)
+- **書き手 (updater)** はデータのコピーを作り、変更し、ポインタを差し替える
+- 古いデータは、すべての読者がアクセスを完了した後に解放される (**遅延解放**)
+
+### 主要な API (C)
+
+| API | 役割 |
+|---|---|
+| `rcu_read_lock()` | RCU 読み取りクリティカルセクションの開始 (プリエンプション無効化等) |
+| `rcu_read_unlock()` | RCU 読み取りクリティカルセクションの終了 |
+| `synchronize_rcu()` | すべての既存の RCU 読者が完了するまでブロックする (grace period の待機) |
+| `call_rcu()` | grace period 完了後にコールバックを非同期に呼び出す |
+| `rcu_dereference()` | RCU 保護されたポインタの読み取り (メモリバリア付き) |
+| `rcu_assign_pointer()` | RCU 保護されたポインタの更新 (メモリバリア付き) |
+
+### Grace Period
+
+Grace period とは「すべての既存の RCU 読者がクリティカルセクションを抜けるまでの期間」である。
+書き手は古いデータを grace period の経過後に安全に解放できる。
+
+```
+Reader 1:  [rcu_read_lock ... rcu_read_unlock]
+Reader 2:       [rcu_read_lock ... rcu_read_unlock]
+
+Updater:   ポインタ差替 ────── grace period ──────→ 古いデータを解放
+                         ↑                         ↑
+                    すべての既存読者が            synchronize_rcu() 復帰
+                    完了するのを待つ              or call_rcu() コールバック
+```
+
+### いつ RCU を使うか
+
+- 読み取りが圧倒的に多く、書き込みが稀な場合
+- 読者側のオーバーヘッドを極限まで下げたい場合
+- Spinlock では読者同士の不要な競合が発生する場合
+
+RCU は非常に強力だが、正しく使うには深い理解が必要である。
+詳細は Paul McKenney の著書 *"Is Parallel Programming Hard, And, If So, What Can You Do About It?"*
+および [kernel.org の RCU ドキュメント](https://docs.kernel.org/RCU/) を参照されたい。
+
+:::note
+Rust 側の RCU 抽象化は開発途中であり、API が安定するまでにはまだ時間がかかる。
+現時点では C 側の概念を理解しておくことが重要である。
+:::
+
+## アトミック操作
+
+アトミック操作は、ロックを使わずに単一の変数に対する操作を不可分 (atomic) に行う仕組みである。
+カウンタ、フラグ、参照カウントなどに使用される。
+
+### Rust 側の API: `kernel::sync::atomic`
+
+カーネル 6.18 以降、Rust 側に `kernel::sync::atomic::Atomic<T>` が導入されている。
+これは C の `atomic_t` / `atomic64_t` に相当する型安全なラッパーである。
+
+```rust
+use kernel::sync::atomic::{Atomic, Ordering};
+
+let counter = Atomic::new(0i64);
+
+// アトミックにインクリメント
+counter.fetch_add(1, Ordering::Relaxed);
+
+// 値の読み取り
+let val = counter.load(Ordering::Acquire);
+```
+
+### メモリオーダリング: LKMM vs C11
+
+Linux カーネルは独自のメモリモデル **LKMM (Linux Kernel Memory Model)** を持つ。
+これは C11/C++11 のメモリモデルとは異なる点がある。
+
+主な違い:
+
+- LKMM は `smp_mb()`, `smp_rmb()`, `smp_wmb()` など、Linux 固有のバリア API を定義する
+- C11 の `memory_order_consume` に相当するものとして、LKMM では `READ_ONCE()` + アドレス依存性を使用する
+- LKMM はカーネル特有のハードウェアとの相互作用 (DMA、MMIO 等) も考慮している
+
+Rust カーネルコードでは `Ordering` enum を使用するが、
+その意味論はユーザランドの `std::sync::atomic::Ordering` と完全に同一ではない場合がある。
+カーネル開発においては LKMM のドキュメントを参照すること。
+
+### 副読本
+
+アトミック操作とメモリオーダリングを体系的に学ぶには、以下の書籍が優れている:
+
+- **Mara Bos "Rust Atomics and Locks"** — [marabos.nl/atomics/](https://marabos.nl/atomics/)
+  - Rust のアトミック操作、メモリオーダリング、ロックの実装を丁寧に解説
+  - オンラインで無料公開されている
+  - ユーザランド向けの内容だが、基礎概念はカーネルプログラミングにも直接応用できる
+
+## よくある罠
+
+1. **割込ハンドラ内で Mutex を使う** — panic。Spinlock を使う。
+2. **Guard を長く保持する** — ロック期間が長いとレイテンシが悪化する。必要な処理だけ Guard のスコープ内で行う。
+3. **`Mutex<T>` から `&T` を直接借りたがる** — Guard 経由でしかアクセスできない。これは意図的な設計。
+4. **C の癖で `unlock` を明示的に呼ぼうとする** — Rust では Guard の Drop が unlock。明示的な unlock API はない。
+
+## 章末演習
+
+1. C でグローバルカウンタを Mutex で保護し、2 つの kthread から同時にインクリメントするモジュールを書け。
+
+2. 同じものを Spinlock に置き換えて動作を確認せよ。
+
+3. (発展) 意図的に `mutex_lock` を割込コンテキストから呼ぶコードを書き、
+   `CONFIG_DEBUG_ATOMIC_SLEEP=y` の警告メッセージを `dmesg` で確認せよ。
+
+---
+
+次の章 → [Ch 23. データ構造とデバッグ技法](/part7-observability/23-debug-tracing/)
+
+## 参考資料
+
+- [Unreliable Guide To Locking (kernel.org)](https://docs.kernel.org/kernel-hacking/locking.html)
+- [Lock types and their rules (kernel.org)](https://docs.kernel.org/locking/locktypes.html)
+- [Runtime locking correctness validator (kernel.org)](https://docs.kernel.org/locking/lockdep-design.html)
+- [kernel::sync (rustdoc)](https://rust.docs.kernel.org/kernel/sync/)
+- [RCU concepts (kernel.org)](https://docs.kernel.org/RCU/)
+- Paul McKenney, *"Is Parallel Programming Hard, And, If So, What Can You Do About It?"* — [kernel.org/pub/linux/kernel/people/paulmck/perfbook/perfbook.html](https://kernel.org/pub/linux/kernel/people/paulmck/perfbook/perfbook.html)
+- [LKMM (Linux Kernel Memory Model)](https://docs.kernel.org/locking/explanation.html)
+- Mara Bos, *"Rust Atomics and Locks"* — [marabos.nl/atomics/](https://marabos.nl/atomics/)
+- [kernel::sync::atomic (rustdoc)](https://rust.docs.kernel.org/kernel/sync/atomic/)

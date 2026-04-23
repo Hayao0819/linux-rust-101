@@ -1,0 +1,264 @@
+---
+title: "Ch 12. Platform Driver と PCI Driver"
+description: Platform/PCI ドライバの実装, MMIO, BAR, MSI, Rust 側の抽象を学ぶ
+---
+
+## この章で学ぶこと
+
+- Platform driver を C と Rust の両方で実装できる
+- PCI の基本概念 (BAR, config space, MSI) を把握する
+- `kernel::platform::Driver` と `kernel::pci::Driver` の使い方を理解する
+- QEMU の仮想デバイスでテストできる
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::platform::Driver` (OF_ID_TABLE, probe/remove)
+🟢 **安定**: `kernel::pci::Driver` (PCI_ID_TABLE, probe/remove)
+🟢 **安定**: `kernel::types::Devres<T>` (device-managed リソース)
+:::
+
+## 前提
+
+- [Ch 15](/part5-hardware/15-device-model/) (デバイスモデル) を完了している
+
+## Platform Driver (C 版)
+
+Platform デバイスは、PCI や USB のような自己発見可能なバスに接続されていないデバイスである。
+SoC 内蔵ペリフェラル (UART, GPIO, タイマ) の大半がこれに該当する。
+
+```c title="my_platform.c"
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/of.h>
+#include <linux/io.h>
+
+struct my_data {
+    void __iomem *base;
+    int irq;
+};
+
+static int my_probe(struct platform_device *pdev)
+{
+    struct my_data *data;
+    struct resource *res;
+
+    data = devm_kzalloc(&pdev->dev, sizeof(*data), GFP_KERNEL);
+    if (!data)
+        return -ENOMEM;
+
+    /* MMIO 領域を取得 & マッピング */
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    data->base = devm_ioremap_resource(&pdev->dev, res);
+    if (IS_ERR(data->base))
+        return PTR_ERR(data->base);
+
+    /* IRQ を取得 */
+    data->irq = platform_get_irq(pdev, 0);
+    if (data->irq < 0)
+        return data->irq;
+
+    platform_set_drvdata(pdev, data);
+    dev_info(&pdev->dev, "probed: base=%p irq=%d\n", data->base, data->irq);
+    return 0;
+}
+
+static void my_remove(struct platform_device *pdev)
+{
+    dev_info(&pdev->dev, "removed\n");
+    /* devm_ で確保したリソースは自動解放 */
+}
+
+static const struct of_device_id my_of_match[] = {
+    { .compatible = "myvendor,mydevice" },
+    { /* sentinel */ },
+};
+MODULE_DEVICE_TABLE(of, my_of_match);
+
+static struct platform_driver my_driver = {
+    .probe  = my_probe,
+    .remove = my_remove,
+    .driver = {
+        .name = "my_driver",
+        .of_match_table = my_of_match,
+    },
+};
+module_platform_driver(my_driver);
+
+MODULE_LICENSE("GPL");
+```
+
+`module_platform_driver()` マクロは `module_init` / `module_exit` と
+`platform_driver_register` / `platform_driver_unregister` を一括で生成する。
+
+## Platform Driver (Rust 版)
+
+```rust title="概念コード"
+use kernel::prelude::*;
+use kernel::platform;
+
+module! {
+    type: MyPlatformModule,
+    name: "my_platform_rust",
+    author: "Your Name",
+    license: "GPL",
+}
+
+struct MyPlatformDriver;
+
+impl platform::Driver for MyPlatformDriver {
+    type IdInfo = ();
+    const OF_ID_TABLE: Option<&'static [platform::OfDeviceId]> = Some(&[
+        platform::OfDeviceId::new(b"myvendor,mydevice"),
+    ]);
+
+    fn probe(dev: &platform::Device, _info: &Self::IdInfo) -> Result<Pin<KBox<Self>>> {
+        dev_info!(dev.as_ref(), "probed (Rust)\n");
+        let data = KBox::new(MyPlatformDriver, GFP_KERNEL)?;
+        Ok(data.into())
+    }
+}
+
+impl Drop for MyPlatformDriver {
+    fn drop(&mut self) {
+        pr_info!("removed (Rust)\n");
+    }
+}
+```
+
+> 実際の API は `samples/rust/rust_driver_platform.rs` を参照すること。
+
+## PCI の基本概念
+
+PCI (Peripheral Component Interconnect) は自己発見可能なバスである。
+カー��ルは起動時にバスをスキャンし、接続されたデバイスを列挙する。
+
+### Config Space
+
+各 PCI デバイスは 256 バイト (PCIe は 4096 バイト) の設定空間を持つ:
+
+| オフセット | フィールド | 用途 |
+|---|---|---|
+| 0x00 | Vendor ID | 製造者を特定 (例: 0x8086 = Intel) |
+| 0x02 | Device ID | デバイスを特定 |
+| 0x04 | Command | デバイスの有効化/無効化 |
+| 0x10-0x24 | BAR 0-5 | メモリ/I/O リソースのベースアドレス |
+
+### BAR (Base Address Register)
+
+BAR はデバイスの MMIO 領域やポート I/O 領域のアドレスを示す。
+
+```c
+/* BAR 0 のアドレスとサイズを取得 */
+resource_size_t start = pci_resource_start(pdev, 0);
+resource_size_t len = pci_resource_len(pdev, 0);
+
+/* BAR 0 を ioremap */
+void __iomem *base = pci_ioremap_bar(pdev, 0);
+
+/* MMIO レジス���の読み書き */
+u32 val = ioread32(base + 0x10);
+iowrite32(0x1, base + 0x14);
+```
+
+### MSI / MSI-X
+
+MSI (Message Signaled Interrupts) は従来のピンベースの割り込みに代わる仕組み。
+メモリ書き込みで割り込��を通知するため、共有 IRQ の問題がない。
+
+```c
+int nvec = pci_alloc_irq_vectors(pdev, 1, 4, PCI_IRQ_MSI | PCI_IRQ_MSIX);
+int irq = pci_irq_vector(pdev, 0);
+request_irq(irq, my_handler, 0, "my_pci", data);
+```
+
+## PCI Driver のスケルトン (C)
+
+```c title="my_pci.c"
+static int my_pci_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+{
+    int ret;
+    void __iomem *base;
+
+    ret = pcim_enable_device(pdev);  /* devm 版の pci_enable_device */
+    if (ret)
+        return ret;
+
+    base = pcim_iomap(pdev, 0, 0);  /* BAR 0 を devm ioremap */
+    if (!base)
+        return -ENOMEM;
+
+    pci_set_master(pdev);  /* バスマスタリングを有効化 */
+
+    dev_info(&pdev->dev, "probed: BAR0=%p\n", base);
+    return 0;
+}
+
+static void my_pci_remove(struct pci_dev *pdev)
+{
+    dev_info(&pdev->dev, "removed\n");
+}
+
+static const struct pci_device_id my_pci_ids[] = {
+    { PCI_DEVICE(0x1234, 0x0001) },  /* vendor=0x1234, device=0x0001 */
+    { /* sentinel */ },
+};
+MODULE_DEVICE_TABLE(pci, my_pci_ids);
+
+static struct pci_driver my_pci_driver = {
+    .name     = "my_pci",
+    .id_table = my_pci_ids,
+    .probe    = my_pci_probe,
+    .remove   = my_pci_remove,
+};
+module_pci_driver(my_pci_driver);
+
+MODULE_LICENSE("GPL");
+```
+
+## QEMU でのテスト
+
+```bash
+# pci-testdev デバイスを追加して起動
+qemu-system-x86_64 \
+    -kernel bzImage \
+    -device pci-testdev \
+    -nographic -append "console=ttyS0"
+
+# ゲスト内で PCI デバイスを確認
+lspci
+# 00:03.0 Unassigned class: Device 1b36:0005
+```
+
+`samples/rust/rust_driver_pci.rs` は QEMU の `pci-testdev` 向けに書かれている。
+
+## C ⇔ Rust 対比
+
+| C | Rust |
+|---|---|
+| `module_platform_driver(drv)` | `impl platform::Driver` + `module!` |
+| `of_match_table` | `const OF_ID_TABLE` |
+| `probe()` returns int | `probe()` returns `Result<Pin<KBox<Self>>>` |
+| `devm_*` で自動解放 | `Devres<T>` + Drop |
+| `pci_device_id` テーブル | `const PCI_ID_TABLE` |
+
+## よくある罠
+
+1. **`pci_enable_device` を忘れる** — BAR に��クセスする前にデバイスを有効化する必要がある。
+2. **`-EPROBE_DEFER` を返し忘れる** — 依存リソースが未準備の場合に必要。
+3. **BAR 0 のサイズを誤認する** — `pci_resource_len` で正確に取得する。
+4. **`pci_set_master` を忘れる** — DMA を使うデバイスではバスマスタリングが必要。
+
+## 章末演習
+
+1. `lspci -v` で自分のマシンの PCI デバイスを確認し、各デバイスの BAR を読み取れ。
+
+2. QEMU `-device pci-testdev` で `samples/rust/rust_driver_pci.rs` をロードし、probe メッセージを確認せよ。
+
+3. `samples/rust/rust_driver_platform.rs` を読み、probe / remove の処理を説明せよ。
+
+## 参考資料
+
+- [PCI (kernel.org)](https://docs.kernel.org/PCI/)
+- [Platform Devices (kernel.org)](https://docs.kernel.org/driver-api/driver-model/platform.html)
+- [kernel::platform (rustdoc)](https://rust.docs.kernel.org/kernel/platform/)
+- [kernel::pci (rustdoc)](https://rust.docs.kernel.org/kernel/pci/)
+- [samples/rust/rust_driver_pci.rs](https://github.com/torvalds/linux/blob/master/samples/rust/rust_driver_pci.rs)

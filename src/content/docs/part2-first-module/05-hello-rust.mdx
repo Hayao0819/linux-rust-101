@@ -1,0 +1,272 @@
+---
+title: "Ch 4. 最初のカーネルモジュール — Rust 版"
+description: Ch 3 と同じ Hello World を Rust で書き、C 版との違いを理解する
+---
+
+## この章で学ぶこと
+
+- `module!` マクロが生成するもの (C ABI シンボル、modinfo セクション) を理解する
+- `Module` trait と `init` メソッドの役割を把握する
+- `impl Drop` が `cleanup_module` 相当であることを理解する
+- `pr_info!` と `printk` の関係を追える
+
+:::note[Rust API ステータス]
+🟢 **安定**: `module!` マクロ, `kernel::Module` trait, `pr_info!` / `pr_err!`, `ThisModule`, `kernel::prelude::*`
+:::
+
+## 前提
+
+- [Ch 4](/part2-first-module/04-hello-c/) (C 版モジュール) を完了している
+- `module_init` / `module_exit` / `printk` の役割を理解している
+
+## C 版と Rust 版の対比
+
+[Ch 4](/part2-first-module/04-hello-c/) で書いた C モジュールは以下の構造を持っていた:
+
+```c title="C 版 (復習)"
+#include <linux/init.h>
+#include <linux/module.h>
+
+static int __init hello_init(void) {
+    pr_info("hello: loaded\n");
+    return 0;
+}
+static void __exit hello_exit(void) {
+    pr_info("hello: unloaded\n");
+}
+module_init(hello_init);
+module_exit(hello_exit);
+MODULE_LICENSE("GPL");
+```
+
+同じことを Rust で書くと:
+
+```rust title="Rust 版"
+// SPDX-License-Identifier: GPL-2.0
+
+//! Minimal Rust kernel module.
+
+use kernel::prelude::*;
+
+module! {
+    type: HelloRust,
+    name: "hello_rust",
+    author: "Your Name",
+    description: "A minimal hello world kernel module in Rust",
+    license: "GPL",
+}
+
+struct HelloRust;
+
+impl kernel::Module for HelloRust {
+    fn init(_module: &ThisModule) -> Result<Self> {
+        pr_info!("hello_rust: module loaded\n");
+        Ok(HelloRust)
+    }
+}
+
+impl Drop for HelloRust {
+    fn drop(&mut self) {
+        pr_info!("hello_rust: module unloaded\n");
+    }
+}
+```
+
+## 逐行解説
+
+### `use kernel::prelude::*`
+
+カーネル Rust モジュールで頻繁に使う型やマクロを一括で import する。
+`prelude` には以下が含まれる:
+
+- `pr_info!`, `pr_warn!`, `pr_err!` など — printk ラッパーマクロ
+- `Result` — `kernel::error::Result<T>` のエイリアス
+- `ThisModule` — 現在のモジュールへの参照
+- `module!` — モジュール宣言マクロ
+- その他基本型
+
+### `module!` マクロ
+
+```rust
+module! {
+    type: HelloRust,       // Module trait を実装する型
+    name: "hello_rust",    // モジュール名 (lsmod で表示される)
+    author: "Your Name",
+    description: "...",
+    license: "GPL",        // MODULE_LICENSE 相当
+}
+```
+
+このマクロは手続き的マクロ (proc-macro) であり、以下を生成する:
+
+1. **`init_module` 関数** — C ABI で `module_init` 相当のエントリポイント
+2. **`cleanup_module` 関数** — C ABI で `module_exit` 相当
+3. **modinfo セクション** — `MODULE_LICENSE`, `MODULE_AUTHOR`, `MODULE_DESCRIPTION` 相当のメタデータ
+4. **`__this_module` への参照** — `ThisModule` 型として Rust 側に渡す
+
+つまり、[Ch 4](/part2-first-module/04-hello-c/) で手動で書いた `module_init()` + `module_exit()` + `MODULE_*` マクロの一式を、
+Rust では `module!` マクロ 1 つで宣言する。
+
+### `Module` trait
+
+```rust
+impl kernel::Module for HelloRust {
+    fn init(_module: &ThisModule) -> Result<Self> {
+        pr_info!("hello_rust: module loaded\n");
+        Ok(HelloRust)
+    }
+}
+```
+
+C 版との決定的な違い:
+
+| 観点 | C 版 | Rust 版 |
+|---|---|---|
+| 初期化関数の戻り値 | `int` (0 = 成功, 負 = errno) | `Result<Self>` (Ok = 成功 + 値を返す, Err = エラー) |
+| クリーンアップ | 別関数 `module_exit(fn)` | `impl Drop` (RAII) |
+| リソース管理 | `goto err_cleanup;` パターン | `?` 演算子で自動伝播 |
+
+`init` が **`Ok(HelloRust)`** を返すことに注目してほしい。
+この返り値の `HelloRust` インスタンスがカーネルに保持され、
+モジュールがアンロードされるときに `Drop::drop` が呼ばれる。
+
+つまり、**init で返した値の Drop が cleanup に対応する**。
+
+### `impl Drop`
+
+```rust
+impl Drop for HelloRust {
+    fn drop(&mut self) {
+        pr_info!("hello_rust: module unloaded\n");
+    }
+}
+```
+
+C 版では `module_exit(hello_exit)` で明示的にクリーンアップ関数を登録した。
+Rust 版では、`Module::init` が返した値の `Drop` 実装が自動的に呼ばれる。
+
+これは Rust の **RAII (Resource Acquisition Is Initialization)** パターンである。
+リソースの確保 (init) と解放 (drop) が型に紐づくため、解放忘れが構造的に防がれる。
+
+### `pr_info!` マクロ
+
+```rust
+pr_info!("hello_rust: module loaded\n");
+```
+
+内部的には `printk(KERN_INFO ...)` に展開される。
+Rust の `format_args!` を使ってフォーマット文字列を処理し、
+最終的に C の `printk` 関数を呼び出す。
+
+## out-of-tree モジュールで試す
+
+カーネルソースツリー外でも Rust モジュールをビルドできる。
+公式テンプレートを使う:
+
+```bash
+git clone https://github.com/Rust-for-Linux/rust-out-of-tree-module.git
+cd rust-out-of-tree-module
+
+# KDIR にカーネルソースのパスを指定
+make KDIR=/path/to/linux LLVM=1
+```
+
+このテンプレートには `Makefile`, `Kbuild`, `rust_out_of_tree.rs` が含まれている。
+これを改変して自分のモジュールを作る出発点にするのが最も簡単である。
+
+## エラーハンドリング: `?` 演算子
+
+C 版では初期化中にエラーが起きると、`goto` でクリーンアップに飛ぶ:
+
+```c title="C のエラーハンドリング"
+static int __init my_init(void)
+{
+    int ret;
+
+    buf = kmalloc(BUF_SIZE, GFP_KERNEL);
+    if (!buf)
+        return -ENOMEM;
+
+    ret = register_device();
+    if (ret)
+        goto err_free_buf;
+
+    return 0;
+
+err_free_buf:
+    kfree(buf);
+    return ret;
+}
+```
+
+Rust 版では `?` 演算子が同じ役割を果たす:
+
+```rust title="Rust のエラーハンドリング"
+fn init(_module: &ThisModule) -> Result<Self> {
+    let buf = KVec::with_capacity(BUF_SIZE, GFP_KERNEL)?;  // 失敗したら Err を返す
+    let _reg = register_device()?;  // 失敗したら buf が自動で drop される
+    Ok(Self { buf, _reg })
+}
+```
+
+`?` が `Err` を返すとき、それまでにスタック上に作られた値が自動的に `drop` される。
+C の `goto err_cleanup` パターンが不要になる。
+
+## サンプルモジュールを読む
+
+カーネルソースの `samples/rust/` に参考になるサンプルがある:
+
+```bash
+ls samples/rust/
+# rust_minimal.rs      -- 最小限のモジュール
+# rust_print.rs        -- pr_* マクロの例
+# rust_misc_device.rs  -- miscdevice ドライバ (Ch 9 で詳しく扱う)
+```
+
+`rust_minimal.rs` の内容は、本章で書いたものとほぼ同じである。
+
+## C ⇔ Rust 対応表
+
+| C | Rust |
+|---|---|
+| `#include <linux/module.h>` | `use kernel::prelude::*;` |
+| `MODULE_LICENSE("GPL")` | `license: "GPL"` (module! 内) |
+| `module_init(fn)` | `impl Module { fn init() -> Result<Self> }` |
+| `module_exit(fn)` | `impl Drop { fn drop() }` |
+| `printk(KERN_INFO "...")` | `pr_info!("...")` |
+| `return -ENOMEM;` | `return Err(ENOMEM);` or `?` |
+| `goto err_cleanup;` | `?` 演算子 + Drop |
+| `MODULE_PARM_DESC(...)` | (6.18 時点では Rust 側未サポート) |
+
+## よくある罠
+
+1. **`license: "GPL"` 以外にする** — C 版と同様、GPL-only シンボルが使えなくなる。
+
+2. **`Ok(())` を返そうとする** — `Module::init` は `Result<Self>` を返す。
+   `Self` 型のインスタンスを返さないとコンパイルエラーになる。
+
+3. **`pr_info!` の末尾に `\n` を忘れる** — C の `printk` と同様、改行は手動で入れる必要がある。
+
+4. **out-of-tree ビルドで `LLVM=1` を忘れる** — Rust モジュールは LLVM/Clang が必須。
+
+## 章末演習
+
+1. `rust-out-of-tree-module` テンプレートをクローンし、自分の名前を出力するモジュールに改変せよ。
+   `insmod` / `dmesg` / `rmmod` のサイクルを virtme-ng 上で実行せよ。
+
+2. `init` 関数で意図的に `Err(kernel::error::code::ENOMEM)` を返し、
+   モジュールのロードが失敗することを確認せよ。`dmesg` にどのようなメッセージが出るか記録せよ。
+
+3. `samples/rust/rust_minimal.rs` のソースを読み、本章で書いたコードとの差分を説明せよ。
+
+---
+
+次の章 → [Ch 8. カーネルのメモリ管理](/part3-kernel-concepts/08-memory/)
+
+## 参考資料
+
+- [samples/rust/ (カーネルソース)](https://github.com/torvalds/linux/tree/master/samples/rust)
+- [rust-out-of-tree-module (GitHub)](https://github.com/Rust-for-Linux/rust-out-of-tree-module)
+- [module! マクロ (rustdoc)](https://rust.docs.kernel.org/macros/macro.module.html)
+- [pr_info! マクロ (rustdoc)](https://rust.docs.kernel.org/kernel/macro.pr_info.html)
+- [kernel::prelude (rustdoc)](https://rust.docs.kernel.org/kernel/prelude/index.html)

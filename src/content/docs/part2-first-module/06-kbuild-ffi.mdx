@@ -1,0 +1,512 @@
+---
+title: "Ch 6. kbuild と FFI の仕組み"
+description: "bindgen, helpers.c, Opaque, ForeignOwnable, kbuild の Rust ファイル処理フローを理解する"
+---
+
+## この章で学ぶこと
+
+- bindgen が C ヘッダから何を生成するかを理解する
+- `rust/helpers.c` がなぜ必要かを説明できる
+- `#[repr(C)]`, `extern "C"`, `Opaque<T>`, `ForeignOwnable` の役割を把握する
+- kbuild が Rust ソースをどう処理してオブジェクトファイルにするかを追える
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::types::Opaque<T>`, `kernel::types::ForeignOwnable`, `#[repr(C)]`, `extern "C"`, bindgen 自動生成バインディング
+:::
+
+## 前提
+
+- [Ch 20](/part6-rust-kernel/20-ownership-unsafe/) (所有権・unsafe) と [Ch 21](/part6-rust-kernel/21-pin/) (Pin) を完了している
+- C の ABI (呼び出し規約、構造体レイアウト) の基本概念を知っている
+
+---
+
+## FFI とは何か
+
+FFI (Foreign Function Interface) とは、ある言語から別の言語の関数やデータ構造にアクセスするための仕組みである。
+Rust for Linux においては、**Rust から C カーネル API を呼ぶ** こと、および **C からマクロが生成した Rust シンボルを呼ぶ** ことの双方が FFI に該当する。
+
+カーネルにおける FFI の特殊性は次の点にある:
+
+1. **libcが存在しない** — ユーザ空間の `libc::malloc` のような便利な仲介層はない
+2. **ヘッダが巨大** — `linux/fs.h` のような C ヘッダは何万行にもなる
+3. **static inline 関数が多い** — ヘッダ内に定義された関数はリンカから見えない
+4. **カーネル ABI は安定ではない** — バージョンごとに構造体のフィールドが変わる
+
+これらの問題を、bindgen とヘルパー関数で解決するのが Rust for Linux のアプローチである。
+
+---
+
+## bindgen が生成するもの — `bindings_generated.rs`
+
+### bindgen の役割
+
+[bindgen](https://rust-lang.github.io/rust-bindgen/) は C ヘッダファイルを解析し、対応する Rust の FFI 宣言を自動生成するツールである。
+カーネルのビルドシステムは `rust/bindings/bindings_helper.h` を入力として bindgen を実行し、
+`rust/bindings/bindings_generated.rs` を出力する。
+
+```c title="rust/bindings/bindings_helper.h (抜粋)"
+/* SPDX-License-Identifier: GPL-2.0 */
+
+#include <linux/slab.h>
+#include <linux/refcount.h>
+#include <linux/wait.h>
+#include <linux/sched.h>
+#include <linux/workqueue.h>
+#include <linux/mutex.h>
+#include <linux/spinlock.h>
+```
+
+このヘッダに `#include` を追加すると、対応する C の型・定数・関数宣言が Rust から利用可能になる。
+
+### 生成されるコードの例
+
+bindgen は C の構造体、関数宣言、定数を以下のように変換する:
+
+```rust title="bindings_generated.rs (概念的な抜粋)"
+// C: struct mutex { ... };
+#[repr(C)]
+pub struct mutex {
+    pub owner: atomic_long_t,
+    pub wait_lock: spinlock_t,
+    pub osq: optimistic_spin_queue,
+    pub wait_list: list_head,
+    // ... (カーネル設定によりフィールドが変わる)
+}
+
+// C: #define GFP_KERNEL (___GFP_RECLAIM | ___GFP_IO | ___GFP_FS)
+pub const GFP_KERNEL: gfp_t = 3264;
+
+// C: extern void mutex_lock(struct mutex *lock);
+extern "C" {
+    pub fn mutex_lock(lock: *mut mutex);
+    pub fn mutex_unlock(lock: *mut mutex);
+}
+```
+
+### bindgen の限界
+
+bindgen が扱えないものがある:
+
+| 扱えるもの | 扱えないもの |
+|---|---|
+| 通常の関数宣言 (`extern`) | `static inline` 関数 |
+| 構造体定義 | C マクロで定義された「関数もどき」 |
+| `#define` の整数定数 | 複雑なマクロ展開 |
+| `enum` 定義 | ビットフィールド (部分的) |
+
+`static inline` 関数がなぜ問題かは、次節で説明する。
+
+---
+
+## `rust/helpers.c` — static inline 関数のラッパー
+
+### なぜラッパーが必要か
+
+C カーネルでは、パフォーマンス上の理由からヘッダ内に `static inline` で定義された関数が多数ある:
+
+```c title="include/linux/spinlock.h (概念)"
+static __always_inline void spin_lock(spinlock_t *lock)
+{
+    raw_spin_lock(&lock->rlock);
+}
+```
+
+この `spin_lock` は **コンパイル単位ごとにインライン展開される** ため、
+独立したシンボルとしてオブジェクトファイルに存在しない。
+つまり、Rust 側から `extern "C"` で呼ぶことができない。
+
+### ヘルパー関数の仕組み
+
+この問題を解決するため、`rust/helpers.c` に薄いラッパー関数を定義する:
+
+```c title="rust/helpers.c (抜粋)"
+#include <linux/spinlock.h>
+#include <linux/mutex.h>
+#include <linux/refcount.h>
+
+void rust_helper_spin_lock(spinlock_t *lock)
+{
+    spin_lock(lock);
+}
+EXPORT_SYMBOL_GPL(rust_helper_spin_lock);
+
+void rust_helper_mutex_lock(struct mutex *lock)
+{
+    mutex_lock(lock);
+}
+EXPORT_SYMBOL_GPL(rust_helper_mutex_lock);
+
+refcount_t rust_helper_REFCOUNT_INIT(int n)
+{
+    return (refcount_t)REFCOUNT_INIT(n);
+}
+EXPORT_SYMBOL_GPL(rust_helper_REFCOUNT_INIT);
+```
+
+ポイントは以下の通り:
+
+1. **`rust_helper_` プレフィックス** — 命名規則で他のシンボルと区別する
+2. **`EXPORT_SYMBOL_GPL`** — Rust のオブジェクトファイルからリンクできるようにシンボルをエクスポートする
+3. **関数本体は 1 行** — 単に `static inline` 関数を呼ぶだけ。コンパイラが実体を作り出す
+
+Rust 側では bindgen がこのラッパーの宣言を自動的に拾い、
+`bindings::rust_helper_spin_lock()` として呼べるようになる。
+さらにカーネルの Rust 抽象層が安全なラッパーを提供する:
+
+```rust title="kernel/sync/lock/spinlock.rs (概念)"
+// 安全な Rust API
+impl<T: ?Sized> SpinLock<T> {
+    pub fn lock(&self) -> Guard<'_, Self> {
+        // SAFETY: `self.lock` は有効な spinlock_t である
+        unsafe { bindings::rust_helper_spin_lock(self.lock.get()) }
+        // Guard が scope を抜けるとき unlock する
+        // SAFETY: 上で lock を取得した
+        unsafe { Guard::new(self) }
+    }
+}
+```
+
+### helpers.c に新しいラッパーを追加する
+
+新しい `static inline` 関数を Rust から使いたい場合の手順:
+
+1. `rust/helpers.c` にラッパー関数を追加する
+2. `EXPORT_SYMBOL_GPL` でエクスポートする
+3. 必要に応じて `rust/bindings/bindings_helper.h` にヘッダの `#include` を追加する
+4. カーネルを再ビルドすると、bindgen が自動的に Rust 側の宣言を生成する
+
+---
+
+## `#[repr(C)]` と `extern "C"`
+
+### `#[repr(C)]`
+
+Rust のデフォルトの構造体レイアウトは言語仕様で規定されていない。
+コンパイラはフィールドの並び替えやパディングの最適化を自由に行える。
+
+C の構造体と互換性のあるレイアウトにするには `#[repr(C)]` を付与する:
+
+```rust
+// C 互換レイアウト: フィールド順・アラインメントが C と同一
+#[repr(C)]
+struct FileOperations {
+    owner: *mut bindings::module,
+    open: Option<unsafe extern "C" fn(*mut bindings::inode, *mut bindings::file) -> i32>,
+    release: Option<unsafe extern "C" fn(*mut bindings::inode, *mut bindings::file) -> i32>,
+    // ...
+}
+```
+
+`#[repr(C)]` がないと、Rust コンパイラがフィールドを並び替える可能性があり、
+C 側から渡されたポインタで構造体にアクセスすると **メモリ破壊** が起こる。
+
+### `extern "C"`
+
+関数の呼び出し規約を C ABI に合わせる:
+
+```rust
+// Rust → C: C の関数を呼ぶ宣言
+extern "C" {
+    fn printk(fmt: *const c_char, ...) -> c_int;
+}
+
+// C → Rust: C から呼ばれるコールバック
+unsafe extern "C" fn my_open(
+    inode: *mut bindings::inode,
+    file: *mut bindings::file,
+) -> c_int {
+    // ...
+    0
+}
+```
+
+`extern "C"` を付けないと、Rust のデフォルト呼び出し規約が使われるため、
+引数のレジスタ割り当てやスタックフレームの構造が C 側と合わず、即座にクラッシュする。
+
+---
+
+## `Opaque<T>` — C の構造体を安全に包む
+
+### 問題: C 構造体の直接利用は危険
+
+bindgen が生成した `bindings::mutex` をそのまま Rust で使うと、以下の問題が起こる:
+
+1. **Move される** — Rust はデフォルトで値を move する。C の `mutex` は内部にポインタを持ち、move すると壊れる
+2. **サイズが不安定** — カーネル config により構造体のサイズが変わる
+3. **直接アクセスされる** — Rust コードが内部フィールドを直接触ると抽象化が壊れる
+
+### `Opaque<T>` の設計
+
+[`kernel::types::Opaque<T>`](https://rust.docs.kernel.org/kernel/types/struct.Opaque.html) はこれらの問題を解決する型である:
+
+```rust title="kernel/types.rs (簡略化)"
+#[repr(transparent)]
+pub struct Opaque<T> {
+    value: UnsafeCell<MaybeUninit<T>>,
+    _pin: PhantomPinned,
+}
+```
+
+各要素の意味:
+
+| 構成要素 | 役割 |
+|---|---|
+| `UnsafeCell<...>` | 内部可変性を提供 (C 関数が `*mut` で変更できるように) |
+| `MaybeUninit<T>` | 未初期化状態を許容 (C 側で初期化するため) |
+| `PhantomPinned` | `Unpin` を実装しない → Pin で固定を強制 |
+| `#[repr(transparent)]` | メモリレイアウトが `T` と同一 |
+
+### 使用例: Mutex の内部
+
+```rust title="kernel/sync/lock/mutex.rs (概念)"
+pub struct Mutex<T: ?Sized> {
+    /// C の `struct mutex`
+    lock: Opaque<bindings::mutex>,
+    /// ロックで保護されるデータ
+    data: UnsafeCell<T>,
+}
+```
+
+`Opaque<bindings::mutex>` により:
+
+- `Pin` なしでは move できない (`PhantomPinned`)
+- 初期化は C の `mutex_init()` ヘルパー経由で行う
+- Rust コードが内部フィールドに直接アクセスできない
+
+[Ch 21](/part6-rust-kernel/21-pin/) で学んだ `Pin` と `pinned-init` が、まさにこの `Opaque<T>` の初期化問題を解決するために存在する。
+
+---
+
+## `ForeignOwnable` — 所有権を C に渡す
+
+C カーネルでは、コールバックにコンテキストデータを渡すために `void *` ポインタを多用する。
+例えば `request_irq()` の `dev_id` パラメータがそれに当たる。
+
+`ForeignOwnable` trait は、Rust の所有権を C の `void *` に変換し、後で取り戻すための仕組みである:
+
+```rust title="kernel::types::ForeignOwnable (概念)"
+pub trait ForeignOwnable: Sized {
+    /// 所有権付きの raw ポインタに変換
+    fn into_foreign(self) -> *const core::ffi::c_void;
+
+    /// raw ポインタから所有権を取り戻す
+    /// SAFETY: `into_foreign` で作成したポインタを一度だけ渡すこと
+    unsafe fn from_foreign(ptr: *const core::ffi::c_void) -> Self;
+
+    /// 借用として参照する (所有権は移動しない)
+    /// SAFETY: `into_foreign` で作成したポインタであること
+    unsafe fn borrow<'a>(ptr: *const core::ffi::c_void) -> Self::Borrowed<'a>;
+}
+```
+
+`Box<T>`, `Arc<T>`, `ARef<T>` がこの trait を実装しており、典型的には次のように使う:
+
+```rust
+// 所有権を C に渡す
+let data = KBox::new(MyData { ... }, GFP_KERNEL)?;
+let ptr = data.into_foreign();  // *const c_void を得る
+// C のコールバック登録に ptr を渡す
+
+// C からのコールバック内で取り戻す
+unsafe {
+    let data: KBox<MyData> = KBox::from_foreign(ptr);
+    // data を使用...
+}
+```
+
+`into_foreign` は所有権を消費する (`self` を取る) ため、
+Rust 側から `data` を二度使うとコンパイルエラーになる。
+これにより、C の `void *` ポインタ経由でも所有権の二重解放を防止できる。
+
+---
+
+## kbuild の Rust ファイル処理フロー
+
+### 全体像
+
+カーネルのビルドシステム (kbuild) は、Rust ソースファイルを以下の流れで処理する:
+
+```
+┌─────────────────────────────────────────────────────┐
+│ 1. bindgen                                          │
+│    bindings_helper.h  ──→  bindings_generated.rs    │
+└────────────────────────────┬────────────────────────┘
+                             │ (Rust ソースが参照)
+┌────────────────────────────▼────────────────────────┐
+│ 2. rustc (コアライブラリ)                             │
+│    core, alloc, kernel crate をコンパイル             │
+│    rustc --edition=2021 --emit=obj ...               │
+└────────────────────────────┬────────────────────────┘
+                             │
+┌────────────────────────────▼────────────────────────┐
+│ 3. rustc (ドライバ / モジュール)                      │
+│    drivers/foo/bar.rs  ──→  bar.o                   │
+│    rustc --edition=2021 --emit=obj                   │
+│          --extern kernel=...                         │
+│          --cfg MODULE                                │
+└────────────────────────────┬────────────────────────┘
+                             │
+┌────────────────────────────▼────────────────────────┐
+│ 4. helpers.c のコンパイル                             │
+│    rust/helpers.c  ──→  helpers.o                    │
+│    (static inline ラッパーの実体)                     │
+└────────────────────────────┬────────────────────────┘
+                             │
+┌────────────────────────────▼────────────────────────┐
+│ 5. リンク (ld)                                       │
+│    bar.o + helpers.o + kernel crate + vmlinux        │
+│    ──→  bar.ko  (ローダブルモジュール)                │
+│    ──→  または vmlinux に組み込み                     │
+└─────────────────────────────────────────────────────┘
+```
+
+### Kbuild ファイルでの記述
+
+Rust ソースは Kbuild ファイルで以下のように指定する:
+
+```makefile title="drivers/foo/Kbuild"
+obj-$(CONFIG_FOO_DRIVER) += foo.o
+```
+
+ファイル名が `foo.rs` の場合、kbuild は自動的に `rustc` を使ってコンパイルする
+(`.c` なら `gcc`/`clang`、`.rs` なら `rustc`)。
+
+### rustc に渡される主要フラグ
+
+| フラグ | 意味 |
+|---|---|
+| `--edition=2021` | Rust 2021 エディション |
+| `--emit=obj` | オブジェクトファイル (`.o`) を直接出力 |
+| `--extern kernel=...` | `kernel` crate の場所を指定 |
+| `--cfg MODULE` | ローダブルモジュールとしてコンパイル |
+| `-Cpanic=abort` | panic 時にアンワインドせず abort |
+| `-Cno-redzone` | カーネル空間では red zone を使わない |
+| `-Copt-level=2` | 最適化レベル |
+
+`--emit=obj` により、`rustc` は `.rlib` (Rust のライブラリ形式) ではなく、
+C と同じ `.o` (ELF オブジェクト) を直接出力する。
+これが既存の `ld` によるリンクとシームレスに統合される鍵である。
+
+---
+
+## まとめ: FFI レイヤーの全体構造
+
+```
+  ┌──────────── C の世界 ────────────┐  ┌──────── Rust の世界 ────────┐
+  │                                   │  │                             │
+  │  linux/mutex.h                    │  │  kernel::sync::Mutex<T>     │
+  │    ├─ struct mutex (定義)         │  │    ├─ Opaque<bindings::mutex>│
+  │    └─ mutex_lock() [inline]       │  │    └─ .lock() → Guard<T>   │
+  │           │                       │  │           ▲                 │
+  │           ▼                       │  │           │                 │
+  │  rust/helpers.c                   │  │  bindings_generated.rs      │
+  │    rust_helper_mutex_lock()       │  │    extern "C" {             │
+  │    [EXPORT_SYMBOL_GPL]            │  │      fn rust_helper_...     │
+  │           │                       │  │    }                        │
+  │           └───── リンク時に結合 ──────┘                             │
+  │                                   │                                │
+  └───────────────────────────────────┘  └────────────────────────────┘
+```
+
+各層の責務:
+
+| 層 | 担当 | ファイル |
+|---|---|---|
+| C ヘッダ | 型定義、inline 関数 | `include/linux/*.h` |
+| helpers.c | inline のシンボル化 | `rust/helpers.c` |
+| bindgen | C → Rust 宣言の自動生成 | `rust/bindings/bindings_generated.rs` |
+| Rust 抽象層 | 安全な API の提供 | `rust/kernel/` |
+| ドライバ | trait 実装 | `drivers/*/` |
+
+---
+
+## Kconfig にカスタムオプションを追加する
+
+カーネルツリー内にコードを追加する場合、Kconfig にオプションを定義して `make menuconfig` で有効/無効を切り替えられるようにする。
+
+### Kconfig エントリの書き方
+
+```kconfig title="drivers/misc/Kconfig (末尾に追加)"
+config MY_ECHO_DEVICE
+	tristate "My Echo character device"
+	depends on RUST
+	help
+	  A simple echo character device driver written in Rust.
+	  Writes data and reads it back.
+
+	  To compile as a module, choose M here.
+	  If unsure, say N.
+```
+
+| フィールド | 意味 |
+|---|---|
+| `config` | CONFIG_ プレフィックスなしの名前 |
+| `tristate` | y/m/n を選択可能 (`bool` なら y/n のみ) |
+| `depends on` | 依存する他のオプション |
+| `select` | このオプション有効時に自動的に有効にするオプション |
+| `default` | デフォルト値 |
+| `help` | `make menuconfig` で表示される説明 |
+
+### Makefile での対応
+
+```makefile title="drivers/misc/Makefile (末尾に追加)"
+obj-$(CONFIG_MY_ECHO_DEVICE) += my_echo.o
+```
+
+`CONFIG_MY_ECHO_DEVICE=y` ならカーネル本体に、`=m` ならモジュールとしてビルドされる。
+
+### 確認
+
+```bash
+make menuconfig
+# Device Drivers → Misc devices → My Echo character device
+```
+
+この仕組みを理解すると、upstream にコードを追加する際のパッチ構成も自然に書ける。
+
+---
+
+## よくある罠
+
+1. **`#[repr(C)]` を付け忘れる** — C に渡す構造体に `#[repr(C)]` がないと、フィールドが並び替えられて C 側のオフセットと一致しなくなる。コンパイルは通るが実行時にデータが壊れるため、最も危険なバグの一つである。
+
+2. **`Opaque<T>` を move する** — `Opaque<T>` は `PhantomPinned` を含むため、`Pin` で固定しなければならない。うっかり move すると、C 側が保持するポインタがダングリングになる。[Ch 21](/part6-rust-kernel/21-pin/) の Pin の知識が必須である。
+
+3. **helpers.c への追加を忘れる** — 新しい `static inline` 関数を呼ぼうとして `extern "C"` 宣言だけ書いても、リンクエラーになる。必ず `rust/helpers.c` にラッパーを追加し `EXPORT_SYMBOL_GPL` すること。
+
+4. **`ForeignOwnable::from_foreign` を 2 回呼ぶ** — `from_foreign` は所有権を取り戻す操作なので、同じポインタに対して 2 回呼ぶと二重解放になる。参照のみが必要なら `borrow` を使う。
+
+---
+
+## 章末演習
+
+1. カーネルソースの `rust/bindings/bindings_helper.h` を開き、インクルードされているヘッダを 10 個列挙せよ。それぞれのヘッダが提供する主要な型や関数を 1 つずつ挙げよ。
+
+2. `rust/helpers.c` を開き、`rust_helper_` プレフィックスの関数を 5 つ見つけよ。対応する `static inline` 関数がどのヘッダに定義されているか特定せよ。
+
+3. 以下のコードがコンパイルできない理由を説明せよ:
+   ```rust
+   struct MyData {
+       lock: Opaque<bindings::mutex>,
+       value: u32,
+   }
+
+   fn bad_example() {
+       let data = MyData { ... };
+       let data2 = data;  // ← ここでエラー
+   }
+   ```
+
+4. (発展) `rust-out-of-tree-module` テンプレートをクローンし、`make V=1 LLVM=1` でビルドした際に表示される `rustc` コマンドラインを記録せよ。`--emit=obj` やその他のフラグを確認し、本章で説明した処理フローと照合せよ。
+
+---
+
+## 参考資料
+
+- [Rust for Linux — General Information (docs.kernel.org)](https://docs.kernel.org/rust/general-information.html)
+- [rust-bindgen ユーザーガイド](https://rust-lang.github.io/rust-bindgen/)
+- [kernel::types::Opaque (rustdoc)](https://rust.docs.kernel.org/kernel/types/struct.Opaque.html)
+- [kernel::types::ForeignOwnable (rustdoc)](https://rust.docs.kernel.org/kernel/types/trait.ForeignOwnable.html)
+- [The Rust Reference — FFI](https://doc.rust-lang.org/reference/items/external-blocks.html)
+- [Rust Nomicon — FFI](https://doc.rust-lang.org/nomicon/ffi.html)

@@ -1,0 +1,98 @@
+---
+title: "付録 D. 推奨副読本・動画リンク集"
+description: Rust for Linux を学ぶ上で役立つ書籍、オンライン教材、動画、カンファレンス情報
+---
+
+## 書籍
+
+### Linux カーネル
+
+| タイトル | 著者 | 備考 |
+|---|---|---|
+| [Linux Device Drivers, 3rd Edition (LDD3)](https://lwn.net/Kernel/LDD3/) | Corbet, Rubini, Kroah-Hartman | 無料公開。古い（2.6 対象）が、概念は現在も有効 |
+| [Linux Kernel Development, 3rd Edition](https://www.oreilly.com/library/view/linux-kernel-development/9780768696974/) | Robert Love | カーネル内部構造を平易に解説した定番書 |
+| [Understanding the Linux Kernel, 3rd Edition](https://www.oreilly.com/library/view/understanding-the-linux/0596005652/) | Bovet, Cesati | プロセス管理やメモリ管理を深掘りする |
+
+### Rust 言語
+
+| タイトル | 著者 | 備考 |
+|---|---|---|
+| [The Rust Programming Language 日本語版](https://doc.rust-jp.rs/book-ja/) | Steve Klabnik, Carol Nichols | Rust 公式書籍の日本語訳。無料 |
+| [Rust Atomics and Locks](https://marabos.nl/atomics/) | Mara Bos | 並行プログラミングの実践的解説。無料公開 |
+| [Rustonomicon](https://doc.rust-lang.org/nomicon/) | Rust チーム | unsafe Rust の公式ガイド。カーネル開発では必読 |
+| [Programming Rust, 2nd Edition](https://www.oreilly.com/library/view/programming-rust-2nd/9781492052586/) | Blandy, Orendorff, Tindall | 大規模な Rust リファレンス |
+
+---
+
+## オンラインチュートリアル・教材
+
+| タイトル | 説明 |
+|---|---|
+| [The Linux Kernel Module Programming Guide (LKMPG)](https://sysprog21.github.io/lkmpg/) | カーネルモジュール開発の入門ガイド。C ベースだが構造を理解するのに最適 |
+| [Linux Kernel Teaching](https://linux-kernel-labs.github.io/refs/heads/master/) | ルーマニア工科大学の教材。実習形式でカーネル内部を学ぶ |
+| [Writing an OS in Rust (BlogOS)](https://os.phil-opp.com/) | Philipp Oppermann による Rust で OS をゼロから書くチュートリアル |
+| [rCore Tutorial](https://rcore-os.cn/rCore-Tutorial-Book-v3/) | 清華大学の Rust OS 教材。RISC-V 上で OS を構築する |
+| [Rust by Example](https://doc.rust-lang.org/rust-by-example/) | 例題ベースで Rust を学ぶ公式教材 |
+| [Comprehensive Rust (Google)](https://google.github.io/comprehensive-rust/) | Google 社内研修用の Rust 教材。Android/Chromium の章もある |
+| [Rust for Linux ドキュメント](https://rust-for-linux.com/) | Rust for Linux プロジェクト公式サイト |
+
+---
+
+## 動画・講演
+
+### Alice Ryhl（Google / Rust for Linux メンテナ）
+
+| タイトル | イベント | リンク |
+|---|---|---|
+| Arc in the Linux Kernel | Kangrejos 2024 | [YouTube](https://www.youtube.com/watch?v=HJxN7S8hJMg) |
+| Rust Binder | Linux Plumbers Conference | [YouTube](https://www.youtube.com/results?search_query=alice+ryhl+rust+binder+linux+plumbers) |
+| Rust for Linux: Status Update | LPC 2024 | [LPC アーカイブ](https://lpc.events/) |
+
+### Asahi Lina（Asahi Linux / Apple GPU ドライバ）
+
+| タイトル | 説明 | リンク |
+|---|---|---|
+| Asahi GPU ドライバ開発配信 | Rust で Apple GPU ドライバを実装する過程をライブ配信 | [YouTube チャンネル](https://www.youtube.com/@AsahiLina) |
+| Writing a GPU Driver in Rust | LPC 2023 での講演 | [YouTube](https://www.youtube.com/results?search_query=asahi+lina+gpu+driver+rust) |
+
+### その他の重要な講演
+
+| タイトル | 登壇者 | リンク |
+|---|---|---|
+| Rust in the Linux Kernel | Miguel Ojeda | [YouTube](https://www.youtube.com/results?search_query=miguel+ojeda+rust+linux+kernel) |
+| Rust for Linux: Where we are | Greg Kroah-Hartman | [YouTube](https://www.youtube.com/results?search_query=greg+kroah-hartman+rust+linux) |
+
+---
+
+## カンファレンス
+
+| 名称 | 時期 | 説明 |
+|---|---|---|
+| [Kangrejos](https://kangrejos.com/) | 毎年秋 | Rust for Linux 専門のワークショップ。最新の開発状況を議論する |
+| [Linux Plumbers Conference (LPC)](https://lpc.events/) | 毎年秋 | Linux カーネル開発者の主要カンファレンス。Rust MC がある |
+| [FOSDEM](https://fosdem.org/) | 毎年 2 月 | Rust devroom でカーネル関連の講演が行われる |
+| [Linux Security Summit](https://events.linuxfoundation.org/) | 年 2 回 | セキュリティ観点からの Rust 活用が議論される |
+| [Rust Nation UK](https://www.rustnationuk.com/) | 毎年 | 英国の Rust カンファレンス。カーネル関連の講演もある |
+
+---
+
+## 日本語リソース
+
+| タイトル | 著者/媒体 | 説明 |
+|---|---|---|
+| [Rust for Linux の概要と仕組み](https://zenn.dev/garasubo) | garasubo (Zenn) | Rust for Linux の構造を日本語で解説 |
+| [The Rust Programming Language 日本語版](https://doc.rust-jp.rs/book-ja/) | rust-jp コミュニティ | 公式 Rust Book の日本語訳 |
+| [Rust by Example 日本語版](https://doc.rust-jp.rs/rust-by-example-ja/) | rust-jp コミュニティ | 例題ベースの Rust 入門 |
+| [Rust API Guidelines 日本語訳](https://sinkuu.github.io/api-guidelines/) | sinkuu | Rust API 設計のベストプラクティス |
+| [エディション・ガイド 日本語版](https://doc.rust-jp.rs/edition-guide/) | rust-jp コミュニティ | Rust のエディション間の変更点を解説 |
+
+---
+
+## メーリングリスト・コミュニティ
+
+| リソース | URL | 説明 |
+|---|---|---|
+| rust-for-linux メーリングリスト | [lore.kernel.org](https://lore.kernel.org/rust-for-linux/) | パッチの議論やレビューが行われる |
+| Rust for Linux Zulip | [rust-for-linux.zulipchat.com](https://rust-for-linux.zulipchat.com/) | リアルタイムのチャット。質問しやすい |
+| LKML (Linux Kernel Mailing List) | [lore.kernel.org/lkml](https://lore.kernel.org/lkml/) | Linux カーネル全体のメーリングリスト |
+| rust-jp Discord | [rust-jp.rs](https://rust-jp.rs/) | 日本語 Rust コミュニティの Discord |

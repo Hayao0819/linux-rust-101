@@ -1,0 +1,547 @@
+---
+title: "実習: タイマーと workqueue で定期実行モジュールを作る"
+description: カーネルタイマーと workqueue を組み合わせ、システム情報を定期的にログ出力するモジュールを C と Rust で実装する
+---
+
+import { Aside, Steps, Tabs, TabItem } from '@astrojs/starlight/components';
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::workqueue` (Work, WorkItem)
+❌ **未実装**: `timer_list` の Rust バインディング (C FFI または delayed work で代替)
+:::
+
+## 概要
+
+この実習では、[Ch 18](/part5-hardware/18-irq-timer-wq/) (割り込み・タイマー・workqueue) で学んだ概念を活用し、**タイマーで定期的に workqueue に仕事を投入し、システム情報を出力するモジュール**を作る。
+
+モジュールの仕様:
+
+- `struct timer_list` でカーネルタイマーを作成する
+- タイマーコールバック (softirq コンテキスト) から workqueue に仕事を投入する
+- work 関数 (プロセスコンテキスト) で uptime と空きメモリページ数を `pr_info` で出力する
+- `mod_timer` でタイマーを繰り返し発火させる
+- モジュールパラメータ `interval_ms` で間隔を制御する
+- アンロード時にタイマーと work の両方を安全に停止する
+
+## 前提
+
+- [Ch 18](/part5-hardware/18-irq-timer-wq/) (割り込み・タイマー・workqueue) を完了している
+- カーネルヘッダがインストール済み
+
+---
+
+## Part A: C 版
+
+### ステップ 1: ディレクトリ構成
+
+```bash
+mkdir -p ~/timer_wq_lab && cd ~/timer_wq_lab
+```
+
+```
+timer_wq_lab/
+├── Makefile
+└── timer_wq.c
+```
+
+### ステップ 2: Makefile
+
+```makefile title="Makefile"
+obj-m += timer_wq.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+```
+
+### ステップ 3: timer_wq.c の完全なソースコード
+
+```c title="timer_wq.c"
+// SPDX-License-Identifier: GPL-2.0
+/*
+ * timer_wq.c - タイマー + workqueue で定期的にシステム情報をログ出力する
+ *
+ * タイマーコールバック (softirq コンテキスト) から workqueue に仕事を投入し、
+ * work 関数 (プロセスコンテキスト) で情報を出力する。
+ */
+
+#include <linux/module.h>
+#include <linux/timer.h>
+#include <linux/workqueue.h>
+#include <linux/jiffies.h>
+#include <linux/mm.h>        /* si_meminfo */
+#include <linux/slab.h>
+
+#define DEFAULT_INTERVAL_MS  5000  /* デフォルト: 5 秒 */
+
+/* ──────────────────────────────────────────────
+ * モジュールパラメータ
+ * ────────────────────────────────────────────── */
+
+static unsigned int interval_ms = DEFAULT_INTERVAL_MS;
+module_param(interval_ms, uint, 0644);
+MODULE_PARM_DESC(interval_ms,
+    "Timer interval in milliseconds (default: 5000)");
+
+/* ──────────────────────────────────────────────
+ * グローバル変数
+ * ────────────────────────────────────────────── */
+
+static struct timer_list my_timer;
+static struct work_struct my_work;
+static unsigned long fire_count;  /* タイマー発火回数 */
+
+/* ──────────────────────────────────────────────
+ * Work 関数 (プロセスコンテキスト)
+ *
+ * ここでは sleep や GFP_KERNEL アロケーションが可能。
+ * si_meminfo() でシステムのメモリ情報を取得する。
+ * ────────────────────────────────────────────── */
+
+static void sysinfo_work_func(struct work_struct *work)
+{
+    struct sysinfo si;
+    unsigned long uptime_sec;
+
+    si_meminfo(&si);
+
+    /*
+     * jiffies はブート後のティック数。
+     * jiffies / HZ で秒数に変換できる。
+     */
+    uptime_sec = jiffies / HZ;
+
+    pr_info("timer_wq [#%lu]: uptime=%lu s, "
+            "free_pages=%lu, total_pages=%lu, "
+            "free_MB=%lu/%lu MB\n",
+            fire_count,
+            uptime_sec,
+            si.freeram,
+            si.totalram,
+            (si.freeram * si.mem_unit) >> 20,
+            (si.totalram * si.mem_unit) >> 20);
+}
+
+/* ──────────────────────────────────────────────
+ * タイマーコールバック (softirq コンテキスト)
+ *
+ * ここでは sleep 不可、Mutex 不可、GFP_KERNEL 不可。
+ * やるべきことは 2 つだけ:
+ *   1. workqueue に仕事を投入する
+ *   2. mod_timer で次回の発火を設定する
+ * ────────────────────────────────────────────── */
+
+static void my_timer_callback(struct timer_list *t)
+{
+    fire_count++;
+
+    /* work をシステム workqueue に投入 */
+    schedule_work(&my_work);
+
+    /*
+     * mod_timer で次回の発火時刻を設定する。
+     * jiffies + msecs_to_jiffies(interval_ms) で
+     * 現在から interval_ms ミリ秒後に発火する。
+     */
+    mod_timer(&my_timer, jiffies + msecs_to_jiffies(interval_ms));
+}
+
+/* ──────────────────────────────────────────────
+ * モジュール初期化
+ * ────────────────────────────────────────────── */
+
+static int __init timer_wq_init(void)
+{
+    pr_info("timer_wq: loading (interval=%u ms)\n", interval_ms);
+
+    if (interval_ms == 0) {
+        pr_err("timer_wq: interval_ms must be > 0\n");
+        return -EINVAL;
+    }
+
+    /* work の初期化 */
+    INIT_WORK(&my_work, sysinfo_work_func);
+
+    /* タイマーの初期化と最初の発火設定 */
+    timer_setup(&my_timer, my_timer_callback, 0);
+    mod_timer(&my_timer, jiffies + msecs_to_jiffies(interval_ms));
+
+    pr_info("timer_wq: timer started (first fire in %u ms)\n",
+            interval_ms);
+    return 0;
+}
+
+/* ──────────────────────────────────────────────
+ * モジュール終了
+ *
+ * 重要: タイマーと work の停止順序に注意。
+ *
+ * 1. まず del_timer_sync() でタイマーを停止する。
+ *    これにより、新しい work の投入が止まる。
+ *    _sync 版は、現在実行中のコールバックが完了するまで待つ。
+ *
+ * 2. 次に cancel_work_sync() で実行中/キュー待ちの work を停止する。
+ *    _sync 版は、現在実行中の work 関数が完了するまで待つ。
+ *
+ * この順序を逆にすると、cancel_work_sync の後に
+ * タイマーが新たな work を投入する可能性がある。
+ * ────────────────────────────────────────────── */
+
+static void __exit timer_wq_exit(void)
+{
+    /* 1. タイマーを停止 (実行中のコールバック完了を待つ) */
+    del_timer_sync(&my_timer);
+
+    /* 2. 残っている work を停止 (実行完了を待つ) */
+    cancel_work_sync(&my_work);
+
+    pr_info("timer_wq: unloaded (fired %lu times)\n", fire_count);
+}
+
+module_init(timer_wq_init);
+module_exit(timer_wq_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Linux-Rust-101");
+MODULE_DESCRIPTION("Periodic system info logger using timer + workqueue");
+```
+
+### ステップ 4: コード解説
+
+#### タイマーの仕組み
+
+```
+                  softirq コンテキスト            プロセスコンテキスト
+                 ┌─────────────────┐           ┌─────────────────────┐
+                 │ my_timer_callback│           │  sysinfo_work_func  │
+ mod_timer ───▶ │  1. fire_count++ │──schedule_work──▶│  si_meminfo()     │
+                 │  2. schedule_work│           │  pr_info(...)       │
+                 │  3. mod_timer    │           └─────────────────────┘
+                 └─────────────────┘
+                         │
+                         ▼
+                   次回も mod_timer で
+                   自分自身を再設定
+```
+
+1. `timer_setup()` でタイマーを初期化し、コールバック関数を登録する
+2. `mod_timer()` で発火時刻を設定する (jiffies + 変換後のミリ秒)
+3. タイマーコールバックは **softirq コンテキスト**で実行される — sleep 不可
+4. コールバック内で `schedule_work()` を呼び、重い処理を workqueue に委譲する
+5. コールバック内で再度 `mod_timer()` を呼ぶことで、繰り返し実行を実現する
+
+#### モジュールパラメータ
+
+```c
+static unsigned int interval_ms = DEFAULT_INTERVAL_MS;
+module_param(interval_ms, uint, 0644);
+```
+
+- `0644` はパーミッション: オーナーが読み書き可能、それ以外は読み取り専用
+- ロード時に指定: `sudo insmod timer_wq.ko interval_ms=2000`
+- ロード後に変更: `echo 3000 | sudo tee /sys/module/timer_wq/parameters/interval_ms`
+
+<Aside type="caution">
+`interval_ms` を動的に変更しても、次回のタイマー発火までは古い値で動作する。
+即座に反映させるには、パラメータ変更時にタイマーを再設定するコールバックが必要になる。
+</Aside>
+
+#### 安全な停止順序
+
+```c
+static void __exit timer_wq_exit(void)
+{
+    del_timer_sync(&my_timer);     /* 1. 新しい work の投入を止める */
+    cancel_work_sync(&my_work);    /* 2. 実行中の work を待つ */
+}
+```
+
+この順序が**極めて重要**である:
+
+| 順序 | 動作 | 結果 |
+|---|---|---|
+| timer → work (正しい) | タイマー停止後に work を停止 | 安全 |
+| work → timer (間違い) | work 停止後にタイマーが新たな work を投入する可能性 | **use-after-free のリスク** |
+
+### ステップ 5: ビルドとテスト
+
+<Steps>
+
+1. **ビルド**
+
+   ```bash
+   cd ~/timer_wq_lab
+   make
+   ```
+
+2. **デフォルト間隔 (5 秒) でロード**
+
+   ```bash
+   sudo insmod timer_wq.ko
+   ```
+
+3. **ログを観察**
+
+   ```bash
+   # リアルタイムでログを監視
+   dmesg -w
+   ```
+
+   5 秒ごとに以下のようなメッセージが表示される:
+
+   ```
+   timer_wq: loading (interval=5000 ms)
+   timer_wq: timer started (first fire in 5000 ms)
+   timer_wq [#1]: uptime=12345 s, free_pages=1234567, total_pages=2048000, free_MB=4823/8000 MB
+   timer_wq [#2]: uptime=12350 s, free_pages=1234500, total_pages=2048000, free_MB=4823/8000 MB
+   ...
+   ```
+
+4. **間隔を変更してロード**
+
+   ```bash
+   sudo rmmod timer_wq
+   sudo insmod timer_wq.ko interval_ms=2000
+   dmesg -w
+   # → 2 秒ごとに出力される
+   ```
+
+5. **実行中に間隔を変更** (次回発火から反映)
+
+   ```bash
+   echo 1000 | sudo tee /sys/module/timer_wq/parameters/interval_ms
+   cat /sys/module/timer_wq/parameters/interval_ms
+   # → 1000
+   ```
+
+6. **モジュールのアンロード**
+
+   ```bash
+   sudo rmmod timer_wq
+   dmesg | tail -1
+   # timer_wq: unloaded (fired N times)
+   ```
+
+</Steps>
+
+---
+
+## Part B: Rust 版 (概念)
+
+### kernel::workqueue の WorkItem 実装
+
+Rust カーネルの workqueue 抽象を使い、同等のモジュールの構造を示す:
+
+```rust title="timer_wq_rust.rs (概念コード)"
+// SPDX-License-Identifier: GPL-2.0
+
+//! Periodic system info logger using workqueue (Rust)
+
+use kernel::prelude::*;
+use kernel::sync::Arc;
+use kernel::workqueue::{self, Work, WorkItem, HasWork, impl_has_work};
+use kernel::new_mutex;
+
+module! {
+    type: TimerWqModule,
+    name: "timer_wq_rust",
+    author: "Linux-Rust-101",
+    description: "Periodic sysinfo with workqueue",
+    license: "GPL",
+}
+
+/// Work に紐づくデータ。
+/// Arc で参照カウント管理し、work 実行中のオブジェクト解放を防ぐ。
+#[pin_data]
+struct SysInfoWork {
+    count: u64,
+    #[pin]
+    work: Work<SysInfoWork>,
+}
+
+impl_has_work! {
+    impl HasWork<Self> for SysInfoWork { self.work }
+}
+
+impl WorkItem for SysInfoWork {
+    type Pointer = Arc<SysInfoWork>;
+
+    fn run(this: Arc<SysInfoWork>) {
+        // プロセスコンテキスト — sleep OK
+        pr_info!("timer_wq_rust [#{}]: work executed\n", this.count);
+        // 注: si_meminfo 等のバインディングはまだ限定的
+    }
+}
+
+struct TimerWqModule {
+    // タイマーの Rust 抽象は 2026 年時点でまだ開発途上。
+    // 実用的には C ヘルパー経由で timer_list を操作するか、
+    // delayed work (kernel::workqueue) で代替する。
+}
+
+impl kernel::Module for TimerWqModule {
+    fn init(_module: &ThisModule) -> Result<Self> {
+        pr_info!("timer_wq_rust: loading\n");
+
+        // workqueue への投入例:
+        // let work = Arc::pin_init(...)?;
+        // workqueue::system().enqueue(work);
+
+        Ok(TimerWqModule {})
+    }
+}
+
+impl Drop for TimerWqModule {
+    fn drop(&mut self) {
+        pr_info!("timer_wq_rust: unloading\n");
+        // Drop 時に Arc の参照カウントが 0 になれば自動解放
+    }
+}
+```
+
+<Aside type="note">
+2026 年 4 月時点で、`struct timer_list` の Rust バインディングは公式にはまだ提供されていない。
+タイマー機能が必要な場合は以下のいずれかのアプローチを取る:
+
+1. `kernel::workqueue` の delayed work 系 API を使う (推奨)
+2. C ヘルパー関数を FFI 経由で呼び出す ([Ch 6](/part2-first-module/06-kbuild-ffi/) 参照)
+3. 将来的に `kernel::time` モジュールが整備されるのを待つ
+</Aside>
+
+### C 版との比較
+
+| 観点 | C 版 | Rust 版 |
+|---|---|---|
+| **タイマー API** | `timer_setup` / `mod_timer` / `del_timer_sync` で完全に制御可能 | 公式バインディング未整備。delayed work または FFI で代替 |
+| **workqueue** | `INIT_WORK` + `schedule_work` | `WorkItem` trait + `Arc` で型安全 |
+| **work のライフタイム** | `container_of` で手動キャスト。ライフタイムの保証はプログラマの責任 | `Arc` が参照カウントを管理。use-after-free をコンパイル時に防止 |
+| **cleanup の安全性** | `del_timer_sync` → `cancel_work_sync` の順序を手動で守る必要がある | `Drop` trait で自動的に cleanup (ただしタイマーは未抽象化) |
+| **モジュールパラメータ** | `module_param` マクロ | カーネルバージョンにより利用可否が異なる |
+
+---
+
+## よくある罠
+
+### 1. タイマーコールバックは softirq コンテキスト
+
+タイマーコールバック内で以下の操作は**禁止**である:
+
+| 禁止事項 | 理由 |
+|---|---|
+| `mutex_lock()` | sleep する可能性がある |
+| `kmalloc(GFP_KERNEL)` | sleep する可能性がある |
+| `copy_to_user()` / `copy_from_user()` | ユーザコンテキストが存在しない |
+| `schedule()` | 明示的な sleep |
+| 長時間のループ | 他の softirq をブロックする |
+
+```c
+/* NG: タイマーコールバック内で Mutex を取る */
+static void bad_timer_callback(struct timer_list *t)
+{
+    mutex_lock(&my_mutex);   /* BUG: sleep する可能性 → カーネルクラッシュ */
+    /* ... */
+    mutex_unlock(&my_mutex);
+}
+
+/* OK: workqueue に委譲すれば Mutex を取れる */
+static void good_timer_callback(struct timer_list *t)
+{
+    schedule_work(&my_work);  /* work 関数はプロセスコンテキスト */
+}
+```
+
+### 2. rmmod 前に timer + work の両方を確実に止める
+
+```c
+/* 正しい順序 */
+del_timer_sync(&my_timer);     /* タイマー停止 (新しい work の投入を防止) */
+cancel_work_sync(&my_work);    /* 残りの work を完了させてから停止 */
+
+/* 間違った順序 */
+cancel_work_sync(&my_work);    /* work を止めたつもりが... */
+del_timer_sync(&my_timer);     /* この間にタイマーが発火して新たな work を投入する可能性 */
+```
+
+`_sync` のない `del_timer()` や `cancel_work()` は、現在実行中のコールバック/work を待たないため、
+モジュールアンロード時には**必ず `_sync` 付き**を使うこと。
+
+### 3. jiffies と msecs_to_jiffies の変換
+
+```c
+/* jiffies はカーネルのティックカウンタ。HZ はティック/秒。 */
+/* HZ=250 なら 1 jiffie = 4ms, HZ=1000 なら 1 jiffie = 1ms */
+
+/* ミリ秒 → jiffies */
+unsigned long j = msecs_to_jiffies(5000);  /* 5 秒 */
+
+/* jiffies → ミリ秒 */
+unsigned int ms = jiffies_to_msecs(j);
+
+/* 現在の jiffies に加算して未来の時刻を指定 */
+mod_timer(&timer, jiffies + msecs_to_jiffies(interval_ms));
+```
+
+<Aside type="caution">
+`jiffies` はオーバーフローする。比較には `time_after()` / `time_before()` マクロを使うこと:
+
+```c
+/* NG: オーバーフロー時に壊れる */
+if (jiffies > deadline) { ... }
+
+/* OK: オーバーフローを正しく処理 */
+if (time_after(jiffies, deadline)) { ... }
+```
+</Aside>
+
+### 4. work が完了する前にモジュールのメモリが解放される
+
+```c
+/* 危険なパターン: グローバル変数ではなく kmalloc した構造体に work を持たせる場合 */
+struct my_ctx {
+    struct work_struct work;
+    char data[256];
+};
+
+static void my_work_func(struct work_struct *work)
+{
+    struct my_ctx *ctx = container_of(work, struct my_ctx, work);
+    pr_info("data: %s\n", ctx->data);  /* ctx が解放済みなら use-after-free */
+}
+
+static void __exit bad_exit(void)
+{
+    kfree(ctx);                 /* work がまだ実行中かもしれない! */
+}
+
+static void __exit good_exit(void)
+{
+    cancel_work_sync(&ctx->work);  /* work の完了を待ってから */
+    kfree(ctx);                     /* 解放する */
+}
+```
+
+---
+
+## 発展課題
+
+1. **delayed_work への書き換え** — `struct timer_list` + `struct work_struct` の組み合わせを `struct delayed_work` 一つで置き換えよ。`schedule_delayed_work()` と `cancel_delayed_work_sync()` を使う。
+
+2. **sysfs からのリアルタイム制御** — `/sys/module/timer_wq/parameters/` ではなく、独自の sysfs アトリビュートを作成し、タイマーの開始/停止/間隔変更をリアルタイムに行えるようにせよ。
+
+3. **統計情報の蓄積** — work 関数で取得した情報を循環バッファに保存し、debugfs から履歴を読み出せるようにせよ。
+
+4. **CPU ごとの work** — `alloc_workqueue` で `WQ_UNBOUND` フラグを使い、CPU に縛られない workqueue を作成して動作の違いを確認せよ。
+
+---
+
+## 参考資料
+
+- [Ch 18. 割り込み・タイマー・workqueue](/part5-hardware/18-irq-timer-wq/)
+- [Timers (kernel.org)](https://docs.kernel.org/core-api/timers.html)
+- [Concurrency Managed Workqueue (kernel.org)](https://docs.kernel.org/core-api/workqueue.html)
+- [Deferred Work (Linux Kernel Labs)](https://linux-kernel-labs.github.io/refs/heads/master/labs/deferred_work.html)
+- [kernel::workqueue (rustdoc)](https://rust.docs.kernel.org/kernel/workqueue/)

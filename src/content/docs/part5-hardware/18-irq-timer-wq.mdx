@@ -1,0 +1,594 @@
+---
+title: "Ch 18. 割り込み・タイマー・workqueue"
+description: "top half / bottom half, threaded IRQ, jiffies, hrtimer, workqueue, kthread を学ぶ"
+---
+
+## この章で学ぶこと
+
+- ハードウェア割り込みの基本的な仕組みを理解する
+- top half / bottom half の分割思想を把握する
+- `request_irq` と threaded IRQ の使い分けを説明できる
+- 割込コンテキストの制約を完全に理解する
+- jiffies/HZ と delay API の使い分けを把握する
+- `timer_list` と `hrtimer` でタイマーを設定できる
+- workqueue と kthread の仕組みと使い分けを理解する
+
+:::note[Rust API ステータス]
+🟡 **開発中**: `kernel::irq` (Handler trait, Registration — API 発展途上)
+🟢 **安定**: `kernel::workqueue` (Work, WorkItem, HasWork, system workqueue)
+❌ **未実装**: `timer_list` の Rust バインディング, `hrtimer` の Rust API
+:::
+
+## 前提
+
+- [Ch 6](/part2-first-module/06-kbuild-ffi/) (kbuild と FFI) を完了している
+- [Ch 16](/part5-hardware/16-drivers/) (ドライバ) を完了している
+
+---
+
+## 割り込みとは
+
+CPU がコードを実行している最中に、ハードウェアが「注意を引く」仕組みが割り込みである。
+
+1. デバイスが IRQ ラインをアサートする (または MSI でメモリ書き込み)
+2. 割り込みコントローラ (APIC, GIC) が CPU に通知
+3. CPU は現在の処理を中断し、IDT/IVT から割り込みハンドラを呼ぶ
+4. ハンドラが処理完了後、中断された処理を再開
+
+## top half と bottom half
+
+割り込みハンドラには 2 つの要件が対立する:
+
+- **速く終わらなければならない** — ハンドラ実行中は (少なくともその IRQ ラインの) 他の割り込みが遅延する
+- **複雑な処理が必要な場合がある** — バッファのコピー、プロトコル解析など
+
+この対立を解決するのが **top half / bottom half** の分割:
+
+| | Top Half | Bottom Half |
+|---|---|---|
+| 実行コンテキスト | 割込コンテキスト | プロセスコンテキスト (workqueue / threaded IRQ) |
+| すること | ハードウェアの確認・応答、最小限の処理 | 重い処理 (バッファコピー, I/O, sleep) |
+| 制約 | sleep 不可, Mutex 不可 | sleep 可 |
+| 所要時間 | マイクロ秒オーダー | ミリ秒以上も可 |
+
+## request_irq (C)
+
+```c
+#include <linux/interrupt.h>
+
+static irqreturn_t my_handler(int irq, void *dev_id)
+{
+    struct my_device *dev = dev_id;
+    u32 status = ioread32(dev->regs + STATUS_REG);
+
+    if (!(status & MY_IRQ_BIT))
+        return IRQ_NONE;    /* この割り込みは我々のものではない */
+
+    iowrite32(MY_IRQ_BIT, dev->regs + STATUS_REG);  /* IRQ 応答 */
+    return IRQ_HANDLED;
+}
+
+/* probe() 内で登録 */
+ret = request_irq(irq, my_handler, IRQF_SHARED, "my_device", dev);
+```
+
+### IRQF フラグ
+
+| フラグ | 意味 |
+|---|---|
+| `IRQF_SHARED` | IRQ ラインを他のデバイスと共有。ハンドラは自デバイスの IRQ か確認が必要 |
+| `IRQF_ONESHOT` | threaded IRQ 用。スレッド完了まで IRQ ラインをマスクし続ける |
+| `IRQF_TRIGGER_RISING` | 立ち上がりエッジでトリガ |
+| `IRQF_TRIGGER_LEVEL` | レベルトリガ |
+
+### 戻り値
+
+| 値 | 意味 |
+|---|---|
+| `IRQ_NONE` | この割り込みは自デバイスのものではない (共有 IRQ 用) |
+| `IRQ_HANDLED` | 正常に処理完了 |
+| `IRQ_WAKE_THREAD` | threaded handler を起床させる |
+
+## Threaded IRQ
+
+Threaded IRQ は top/bottom の分割を 1 つの API で実現する:
+
+```c
+ret = request_threaded_irq(
+    irq,
+    my_hardirq_handler,    /* top half: 割込コンテキスト */
+    my_threaded_handler,   /* bottom half: プロセスコンテキスト */
+    IRQF_SHARED | IRQF_ONESHOT,
+    "my_device",
+    dev
+);
+```
+
+**top half:**
+
+```c
+static irqreturn_t my_hardirq_handler(int irq, void *dev_id)
+{
+    struct my_device *dev = dev_id;
+    u32 status = ioread32(dev->regs + STATUS_REG);
+
+    if (!(status & MY_IRQ_BIT))
+        return IRQ_NONE;
+
+    iowrite32(MY_IRQ_BIT, dev->regs + STATUS_REG);
+    dev->irq_status = status;  /* スレッドに渡すデータを保存 */
+    return IRQ_WAKE_THREAD;    /* スレッドを起床 */
+}
+```
+
+**bottom half (スレッド):**
+
+```c
+static irqreturn_t my_threaded_handler(int irq, void *dev_id)
+{
+    struct my_device *dev = dev_id;
+
+    /* ここはプロセスコンテキスト — sleep OK */
+    mutex_lock(&dev->lock);
+    process_data(dev->irq_status);
+    mutex_unlock(&dev->lock);
+
+    return IRQ_HANDLED;
+}
+```
+
+Threaded IRQ のスレッドは `ps` で `irq/<number>-<name>` として見える。
+
+## 割込コンテキストの禁止事項
+
+**絶対にやってはいけないこと:**
+
+1. **sleep / schedule** — `msleep()`, `schedule()`, `wait_event()`
+2. **Mutex** — `mutex_lock()` は sleep する可能性がある
+3. **ユーザ空間メモリアクセス** — `copy_from_user()` / `copy_to_user()`
+4. **ページフォルト** — 割込コンテキストには有効な mm がない
+5. **`kmalloc(GFP_KERNEL)`** — メモリ回収で sleep する。`GFP_ATOMIC` を使う
+6. **セマフォ** — `down()` は sleep する
+
+**やってよいこと:**
+
+- Spinlock (`spin_lock()` / `spin_lock_irqsave()`)
+- `kmalloc(GFP_ATOMIC)`
+- `printk()` / `pr_info()` (ロックフリーリングバッファ)
+- ハードウェアレジスタの読み書き (`ioread32()` / `iowrite32()`)
+- Waitqueue の wake up (`wake_up()`)
+- Workqueue への投入 (`queue_work()`)
+
+## Rust 側の割り込み (6.17+)
+
+```rust
+use kernel::irq;
+
+struct MyHandler;
+
+impl irq::Handler for MyHandler {
+    type Data = Arc<MyDevice>;
+
+    fn handle_irq(data: &Self::Data) -> irq::Return {
+        let status = data.read_status();
+        if status & MY_IRQ_BIT == 0 {
+            return irq::Return::None;
+        }
+        data.ack_irq();
+        irq::Return::Handled
+    }
+}
+```
+
+> Rust の IRQ 抽象はまだ発展途上である。最新の API は `kernel::irq` の rustdoc を確認すること。
+
+---
+
+## 時間管理とタイマー
+
+### jiffies と HZ
+
+カーネルは時間を **jiffies** というカウンタで管理する。jiffies はシステム起動時に 0 から始まり、タイマー割り込みのたびにインクリメントされる。
+
+- **`HZ`** — 1 秒あたりのタイマー割り込み回数。`CONFIG_HZ` で設定され、一般的な値は 100, 250, 1000 である
+- **`jiffies`** — 起動からのティック数。`unsigned long` 型
+- **1 jiffy = 1/HZ 秒** — `HZ=1000` なら 1 jiffy = 1ms、`HZ=250` なら 1 jiffy = 4ms
+
+```c
+#include <linux/jiffies.h>
+
+unsigned long now = jiffies;
+unsigned long one_second_later = now + HZ;
+unsigned long half_second_later = now + HZ / 2;
+
+/* jiffies の比較には専用マクロを使う (ラップアラウンド対策) */
+if (time_after(jiffies, deadline)) {
+    pr_info("deadline passed\n");
+}
+```
+
+jiffies のラップアラウンド (オーバーフロー) は 32 ビットシステムでは `HZ=1000` の場合約 49.7 日で発生する。`time_after()` / `time_before()` マクロは符号付き比較を行うことでこの問題を回避する。
+
+### delay / sleep API
+
+カーネルには複数の遅延 API があり、コンテキストと必要な精度に応じて使い分ける:
+
+| API | 遅延範囲 | 仕組み | コンテキスト |
+|---|---|---|---|
+| `ndelay(ns)` | ナノ秒 | ビジーウェイト | どこでも (割込内も可) |
+| `udelay(us)` | ~数十マイクロ秒 | ビジーウェイト | どこでも (割込内も可) |
+| `usleep_range(min, max)` | ~数十マイクロ秒〜20ms | hrtimer ベース sleep | プロセスコンテキストのみ |
+| `msleep(ms)` | ミリ秒以上 | jiffies ベース sleep | プロセスコンテキストのみ |
+| `msleep_interruptible(ms)` | ミリ秒以上 | jiffies ベース (シグナルで中断可) | プロセスコンテキストのみ |
+| `ssleep(s)` | 秒以上 | `msleep(s*1000)` のラッパー | プロセスコンテキストのみ |
+
+**使い分けの指針:**
+
+- **割込コンテキスト** → `ndelay()` / `udelay()` のみ (ビジーウェイト)
+- **10us 未満** → `udelay()`
+- **10us〜20ms** → `usleep_range()` (推奨: CPU を解放する)
+- **20ms 以上** → `msleep()`
+
+`udelay()` を長時間 (数百 us 以上) 使うと CPU を占有し続けるため、プロセスコンテキストでは `usleep_range()` が推奨される。
+
+### timer_list (低精度タイマー)
+
+`timer_list` は jiffies ベースの低精度タイマーである。指定した jiffies 経過後にコールバック関数を呼ぶ:
+
+```c
+#include <linux/timer.h>
+
+struct my_device {
+    struct timer_list timer;
+    int counter;
+};
+
+/* タイマーコールバック (softirq コンテキスト) */
+static void my_timer_callback(struct timer_list *t)
+{
+    struct my_device *dev = from_timer(dev, t, timer);
+
+    dev->counter++;
+    pr_info("timer fired: counter = %d\n", dev->counter);
+
+    /* 周期タイマー: 再度スケジュール */
+    mod_timer(&dev->timer, jiffies + HZ);  /* 1 秒後 */
+}
+
+/* 初期化 (probe 等) */
+static int my_probe(...)
+{
+    struct my_device *dev = ...;
+
+    timer_setup(&dev->timer, my_timer_callback, 0);
+    mod_timer(&dev->timer, jiffies + HZ);  /* 1 秒後に最初の発火 */
+
+    return 0;
+}
+
+/* 破棄 (remove 等) */
+static void my_remove(...)
+{
+    /* タイマーを確実に停止 (コールバック実行中なら完了を待つ) */
+    del_timer_sync(&dev->timer);
+}
+```
+
+主要 API:
+
+| API | 説明 |
+|---|---|
+| `timer_setup(timer, callback, flags)` | タイマーを初期化する |
+| `mod_timer(timer, expires)` | タイマーを (再) スケジュールする。expires は jiffies 値 |
+| `del_timer(timer)` | タイマーをキャンセルする (コールバック実行中の場合は待たない) |
+| `del_timer_sync(timer)` | タイマーをキャンセルし、実行中のコールバックの完了を待つ |
+| `timer_pending(timer)` | タイマーがスケジュール済みかを確認する |
+
+**注意:** タイマーコールバックは softirq コンテキストで実行される。したがって sleep 不可、Mutex 不可などの制約がある。
+
+### hrtimer (高精度タイマー)
+
+`hrtimer` (high-resolution timer) はナノ秒精度のタイマーである。`timer_list` では精度が不足する場合に使用する:
+
+```c
+#include <linux/hrtimer.h>
+#include <linux/ktime.h>
+
+struct my_device {
+    struct hrtimer timer;
+    ktime_t interval;
+};
+
+static enum hrtimer_restart my_hrtimer_callback(struct hrtimer *timer)
+{
+    struct my_device *dev = container_of(timer, struct my_device, timer);
+
+    pr_info("hrtimer fired\n");
+    do_periodic_work(dev);
+
+    /* 周期タイマー: 次の発火時刻を設定 */
+    hrtimer_forward_now(timer, dev->interval);
+    return HRTIMER_RESTART;  /* タイマーを継続 */
+    /* HRTIMER_NORESTART を返すと 1 回で終了 */
+}
+
+static int my_probe(...)
+{
+    struct my_device *dev = ...;
+
+    dev->interval = ktime_set(0, 500000);  /* 500 マイクロ秒 */
+    hrtimer_init(&dev->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+    dev->timer.function = my_hrtimer_callback;
+    hrtimer_start(&dev->timer, dev->interval, HRTIMER_MODE_REL);
+
+    return 0;
+}
+
+static void my_remove(...)
+{
+    hrtimer_cancel(&dev->timer);
+}
+```
+
+| API | 説明 |
+|---|---|
+| `hrtimer_init(timer, clock, mode)` | hrtimer を初期化する |
+| `hrtimer_start(timer, time, mode)` | タイマーを開始する |
+| `hrtimer_cancel(timer)` | タイマーをキャンセルする (コールバック完了を待つ) |
+| `hrtimer_forward_now(timer, interval)` | 現在時刻から interval 後に次回発火を設定する |
+| `ktime_set(sec, nsec)` | ktime_t 値を作成する |
+
+`timer_list` と `hrtimer` の使い分け:
+
+| | timer_list | hrtimer |
+|---|---|---|
+| 精度 | jiffies (1〜10ms) | ナノ秒 |
+| オーバーヘッド | 低い | やや高い |
+| 用途 | タイムアウト、周期的な雑務 | 高精度タイミング、メディア |
+
+---
+
+## Workqueue
+
+### work_struct と基本的な使い方
+
+workqueue はカーネルの **遅延実行メカニズム** である。処理をカーネルスレッドに委譲してプロセスコンテキストで実行する。割込コンテキストから重い処理を安全に委譲するための標準的な手段である。
+
+```c
+#include <linux/workqueue.h>
+
+struct my_device {
+    struct work_struct work;
+    int pending_data;
+};
+
+/* ワーク関数 (プロセスコンテキストで実行される) */
+static void my_work_func(struct work_struct *work)
+{
+    struct my_device *dev = container_of(work, struct my_device, work);
+
+    /* ここでは sleep OK, Mutex OK */
+    mutex_lock(&dev->lock);
+    process_pending_data(dev->pending_data);
+    mutex_unlock(&dev->lock);
+}
+
+/* 初期化 */
+static int my_probe(...)
+{
+    struct my_device *dev = ...;
+    INIT_WORK(&dev->work, my_work_func);
+    return 0;
+}
+
+/* 割込ハンドラ等からスケジュール */
+static irqreturn_t my_handler(int irq, void *dev_id)
+{
+    struct my_device *dev = dev_id;
+    dev->pending_data = ioread32(dev->regs + DATA_REG);
+    schedule_work(&dev->work);  /* system workqueue に投入 */
+    return IRQ_HANDLED;
+}
+```
+
+### system workqueue とカスタム workqueue
+
+`schedule_work()` はカーネルが用意する **system workqueue** にワークを投入する。system workqueue は全ドライバで共有されるため、個々のワーク関数が長時間ブロックすると他のドライバに影響する。
+
+長時間かかる処理や、専用のスレッドが必要な場合はカスタム workqueue を作成する:
+
+```c
+/* カスタム workqueue の作成 */
+struct workqueue_struct *my_wq;
+my_wq = alloc_workqueue("my_driver_wq", WQ_UNBOUND, 0);
+if (!my_wq)
+    return -ENOMEM;
+
+/* カスタム workqueue への投入 */
+queue_work(my_wq, &dev->work);
+
+/* 破棄 (全ワークの完了を待ってから) */
+destroy_workqueue(my_wq);
+```
+
+主な workqueue フラグ:
+
+| フラグ | 説明 |
+|---|---|
+| `WQ_UNBOUND` | 特定の CPU に束縛されない。長時間実行タスク向き |
+| `WQ_HIGHPRI` | 高優先度。通常のワークより先に実行される |
+| `WQ_FREEZABLE` | サスペンド時にワーク実行を停止する |
+| `WQ_MEM_RECLAIM` | メモリ逼迫時でもワーカースレッドを確保する |
+
+### delayed_work
+
+一定時間後にワークを実行したい場合は `delayed_work` を使う:
+
+```c
+struct my_device {
+    struct delayed_work dwork;
+};
+
+INIT_DELAYED_WORK(&dev->dwork, my_delayed_func);
+
+/* 500ms 後に実行 */
+schedule_delayed_work(&dev->dwork, msecs_to_jiffies(500));
+
+/* キャンセル (実行中なら完了を待つ) */
+cancel_delayed_work_sync(&dev->dwork);
+```
+
+`delayed_work` は内部的に `timer_list` と `work_struct` を組み合わせたものである。タイマー発火後に workqueue にワークを投入する。
+
+### workqueue の注意点
+
+- **同じ work_struct を二重投入しない** — `schedule_work()` は既にキューにあるワークを無視するが、前回のワーク実行中に再投入すると実行完了後に再実行される
+- **remove 時に `cancel_work_sync()` を忘れない** — ワーク関数がデバイス構造体を参照するため、デバイス解放前にワークを確実に停止する
+- **flush_work() と cancel_work_sync() の違い** — `flush_work()` はワークの完了を待つが再投入は防がない。`cancel_work_sync()` はキャンセルと完了待ちを行う
+
+---
+
+## カーネルスレッド (kthread)
+
+### kthread とは
+
+workqueue は短い単発の処理を委譲するのに適しているが、継続的にループして動作するバックグラウンドタスクが必要な場合は **kthread** (カーネルスレッド) を使う。
+
+### 基本的な使い方
+
+```c
+#include <linux/kthread.h>
+
+struct my_device {
+    struct task_struct *thread;
+    bool data_ready;
+    wait_queue_head_t wq;
+};
+
+static int my_thread_func(void *data)
+{
+    struct my_device *dev = data;
+
+    while (!kthread_should_stop()) {
+        /* イベントを待つ */
+        wait_event_interruptible(dev->wq, dev->data_ready || kthread_should_stop());
+
+        if (kthread_should_stop())
+            break;
+
+        /* 処理を実行 */
+        dev->data_ready = false;
+        do_background_work(dev);
+    }
+
+    return 0;
+}
+
+/* 起動 (probe 等) */
+static int my_probe(...)
+{
+    struct my_device *dev = ...;
+
+    init_waitqueue_head(&dev->wq);
+    dev->data_ready = false;
+
+    dev->thread = kthread_run(my_thread_func, dev, "my_kthread");
+    if (IS_ERR(dev->thread))
+        return PTR_ERR(dev->thread);
+
+    return 0;
+}
+
+/* 停止 (remove 等) */
+static void my_remove(...)
+{
+    kthread_stop(dev->thread);  /* kthread_should_stop() が true を返すようになる */
+}
+
+/* 割込ハンドラ等からスレッドを起床 */
+static irqreturn_t my_handler(int irq, void *dev_id)
+{
+    struct my_device *dev = dev_id;
+    dev->data_ready = true;
+    wake_up_interruptible(&dev->wq);
+    return IRQ_HANDLED;
+}
+```
+
+### 主要 API
+
+| API | 説明 |
+|---|---|
+| `kthread_run(fn, data, name)` | カーネルスレッドを作成して即座に実行する |
+| `kthread_create(fn, data, name)` | スレッドを作成するが実行はしない (`wake_up_process()` で開始) |
+| `kthread_stop(task)` | スレッドに停止を要求し、終了を待つ |
+| `kthread_should_stop()` | `kthread_stop()` が呼ばれたかを確認する |
+
+### kthread_should_stop パターン
+
+kthread の典型的なパターンは以下の通りである:
+
+1. ループ内で `kthread_should_stop()` をチェックする
+2. `wait_event_interruptible()` の条件にも `kthread_should_stop()` を含める
+3. `kthread_stop()` が呼ばれると、`kthread_should_stop()` が `true` を返し、`wait_event` から抜ける
+
+この 3 点を守らないと、`kthread_stop()` がデッドロックする (スレッドが永遠に wait し続ける)。
+
+### workqueue と kthread の使い分け
+
+| | workqueue | kthread |
+|---|---|---|
+| 用途 | 単発・短時間の処理の委譲 | 継続的なバックグラウンドタスク |
+| ライフサイクル | ワーク単位で完結 | 明示的に stop するまで動作 |
+| スレッド管理 | カーネルが管理 | 自分で管理 |
+| 典型的な用途 | 割込の bottom half、遅延処理 | ポーリング、データパイプライン |
+
+多くの場合は workqueue で十分であり、kthread が必要になるのは workqueue では表現しにくい長寿命のループ処理がある場合に限られる。
+
+---
+
+## よくある罠
+
+1. **IRQ ハンドラ内で Mutex を取る** — panic。`CONFIG_DEBUG_ATOMIC_SLEEP=y` で検出。
+
+2. **`request_irq` 前にデバイスが IRQ を発生させる** — probe の順序に注意。デバイスの IRQ を先にマスクしてから `request_irq` する。
+
+3. **`IRQF_SHARED` なのに `dev_id` が NULL** — 共有 IRQ ではデバイス識別のために非 NULL の `dev_id` が必要。
+
+4. **`IRQF_ONESHOT` を忘れる** — threaded IRQ で必要。忘れると top half が NULL の場合にカーネルが拒否する。
+
+5. **`udelay()` を長時間使う** — プロセスコンテキストで数百 us 以上の遅延が必要なら `usleep_range()` を使う。CPU を無駄に占有する。
+
+6. **`del_timer()` で済ませて `del_timer_sync()` を使わない** — モジュールアンロード時にコールバックがまだ実行中だと use-after-free になる。
+
+7. **remove 時に `cancel_work_sync()` を忘れる** — ワーク関数がデバイス構造体を参照するため、デバイス解放前にワークの停止を確認しないと use-after-free。
+
+8. **kthread のループで `kthread_should_stop()` をチェックしない** — `kthread_stop()` が永遠にブロックし、モジュールアンロードがハングする。
+
+---
+
+## 章末演習
+
+1. QEMU のシリアルポート IRQ をフックする簡単な割り込みハンドラを C で書き、IRQ 発生回数をカウントせよ。
+
+2. 同じものを threaded IRQ に書き換え、bottom half で `mutex_lock` を使えることを確認せよ。
+
+3. `timer_list` を使って 1 秒ごとにカウンタをインクリメントし、`/proc` エントリから読めるモジュールを作成せよ。
+
+4. `delayed_work` を使って probe 後 3 秒でメッセージを表示し、その後 1 秒ごとに繰り返すモジュールを書き換えよ。
+
+5. kthread を使って 5 秒ごとにシステムの `jiffies` 値をログ出力するモジュールを作成せよ。`kthread_stop()` でクリーンに終了できることを確認せよ。
+
+6. 故意に IRQ ハンドラ内で `mutex_lock` を呼ぶコードを書き、カーネルの警告メッセージを確認せよ。
+
+---
+
+## 参考資料
+
+- [IRQ handling (kernel.org)](https://docs.kernel.org/core-api/genericirq.html)
+- [Interrupts (Linux Kernel Labs)](https://linux-kernel-labs.github.io/refs/heads/master/lectures/interrupts.html)
+- [kernel::irq (rustdoc)](https://rust.docs.kernel.org/kernel/irq/)
+- [Timers (kernel.org)](https://docs.kernel.org/core-api/timers.html)
+- [hrtimers (kernel.org)](https://docs.kernel.org/timers/hrtimers.html)
+- [Workqueue (kernel.org)](https://docs.kernel.org/core-api/workqueue.html)
+- [Deferred work (Linux Kernel Labs)](https://linux-kernel-labs.github.io/refs/heads/master/lectures/deferred-work.html)

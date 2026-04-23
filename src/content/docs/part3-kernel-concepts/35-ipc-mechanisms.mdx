@@ -1,0 +1,1452 @@
+---
+title: "プロセス間通信 (IPC) メカニズム"
+description: "シグナル, パイプ, Unix ドメインソケット, eventfd, futex, io_uring — カーネル内部から見た IPC の仕組み"
+---
+
+## この章で学ぶこと
+
+- Linux カーネルが提供する IPC メカニズムの全体像を俯瞰する
+- シグナルの配送メカニズム (`do_signal`, sigpending, シグナルマスク) を理解する
+- パイプの内部構造 (`pipe_buffer` リングバッファ) と `splice` によるゼロコピー転送を把握する
+- Unix ドメインソケットの `SCM_RIGHTS` によるファイルディスクリプタ受け渡しを理解する
+- System V IPC (メッセージキュー, セマフォ, 共有メモリ) の内部構造とセキュリティ上の注意点を知る
+- `eventfd`, `signalfd`, `timerfd` のカーネル内実装を把握する
+- Futex の高速パスとカーネル介入パスの仕組みを理解する
+- `io_uring` の SQ/CQ アーキテクチャと `uring_cmd` によるドライバ統合を習得する
+- カーネルモジュールが IPC をどのように公開するか、設計パターンを整理する
+## 前提
+
+- [Ch 8b](/part4-device-drivers/12-blocking-io/) (ブロッキング I/O と wait queue) を完了している
+- [Ch 6](/part3-kernel-concepts/09-concurrency/) (並行性と同期プリミティブ) を完了している
+- [Ch 11](/part4-device-drivers/11-chardev-c/) (文字デバイスドライバ) の基礎を理解している
+
+---
+
+## IPC の全体像
+
+Linux はプロセス間の通信手段を多数提供している。各メカニズムには異なる特性があり、適材適所で使い分ける必要がある。
+
+| メカニズム | 方向性 | データ型 | 永続性 | ゼロコピー | 典型的な用途 |
+|---|---|---|---|---|---|
+| シグナル | 片方向 | 通知のみ | なし | - | プロセス制御、非同期通知 |
+| パイプ | 片方向 | バイトストリーム | なし | splice で可能 | 親子プロセス間、シェルパイプ |
+| Unix ソケット | 双方向 | バイト/データグラム | なし | なし | ローカルサービス、fd 受け渡し |
+| System V MQ | 双方向 | メッセージ | カーネル内 | なし | レガシーシステム |
+| eventfd | 双方向 | 64bit カウンタ | なし | - | KVM, VFIO, イベント通知 |
+| signalfd | 片方向 | シグナル情報 | なし | - | イベントループ統合 |
+| timerfd | 片方向 | タイマー通知 | なし | - | 高精度タイマーイベント |
+| futex | 双方向 | 同期 | なし | - | ユーザ空間 mutex/condvar |
+| io_uring | 双方向 | 任意 I/O | なし | 可能 | 高性能非同期 I/O |
+
+---
+
+## 1. シグナル
+
+### シグナルの基本
+
+シグナルは Unix 系 OS で最も古い IPC メカニズムである。プロセスに対して非同期的にイベントを通知する。
+
+```
+シグナル番号 1-31:  標準シグナル (SIGHUP, SIGINT, SIGKILL, ...)
+シグナル番号 32-64: リアルタイムシグナル (SIGRTMIN - SIGRTMAX)
+```
+
+### シグナル配送メカニズム
+
+シグナルがプロセスに配送されるまでの流れを追う。
+
+```
+シグナル配送フロー
+=================
+
+ 送信側                     カーネル                         受信プロセス
+ ──────                    ────────                        ────────────
+ kill(pid, sig)
+    |
+    v
+ kill_proc_info()
+    |
+    v
+ send_signal_locked()
+    |
+    +-- シグナルを sigpending キューに追加
+    |   (struct sigqueue をアロケート)
+    |
+    +-- signal_wake_up_state()
+    |   (TIF_SIGPENDING フラグを設定)
+    |
+    v                                                    カーネルから
+ [キューに格納]                                          ユーザ空間に
+                                                         戻る直前
+                                                            |
+                                                            v
+                                                     exit_to_user_mode_loop()
+                                                            |
+                                                            v
+                                                     arch_do_signal_or_restart()
+                                                            |
+                                                            v
+                                                     get_signal()
+                                                            |
+                                                     +------+------+
+                                                     |             |
+                                                     v             v
+                                               デフォルト動作   ユーザハンドラ
+                                               (終了/停止/     setup_rt_frame()
+                                                無視/core)     でスタック上に
+                                                               sigframe を構築
+                                                                    |
+                                                                    v
+                                                               ユーザ空間の
+                                                               ハンドラ実行
+                                                                    |
+                                                                    v
+                                                               rt_sigreturn()
+                                                               でカーネルに戻り
+                                                               元のコンテキスト復帰
+```
+
+### 主要なカーネル内部構造体
+
+```c
+/* include/linux/sched/signal.h */
+struct signal_struct {
+    refcount_t          sigcnt;
+    struct sigpending   shared_pending;  /* スレッドグループ共有 */
+    /* ... */
+};
+
+/* include/linux/signal_types.h */
+struct sigpending {
+    struct list_head list;   /* sigqueue のリスト */
+    sigset_t signal;         /* ビットマスク: 保留中のシグナル番号 */
+};
+
+struct sigqueue {
+    struct list_head list;
+    int flags;
+    kernel_siginfo_t info;   /* シグナルの詳細情報 */
+    struct ucounts *ucounts;
+};
+```
+
+各タスク (`task_struct`) は 2 つの `sigpending` を持つ:
+
+- `task_struct->pending` -- 特定スレッド宛てのシグナル
+- `task_struct->signal->shared_pending` -- プロセス (スレッドグループ) 宛てのシグナル
+
+### sigaction vs signal()
+
+```c
+#include <signal.h>
+
+/* signal() はレガシー。移植性と信頼性に問題がある */
+void (*signal(int signum, void (*handler)(int)))(int);
+
+/* sigaction() を使うべき。動作が完全に制御できる */
+struct sigaction {
+    void     (*sa_handler)(int);               /* 古い形式 */
+    void     (*sa_sigaction)(int, siginfo_t *, void *); /* SA_SIGINFO 時 */
+    sigset_t   sa_mask;    /* ハンドラ実行中にブロックするシグナル */
+    int        sa_flags;   /* SA_RESTART, SA_SIGINFO, SA_NODEFER, ... */
+};
+
+/* 推奨される使い方 */
+struct sigaction sa;
+memset(&sa, 0, sizeof(sa));
+sa.sa_sigaction = my_handler;
+sa.sa_flags = SA_SIGINFO | SA_RESTART;
+sigemptyset(&sa.sa_mask);
+sigaction(SIGUSR1, &sa, NULL);
+```
+
+**`signal()` の問題点:**
+
+1. ハンドラ実行中のシグナルマスクを制御できない
+2. `SA_RESTART` の有無がシステム依存
+3. 一部の実装ではハンドラが 1 回呼ばれると `SIG_DFL` にリセットされる
+
+### リアルタイムシグナル (32-64)
+
+標準シグナル (1-31) とリアルタイムシグナル (32-64) には重要な違いがある。
+
+| 特性 | 標準シグナル (1-31) | リアルタイムシグナル (32-64) |
+|---|---|---|
+| キューイング | されない (合体する) | される (同じ番号が複数保留可能) |
+| 配送順序 | 未定義 | 番号が小さい順 |
+| `siginfo_t` のデータ | 限定的 | `si_value` で任意の値を送れる |
+| 用途 | 伝統的なプロセス制御 | アプリケーション定義のイベント |
+
+```c
+/* リアルタイムシグナルの送信 */
+#include <signal.h>
+
+union sigval value;
+value.sival_int = 42;  /* 任意のデータを付加 */
+
+sigqueue(target_pid, SIGRTMIN + 3, value);
+```
+
+標準シグナルが「合体する」とは、同じシグナルが複数回送られても `sigpending` のビットマスクでは 1 ビットしか立たないため、1 回しか配送されないということである。リアルタイムシグナルは `sigqueue` 構造体が番号ごとにリストに追加されるため、送った回数だけ配送される。
+
+### カーネルモジュールからのシグナル送信
+
+カーネルモジュールからユーザプロセスにシグナルを送ることができる。
+
+```c
+#include <linux/sched/signal.h>
+
+/*
+ * カーネルモジュールからシグナルを送信する例。
+ * 例: 非同期イベント発生時にユーザプロセスに通知。
+ */
+static int send_notification(struct task_struct *task, int sig)
+{
+    struct kernel_siginfo info;
+
+    clear_siginfo(&info);
+    info.si_signo = sig;
+    info.si_code  = SI_KERNEL;  /* カーネルからの送信を示す */
+    info.si_pid   = 0;
+    info.si_uid   = 0;
+
+    return send_sig_info(sig, &info, task);
+}
+
+/*
+ * 使用例: ioctl でプロセスの PID を登録し、
+ *          イベント発生時にシグナルを送る。
+ */
+static struct task_struct *registered_task;
+
+static long my_ioctl(struct file *file, unsigned int cmd, unsigned long arg)
+{
+    switch (cmd) {
+    case MY_IOCTL_REGISTER_PID: {
+        pid_t pid = (pid_t)arg;
+        struct pid *pid_struct;
+
+        pid_struct = find_get_pid(pid);
+        if (!pid_struct)
+            return -ESRCH;
+
+        rcu_read_lock();
+        registered_task = get_pid_task(pid_struct, PIDTYPE_PID);
+        rcu_read_unlock();
+        put_pid(pid_struct);
+
+        if (!registered_task)
+            return -ESRCH;
+        return 0;
+    }
+    }
+    return -ENOTTY;
+}
+```
+
+### ERESTARTSYS とドライバのシグナル処理
+
+ドライバの `read`/`write` 実装では、`wait_event_interruptible` がシグナルで中断されたとき `-ERESTARTSYS` を返す必要がある。
+
+```c
+static ssize_t my_read(struct file *file, char __user *buf,
+                        size_t count, loff_t *ppos)
+{
+    struct my_device *dev = file->private_data;
+    int ret;
+
+    /* データが来るまで sleep。シグナルで起こされる可能性がある */
+    ret = wait_event_interruptible(dev->read_wq, dev->data_ready);
+    if (ret)
+        return -ERESTARTSYS;  /* カーネルがシステムコールを再試行する */
+
+    /*
+     * -ERESTARTSYS を返すと、カーネルは以下のように動作する:
+     *
+     * 1. ユーザが SA_RESTART を設定 → read() を自動再試行
+     * 2. ユーザが SA_RESTART を未設定 → ユーザに -EINTR を返す
+     *
+     * 注意: -EINTR を直接返さないこと。
+     *       -ERESTARTSYS はカーネルが SA_RESTART の判断をするための値。
+     */
+
+    if (copy_to_user(buf, dev->buffer, dev->data_len))
+        return -EFAULT;
+
+    dev->data_ready = false;
+    return dev->data_len;
+}
+```
+
+**重要な原則:** ドライバは `-EINTR` ではなく `-ERESTARTSYS` を返す。カーネルのシグナル処理コードが、ユーザの `sigaction` 設定 (`SA_RESTART` フラグ) に基づいて、システムコールを再試行するか `-EINTR` をユーザに返すかを判断する。
+
+---
+
+## 2. パイプと FIFO
+
+### パイプの内部構造
+
+パイプはカーネル内で `pipe_inode_info` 構造体として管理される。データは `pipe_buffer` のリングバッファに格納される。
+
+```c
+/* include/linux/pipe_fs_i.h */
+struct pipe_inode_info {
+    struct mutex mutex;
+    wait_queue_head_t rd_wait, wr_wait;  /* 読み手/書き手の wait queue */
+    unsigned int head;          /* リングの書き込み位置 */
+    unsigned int tail;          /* リングの読み出し位置 */
+    unsigned int max_usage;     /* 最大バッファ数 (デフォルト 16) */
+    unsigned int ring_size;     /* リングの実サイズ (2のべき乗) */
+    unsigned int nr_accounted;
+    unsigned int readers;       /* 読み手の数 */
+    unsigned int writers;       /* 書き手の数 */
+    unsigned int files;
+    unsigned int r_counter;
+    unsigned int w_counter;
+    bool poll_usage;
+    struct page *tmp_page;
+    struct fasync_struct *fasync_readers;
+    struct fasync_struct *fasync_writers;
+    struct pipe_buffer *bufs;   /* pipe_buffer の配列 (リング) */
+    struct user_struct *user;
+};
+
+struct pipe_buffer {
+    struct page *page;    /* データが格納されたページ */
+    unsigned int offset;  /* ページ内のオフセット */
+    unsigned int len;     /* データ長 */
+    const struct pipe_buf_operations *ops;
+    unsigned int flags;
+};
+```
+
+### パイプバッファリングの図解
+
+```
+pipe_buffer リングバッファ構造
+==============================
+
+pipe_inode_info
++--------------------+
+| head = 5           |  (次の write 位置)
+| tail = 2           |  (次の read 位置)
+| ring_size = 16     |
+| bufs ──────────────+──>  pipe_buffer[16]
++--------------------+     ┌─────────────────────────────────────┐
+                           │ [0]  page=NULL   (consumed)         │
+                           │ [1]  page=NULL   (consumed)         │
+                     tail──>│ [2]  page=0xa00  off=0   len=4096  │ ← 読み出し
+                           │ [3]  page=0xb00  off=0   len=4096  │
+                           │ [4]  page=0xc00  off=0   len=2048  │
+                     head──>│ [5]  page=NULL   (empty)           │ ← 書き込み
+                           │ [6]  page=NULL   (empty)           │
+                           │ ...                                 │
+                           │ [15] page=NULL   (empty)           │
+                           └─────────────────────────────────────┘
+
+データ量 = bufs[tail..head] の len の合計
+         = 4096 + 4096 + 2048 = 10240 bytes
+
+デフォルトのパイプ容量:
+  ring_size = 16, 各バッファは最大 PAGE_SIZE (4096)
+  → 最大 16 * 4096 = 65536 bytes (64 KB)
+
+fcntl(fd, F_SETPIPE_SZ, new_size) で変更可能
+  (上限: /proc/sys/fs/pipe-max-size, デフォルト 1048576)
+```
+
+### splice: ゼロコピーデータ転送
+
+`splice` システムコールは、ページ参照の移動だけでファイルディスクリプタ間のデータ転送を行う。ユーザ空間へのコピーが不要なため、大幅な性能向上が可能。
+
+```c
+#define _GNU_SOURCE
+#include <fcntl.h>
+
+/*
+ * ファイルからソケットへのゼロコピー送信。
+ * sendfile() に似ているが、パイプを経由することで汎用的に使える。
+ */
+int file_to_socket(int file_fd, int sock_fd, size_t len)
+{
+    int pipefd[2];
+    ssize_t ret;
+
+    pipe(pipefd);
+
+    /* ファイル → パイプ: ページ参照をパイプに移動 (コピーなし) */
+    ret = splice(file_fd, NULL, pipefd[1], NULL, len,
+                 SPLICE_F_MOVE | SPLICE_F_MORE);
+    if (ret < 0) return -1;
+
+    /* パイプ → ソケット: ページ参照をソケットに移動 (コピーなし) */
+    ret = splice(pipefd[0], NULL, sock_fd, NULL, ret,
+                 SPLICE_F_MOVE | SPLICE_F_MORE);
+
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return ret;
+}
+```
+
+**カーネル内部の仕組み:**
+
+1. `splice` はソース fd の `file_operations->splice_read` を呼ぶ
+2. ソースのページを `pipe_buffer` の `page` フィールドに設定する (データコピーなし)
+3. 次にデスティネーション fd の `file_operations->splice_write` を呼ぶ
+4. `pipe_buffer` のページ参照をそのままデスティネーションに渡す
+
+ページの参照カウントを増減するだけで、実際のデータコピーは発生しない。
+
+### パイプの容量と制限
+
+```c
+/* パイプ関連のシステムパラメータ */
+
+/* /proc/sys/fs/pipe-max-size
+ * 非特権ユーザが fcntl(F_SETPIPE_SZ) で設定できる最大値。
+ * デフォルト: 1048576 (1 MB) */
+
+/* /proc/sys/fs/pipe-user-pages-soft
+ * ユーザごとのパイプバッファ用ページ数のソフトリミット。
+ * 超過すると新しいパイプはデフォルトサイズ (1ページ) に制限される */
+
+/* /proc/sys/fs/pipe-user-pages-hard
+ * ユーザごとのパイプバッファ用ページ数のハードリミット。
+ * 超過すると pipe() が -ENOMEM で失敗する */
+```
+
+---
+
+## 3. Unix ドメインソケット
+
+### 内部構造
+
+Unix ドメインソケットは `struct socket` と `struct unix_sock` で管理される。
+
+```c
+/* net/unix/af_unix.c で定義 */
+struct unix_sock {
+    struct sock     sk;           /* 汎用ソケット構造体 */
+    struct unix_address *addr;    /* バインドされたアドレス */
+    struct path     path;         /* ファイルシステムパス */
+    struct mutex    iolock;
+    struct mutex    bindlock;
+    struct sock     *peer;        /* 接続先ソケット */
+    struct list_head link;
+    unsigned long   inflight;     /* 転送中の fd 数 */
+    spinlock_t      lock;
+    unsigned char   recursion_level;
+    struct socket_wq peer_wq;
+    wait_queue_entry_t peer_wake;
+    struct scm_stat scm_stat;
+    /* ... */
+};
+```
+
+### SCM_RIGHTS: ファイルディスクリプタの受け渡し
+
+Unix ドメインソケットの最も強力な機能の一つが `SCM_RIGHTS` である。プロセス間でファイルディスクリプタを渡すことができる。これはカーネルが `struct file` の参照をプロセス間で共有することで実現される。
+
+```c
+#include <sys/socket.h>
+#include <sys/un.h>
+
+/* === 送信側: ファイルディスクリプタを送る === */
+int send_fd(int unix_sock, int fd_to_send)
+{
+    struct msghdr msg = {0};
+    struct iovec iov;
+    char buf[1] = {0};  /* 最低 1 バイトのデータが必要 */
+
+    /* 補助データ (ancillary data) の準備 */
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr *cmsg;
+
+    iov.iov_base = buf;
+    iov.iov_len  = 1;
+    msg.msg_iov    = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control    = cmsgbuf;
+    msg.msg_controllen = sizeof(cmsgbuf);
+
+    cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type  = SCM_RIGHTS;   /* ファイルディスクリプタ転送 */
+    cmsg->cmsg_len   = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd_to_send, sizeof(int));
+
+    return sendmsg(unix_sock, &msg, 0);
+}
+
+/* === 受信側: ファイルディスクリプタを受け取る === */
+int recv_fd(int unix_sock)
+{
+    struct msghdr msg = {0};
+    struct iovec iov;
+    char buf[1];
+    char cmsgbuf[CMSG_SPACE(sizeof(int))];
+    struct cmsghdr *cmsg;
+    int received_fd = -1;
+
+    iov.iov_base = buf;
+    iov.iov_len  = 1;
+    msg.msg_iov    = &iov;
+    msg.msg_iovlen = 1;
+    msg.msg_control    = cmsgbuf;
+    msg.msg_controllen = sizeof(cmsgbuf);
+
+    recvmsg(unix_sock, &msg, 0);
+
+    cmsg = CMSG_FIRSTHDR(&msg);
+    if (cmsg && cmsg->cmsg_level == SOL_SOCKET
+             && cmsg->cmsg_type == SCM_RIGHTS) {
+        memcpy(&received_fd, CMSG_DATA(cmsg), sizeof(int));
+    }
+    return received_fd;
+
+    /*
+     * カーネル内部では:
+     * 1. 送信側: fget() で struct file* の参照を取得
+     * 2. unix_attach_fds() で scm_fp_list に格納
+     * 3. 受信側: __scm_install_fd() で新しい fd 番号を割り当て、
+     *    同じ struct file* を受信プロセスの fd テーブルに挿入
+     *
+     * → 同じ struct file を共有するので、
+     *   ファイルオフセットやフラグも共有される
+     */
+}
+```
+
+### 抽象ソケット名前空間
+
+Linux 固有の機能として、ファイルシステムに実体を持たない「抽象名前空間」がある。
+
+```c
+struct sockaddr_un addr;
+addr.sun_family = AF_UNIX;
+
+/* 通常のパス: ファイルシステム上にソケットファイルが作られる */
+strncpy(addr.sun_path, "/tmp/my_socket", sizeof(addr.sun_path) - 1);
+
+/* 抽象名前空間: sun_path[0] を '\0' にする */
+addr.sun_path[0] = '\0';
+strncpy(addr.sun_path + 1, "my_abstract_socket",
+        sizeof(addr.sun_path) - 2);
+
+/*
+ * 抽象名前空間の特徴:
+ * - ファイルシステムにエントリが作られない
+ * - unlink 不要 (全プロセスが close すると自動消滅)
+ * - ファイルパーミッションによるアクセス制御がない
+ *   → ネットワーク名前空間でのみ隔離される
+ * - Android で広く使われている (Binder 以外の IPC)
+ */
+```
+
+---
+
+## 4. System V IPC
+
+### 概要
+
+System V IPC は歴史的な IPC メカニズムで、メッセージキュー、セマフォ、共有メモリの 3 つから構成される。POSIX IPC が推奨される現代でも、レガシーシステムやカーネル内部の理解のために重要である。
+
+### 共通の内部構造
+
+```c
+/* ipc/util.h */
+struct ipc_ids {
+    int in_use;              /* 使用中の IPC オブジェクト数 */
+    unsigned short seq;      /* シーケンス番号 (再利用検出) */
+    struct rw_semaphore rwsem;
+    struct idr ipcs_idr;     /* IDR (Radix tree ベース) で管理 */
+    int max_idx;
+    int last_idx;
+    struct rhashtable key_ht; /* key → id の逆引き */
+};
+
+struct kern_ipc_perm {
+    spinlock_t lock;
+    bool deleted;
+    int id;
+    key_t key;
+    kuid_t uid, gid, cuid, cgid;
+    umode_t mode;
+    unsigned long seq;
+    refcount_t refcount;
+    struct rcu_head rcu;     /* RCU による安全な解放 */
+    /* ... */
+};
+```
+
+**RCU 保護された検索:** `ipc_obtain_object_idr()` は `rcu_read_lock()` の下で IDR からオブジェクトを検索する。これにより、読み取り側はロックフリーでオブジェクトを参照できる。
+
+### メッセージキュー
+
+```c
+#include <sys/msg.h>
+
+/* メッセージキューの作成/取得 */
+int msgid = msgget(IPC_PRIVATE, IPC_CREAT | 0600);
+
+/* メッセージの送信 */
+struct {
+    long mtype;       /* メッセージタイプ (> 0) */
+    char mtext[256];  /* メッセージ本文 */
+} msg;
+
+msg.mtype = 1;
+strncpy(msg.mtext, "Hello IPC", sizeof(msg.mtext));
+msgsnd(msgid, &msg, strlen(msg.mtext) + 1, 0);
+
+/* メッセージの受信 (タイプ 1 を取得) */
+msgrcv(msgid, &msg, sizeof(msg.mtext), 1, 0);
+
+/* メッセージキューの削除 */
+msgctl(msgid, IPC_RMID, NULL);
+```
+
+**カーネル内部:**
+
+```c
+/* ipc/msg.c */
+struct msg_msg {
+    struct list_head m_list;
+    long m_type;
+    size_t m_ts;         /* メッセージサイズ */
+    struct msg_msgseg *next;  /* 追加セグメント (大きなメッセージ用) */
+    void *security;
+    /* ここにデータが続く (ヘッダ直後に配置) */
+};
+```
+
+> **セキュリティ上の注意: `msg_msg` とカーネルエクスプロイト**
+>
+> `msg_msg` 構造体はカーネルヒープ上にアロケートされ、サイズをユーザが制御でき (`msgsnd` のデータサイズ)、内容もユーザが制御できる。さらに、`msgrcv` で読み出すことで内容をユーザ空間に取得できる。
+>
+> この「サイズ制御可能 + 内容制御可能 + 読み出し可能」な特性から、`msg_msg` はカーネルヒープの use-after-free や heap overflow エクスプロイトで広く悪用される:
+>
+> 1. **ヒープスプレー**: 脆弱なオブジェクトと同じ slab に `msg_msg` を大量配置
+> 2. **偽造**: 解放済みメモリに `msg_msg` を配置し、`next` ポインタを偽造して任意読み取り
+> 3. **情報リーク**: ヒープの隣接データを `msg_msg` 越しに読み出す
+>
+> このため、カーネルセキュリティの研究者にとって `msg_msg` の構造理解は必須である。
+
+### セマフォ
+
+```c
+#include <sys/sem.h>
+
+/* セマフォセットの作成 (3つのセマフォ) */
+int semid = semget(IPC_PRIVATE, 3, IPC_CREAT | 0600);
+
+/* セマフォの初期化 */
+union semun {
+    int val;
+    struct semid_ds *buf;
+    unsigned short *array;
+};
+union semun arg;
+arg.val = 1;  /* 初期値 1 (バイナリセマフォ) */
+semctl(semid, 0, SETVAL, arg);
+
+/* P 操作 (acquire / wait) */
+struct sembuf sop = {
+    .sem_num = 0,     /* セマフォ番号 */
+    .sem_op  = -1,    /* -1: デクリメント (ブロック可能) */
+    .sem_flg = SEM_UNDO, /* プロセス終了時に自動アンドゥ */
+};
+semop(semid, &sop, 1);
+
+/* V 操作 (release / post) */
+sop.sem_op = 1;  /* +1: インクリメント */
+semop(semid, &sop, 1);
+```
+
+### 共有メモリ
+
+```c
+#include <sys/shm.h>
+
+/* 共有メモリセグメントの作成 (4096 bytes) */
+int shmid = shmget(IPC_PRIVATE, 4096, IPC_CREAT | 0600);
+
+/* 共有メモリのアタッチ */
+void *addr = shmat(shmid, NULL, 0);
+
+/* データの読み書き */
+sprintf((char *)addr, "Shared data");
+
+/* 共有メモリのデタッチ */
+shmdt(addr);
+
+/* 共有メモリの削除 */
+shmctl(shmid, IPC_RMID, NULL);
+```
+
+---
+
+## 5. eventfd
+
+### カウンタベースのイベント通知
+
+`eventfd` は単一の 64 ビットカウンタを持つファイルディスクリプタである。シンプルだが、`poll`/`epoll` と組み合わせることで強力なイベント通知メカニズムになる。
+
+```c
+#include <sys/eventfd.h>
+
+/* eventfd の作成 */
+int efd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
+/*
+ * 引数:
+ *   initval:  カウンタの初期値
+ *   flags:    EFD_NONBLOCK  - ノンブロッキング
+ *             EFD_CLOEXEC   - exec 時に close
+ *             EFD_SEMAPHORE - セマフォモード
+ */
+
+/* イベントの通知 (書き込み = カウンタ加算) */
+uint64_t val = 1;
+write(efd, &val, sizeof(val));
+/* カウンタに val が加算される。
+ * カウンタが UINT64_MAX - 1 を超える場合は EAGAIN/ブロック */
+
+/* イベントの受信 (読み出し = カウンタ取得 & リセット) */
+uint64_t count;
+read(efd, &count, sizeof(count));
+/*
+ * 通常モード:   カウンタ値を返し、0 にリセット
+ * セマフォモード: 常に 1 を返し、カウンタを 1 減らす
+ * カウンタが 0 の場合は EAGAIN (NONBLOCK) かブロック
+ */
+```
+
+### カーネル内部構造
+
+```c
+/* fs/eventfd.c */
+struct eventfd_ctx {
+    struct kref kref;
+    wait_queue_head_t wqh;    /* poll/epoll 用 wait queue */
+    __u64 count;              /* 64 ビットカウンタ */
+    unsigned int flags;
+    int id;
+};
+```
+
+### KVM/VFIO での使用
+
+`eventfd` はカーネル内部でも広く使われている。代表的なのが KVM (仮想マシンモニタ) における割り込みインジェクションである。
+
+```c
+/*
+ * KVM での eventfd の使用パターン:
+ *
+ * 1. ユーザ空間 (QEMU) が eventfd を作成
+ * 2. KVM_IRQFD ioctl でカーネルの KVM に eventfd を登録
+ * 3. VFIO デバイスが割り込みを受けると eventfd に write
+ * 4. KVM が eventfd をポーリングし、ゲスト VM に割り込みを注入
+ *
+ *   ┌──────────┐   eventfd    ┌──────────┐
+ *   │  VFIO    │──────────>│   KVM    │
+ *   │ (デバイス) │  write(1)   │ (VM管理) │
+ *   └──────────┘              └──────────┘
+ *        ^                         |
+ *        |                         v
+ *   物理デバイス割込           ゲスト VM に仮想割込注入
+ *
+ * カーネル → カーネル間の通知に write/read ではなく
+ * eventfd_signal() / eventfd_ctx_read() を直接使用する。
+ */
+
+/* カーネルモジュールから eventfd に通知 */
+#include <linux/eventfd.h>
+
+void notify_userspace(struct eventfd_ctx *ctx)
+{
+    eventfd_signal(ctx);  /* カウンタを 1 加算、wait queue を起こす */
+}
+
+/* eventfd_ctx の取得 (fd 番号から) */
+struct eventfd_ctx *ctx = eventfd_ctx_fdget(user_fd);
+/* 使用後 */
+eventfd_ctx_put(ctx);
+```
+
+---
+
+## 6. signalfd と timerfd
+
+### signalfd: シグナルをファイルディスクリプタとして扱う
+
+シグナルハンドラの問題点 (非同期安全性、reentrant の制約) を回避するため、シグナルをファイルディスクリプタ経由で同期的に処理できる。
+
+```c
+#include <sys/signalfd.h>
+#include <signal.h>
+
+/* 1. 通常のシグナル配送をブロック */
+sigset_t mask;
+sigemptyset(&mask);
+sigaddset(&mask, SIGINT);
+sigaddset(&mask, SIGTERM);
+sigprocmask(SIG_BLOCK, &mask, NULL);
+
+/* 2. signalfd を作成 */
+int sfd = signalfd(-1, &mask, SFD_NONBLOCK | SFD_CLOEXEC);
+
+/* 3. read() でシグナルを受信 */
+struct signalfd_siginfo fdsi;
+ssize_t s = read(sfd, &fdsi, sizeof(fdsi));
+if (s == sizeof(fdsi)) {
+    printf("Signal %d from PID %d\n", fdsi.ssi_signo, fdsi.ssi_pid);
+}
+
+/*
+ * signalfd は epoll と組み合わせて使うのが一般的。
+ * これにより、ソケット I/O とシグナルを同じイベントループで処理できる。
+ *
+ * カーネル内部:
+ * - signalfd_read() は dequeue_signal() を呼んで
+ *   sigpending キューからシグナルを取り出す
+ * - signalfd_poll() は signal_pending(current) をチェックして
+ *   EPOLLIN を返す
+ */
+```
+
+### timerfd: タイマーをファイルディスクリプタとして扱う
+
+`timerfd` は `hrtimer` (高精度タイマー) をファイルディスクリプタとしてラップしたものである。
+
+```c
+#include <sys/timerfd.h>
+
+/* timerfd の作成 (CLOCK_MONOTONIC = 単調増加クロック) */
+int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+
+/* タイマーの設定: 1秒後に最初の発火、以降 500ms 間隔 */
+struct itimerspec ts = {
+    .it_value    = { .tv_sec = 1, .tv_nsec = 0 },          /* 最初 */
+    .it_interval = { .tv_sec = 0, .tv_nsec = 500000000 },  /* 間隔 */
+};
+timerfd_settime(tfd, 0, &ts, NULL);
+
+/* タイマー発火の読み取り */
+uint64_t expirations;
+read(tfd, &expirations, sizeof(expirations));
+/* expirations: 前回の read 以降の発火回数 */
+
+/*
+ * カーネル内部:
+ * - timerfd_ctx 構造体が hrtimer を保持
+ * - hrtimer のコールバックで wake_up_locked_poll() を呼ぶ
+ * - timerfd_read() は発火回数 (ticks) を返して 0 にリセット
+ * - timerfd_poll() は ticks > 0 なら EPOLLIN を返す
+ *
+ * timerfd は epoll と組み合わせることで、
+ * setitimer/SIGALRM よりも安全で柔軟なタイマー処理が実現できる
+ */
+```
+
+### イベントループでの統合
+
+```c
+/* signalfd + timerfd + socket を epoll で統合する例 */
+#include <sys/epoll.h>
+
+int epfd = epoll_create1(EPOLL_CLOEXEC);
+
+struct epoll_event ev;
+
+/* signalfd を追加 */
+ev.events = EPOLLIN;
+ev.data.fd = sfd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, sfd, &ev);
+
+/* timerfd を追加 */
+ev.events = EPOLLIN;
+ev.data.fd = tfd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, tfd, &ev);
+
+/* リッスンソケットを追加 */
+ev.events = EPOLLIN;
+ev.data.fd = listen_fd;
+epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev);
+
+/* 統一イベントループ */
+struct epoll_event events[16];
+while (1) {
+    int nfds = epoll_wait(epfd, events, 16, -1);
+    for (int i = 0; i < nfds; i++) {
+        if (events[i].data.fd == sfd)
+            handle_signal(sfd);
+        else if (events[i].data.fd == tfd)
+            handle_timer(tfd);
+        else if (events[i].data.fd == listen_fd)
+            handle_connection(listen_fd);
+    }
+}
+```
+
+---
+
+## 7. Futex
+
+### 高速ユーザ空間 Mutex
+
+Futex (Fast Userspace muTEX) は、ユーザ空間とカーネルの協調により、**競合がない場合にシステムコールを完全に回避する**同期プリミティブである。
+
+```
+Futex の動作フロー
+==================
+
+ケース 1: 競合なし (Fast Path) — カーネル介入なし
+──────────────────────────────────────────────
+
+  ユーザ空間                          カーネル
+  ──────────                         ────────
+  atomic_cmpxchg(&futex_word, 0, 1)
+  → 成功! (0 → 1 に変更)
+  → ロック獲得完了                    (呼ばれない)
+  → システムコール不要!
+
+ケース 2: 競合あり (Slow Path) — カーネルが介入
+──────────────────────────────────────────────
+
+  スレッド A (保持者)    スレッド B (待機者)           カーネル
+  ──────────────────    ──────────────────          ────────
+  ロック保持中
+                        atomic_cmpxchg(&futex, 0, 1)
+                        → 失敗! (既に 1)
+                        futex_word を 2 に設定
+                         (「待機者あり」を示す)
+                        |
+                        v
+                        syscall(SYS_futex,
+                                &futex_word,
+                                FUTEX_WAIT,          futex_wait()
+                                2, ...)              → ハッシュバケットを検索
+                                                     → futex_word == 2 を確認
+                                                     → スレッド B を wait queue に追加
+                                                     → スレッド B を sleep
+
+  /* クリティカルセクション終了 */
+  old = atomic_xchg(&futex, 0)
+  if (old == 2)  /* 待機者あり */
+    syscall(SYS_futex,
+            &futex_word,
+            FUTEX_WAKE,              futex_wake()
+            1, ...)                  → ハッシュバケットからスレッド B を見つける
+                                     → スレッド B を起こす
+
+                        [起床]
+                        → ロック獲得を再試行
+```
+
+### FUTEX_WAIT / FUTEX_WAKE
+
+```c
+#include <linux/futex.h>
+#include <sys/syscall.h>
+#include <stdatomic.h>
+
+/*
+ * 注意: futex は通常 pthread ライブラリの内部で使われる。
+ * 以下は仕組みを理解するための直接的な使用例。
+ */
+
+static _Atomic int futex_word = 0;
+
+/* ロック (acquire) */
+void futex_lock(void)
+{
+    int val;
+    /* Fast path: 競合なし → CAS で 0→1 に変更 */
+    val = 0;
+    if (atomic_compare_exchange_strong(&futex_word, &val, 1))
+        return;  /* 成功、システムコール不要 */
+
+    /* Slow path: 競合あり → カーネルで sleep */
+    while (1) {
+        /* 2 = 「待機者あり」を示す (wake 時の最適化のため) */
+        if (atomic_exchange(&futex_word, 2) == 0)
+            return;  /* ロック獲得成功 */
+
+        /* カーネルに sleep を依頼 */
+        syscall(SYS_futex, &futex_word, FUTEX_WAIT, 2, NULL, NULL, 0);
+        /* ここに到達 = wake された or spurious wakeup */
+    }
+}
+
+/* アンロック (release) */
+void futex_unlock(void)
+{
+    /* 2→0 にリセット。元が 2 なら待機者がいる */
+    if (atomic_exchange(&futex_word, 0) == 2) {
+        /* 待機者がいるのでカーネルに wake を依頼 */
+        syscall(SYS_futex, &futex_word, FUTEX_WAKE, 1, NULL, NULL, 0);
+    }
+    /* 元が 1 なら待機者なし → システムコール不要 */
+}
+```
+
+### カーネル内部: ハッシュバケット
+
+```c
+/* kernel/futex/core.c */
+
+/*
+ * futex のカーネル側は、ユーザ空間のアドレスをキーとした
+ * ハッシュテーブルで wait queue を管理する。
+ */
+struct futex_hash_bucket {
+    atomic_t waiters;         /* 待機者数 (最適化用) */
+    spinlock_t lock;
+    struct plist_head chain;  /* 優先度付きリスト */
+};
+
+/*
+ * ハッシュテーブルのサイズは起動時に決定される。
+ * futex_hash() がユーザ空間アドレスからバケットを決定。
+ *
+ * キー (union futex_key) の構成:
+ * - 共有マッピング: (inode, ページオフセット)
+ * - プライベートマッピング: (mm_struct, 仮想アドレス)
+ *
+ * これにより、共有メモリ上の futex は異なるプロセス間でも
+ * 同じバケットに解決される。
+ */
+```
+
+### 優先度継承 futex (PI-futex)
+
+優先度逆転問題を解決するための PI-futex がある。
+
+```c
+/*
+ * 優先度逆転問題:
+ *
+ * 高優先度タスク H がロックを待っている
+ * 低優先度タスク L がロックを保持している
+ * 中優先度タスク M が L をプリエンプトして実行
+ * → H は M の終了を待つことになる (逆転!)
+ *
+ * PI-futex の解決策:
+ * H が L の保持するロックを待つ場合、
+ * L の優先度を一時的に H の優先度に引き上げる (優先度継承)。
+ * → L は M にプリエンプトされず、素早くロックを解放できる。
+ */
+
+/* PI-futex の使用 (pthread 経由) */
+pthread_mutexattr_t attr;
+pthread_mutex_t pi_mutex;
+
+pthread_mutexattr_init(&attr);
+pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT);
+pthread_mutex_init(&pi_mutex, &attr);
+
+/* カーネル内部では FUTEX_LOCK_PI / FUTEX_UNLOCK_PI を使用。
+ * rt_mutex ベースの実装で、ロック所有者の追跡と
+ * 優先度チェーンの伝播を行う。 */
+```
+
+---
+
+## 8. io_uring
+
+### 概要
+
+`io_uring` は Linux 5.1 で導入された非同期 I/O フレームワークである。ユーザ空間とカーネルが共有メモリ上のリングバッファを介して通信することで、システムコールのオーバーヘッドを最小化する。
+
+### SQ/CQ アーキテクチャ
+
+```
+io_uring SQ/CQ アーキテクチャ
+===============================
+
+            ユーザ空間                              カーネル空間
+ ┌──────────────────────────────────┐    ┌──────────────────────────────┐
+ │                                  │    │                              │
+ │  Submission Queue (SQ)           │    │                              │
+ │  ┌────┬────┬────┬────┬────┬────┐ │    │                              │
+ │  │ e0 │ e1 │ e2 │ e3 │    │    │ │    │    SQ Entries (SQE) 配列     │
+ │  └──┬─┴──┬─┴──┬─┴────┴────┴────┘ │    │    ┌────────────────────┐    │
+ │     │    │    │   インデックス     │    │    │ sqe[0]: READ fd=3  │    │
+ │     │    │    │   配列 (mmap)     │    │    │ sqe[1]: WRITE fd=4 │    │
+ │     │    │    └──>────────────────────>│    │ sqe[2]: FSYNC fd=3 │    │
+ │     │    └──>─────────────────────────>│    │ sqe[3]: NOP        │    │
+ │     └──>──────────────────────────────>│    │ ...                │    │
+ │                                  │    │    └────────────────────┘    │
+ │  SQ Tail ──────────────> SQ Head │    │              │               │
+ │  (ユーザが進める) (カーネルが進める) │    │              v               │
+ │                                  │    │     io_uring ワーカースレッド   │
+ │                                  │    │     がリクエストを処理         │
+ │                                  │    │              │               │
+ │  Completion Queue (CQ)           │    │              v               │
+ │  ┌────────────────────────────┐  │    │    CQE をキューに追加        │
+ │  │ cqe[0]: res=4096, ud=0x1  │<──────────────────────┘               │
+ │  │ cqe[1]: res=4096, ud=0x2  │  │    │                              │
+ │  │ cqe[2]: res=0,    ud=0x3  │  │    │                              │
+ │  │                           │  │    │                              │
+ │  └────────────────────────────┘  │    │                              │
+ │  CQ Head ──────────────> CQ Tail│    │                              │
+ │  (ユーザが進める) (カーネルが進める) │    │                              │
+ │                                  │    │                              │
+ └──────────────────────────────────┘    └──────────────────────────────┘
+
+ 共有メモリ (mmap) 上のリングバッファにより、
+ SQE 投入と CQE 回収はロックフリーで行える。
+ io_uring_enter() システムコールは必要な場合のみ呼ぶ。
+
+ SQE (Submission Queue Entry):
+ ┌──────────┬──────────┬──────┬────────┬─────────┐
+ │ opcode   │ flags    │ fd   │ off    │ addr    │
+ │ (8 bits) │ (8 bits) │(32b) │ (64b)  │ (64b)   │
+ ├──────────┼──────────┼──────┼────────┼─────────┤
+ │ len      │ union    │ user_data     │ buf_idx │
+ │ (32b)    │ (各op別) │ (64 bits)     │ (16b)   │
+ └──────────┴──────────┴──────┴────────┴─────────┘
+ 合計 64 bytes / エントリ
+
+ CQE (Completion Queue Entry):
+ ┌─────────────────┬──────────┐
+ │ user_data (64b) │ res (32b)│
+ │                 │ flags    │
+ └─────────────────┴──────────┘
+ 合計 16 bytes / エントリ
+```
+
+### 基本的な使用法
+
+```c
+#include <liburing.h>
+
+/* io_uring の初期化 */
+struct io_uring ring;
+io_uring_queue_init(256, &ring, 0);  /* 256 エントリ */
+
+/* 読み取りリクエストの投入 */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, fd, buf, sizeof(buf), 0);
+io_uring_sqe_set_data(sqe, (void *)0x1234);  /* ユーザデータ */
+
+/* 書き込みリクエストの投入 */
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_write(sqe, fd2, data, data_len, 0);
+io_uring_sqe_set_data(sqe, (void *)0x5678);
+
+/* まとめてサブミット */
+io_uring_submit(&ring);
+
+/* 完了を待つ */
+struct io_uring_cqe *cqe;
+io_uring_wait_cqe(&ring, &cqe);
+
+printf("Result: %d, user_data: %p\n", cqe->res,
+       io_uring_cqe_get_data(cqe));
+
+/* CQE を消費済みとしてマーク */
+io_uring_cqe_seen(&ring, cqe);
+
+/* 後片付け */
+io_uring_queue_exit(&ring);
+```
+
+### 登録済み fd とバッファ
+
+```c
+/*
+ * fd の登録: カーネル側で fget/fput を省略し、
+ * 固定テーブルから直接 struct file* を取得する。
+ * 高頻度 I/O での性能改善に効果的。
+ */
+int fds[] = {fd1, fd2, fd3};
+io_uring_register_files(&ring, fds, 3);
+
+/* 登録済み fd を使う場合は IOSQE_FIXED_FILE フラグを設定 */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read(sqe, 0, buf, len, offset);  /* 0 = fds[0] */
+sqe->flags |= IOSQE_FIXED_FILE;
+
+/*
+ * バッファの登録: カーネル側でユーザ空間のバッファを
+ * 事前に pin して、I/O 時の get_user_pages() を省略する。
+ */
+struct iovec iovecs[] = {
+    { .iov_base = buf1, .iov_len = 4096 },
+    { .iov_base = buf2, .iov_len = 8192 },
+};
+io_uring_register_buffers(&ring, iovecs, 2);
+
+/* 登録済みバッファを使う */
+sqe = io_uring_get_sqe(&ring);
+io_uring_prep_read_fixed(sqe, fd, buf1, 4096, offset, 0); /* buf_idx=0 */
+```
+
+### uring_cmd: カーネルドライバを io_uring バックエンドにする
+
+`uring_cmd` は、カーネルドライバが独自の io_uring オペコードを定義し、io_uring 経由で非同期処理を提供するためのインターフェースである。
+
+```c
+/* ドライバ側の実装 */
+#include <linux/io_uring/cmd.h>
+
+/* ドライバ固有のコマンド定義 */
+enum my_uring_cmd {
+    MY_CMD_READ_SENSOR  = 0,
+    MY_CMD_CONFIG       = 1,
+};
+
+/* uring_cmd ハンドラ */
+static int my_uring_cmd(struct io_uring_cmd *ioucmd,
+                        unsigned int issue_flags)
+{
+    struct my_device *dev = ioucmd->file->private_data;
+    u16 cmd_op = io_uring_cmd_opcode(ioucmd);
+    /* ioucmd->sqe->cmd に渡されたペイロードを取得 */
+
+    switch (cmd_op) {
+    case MY_CMD_READ_SENSOR: {
+        /* 非同期処理を開始 */
+        dev->pending_cmd = ioucmd;
+        start_async_sensor_read(dev);
+        return -EIOCBQUEUED;  /* 非同期完了を示す */
+    }
+    default:
+        return -EINVAL;
+    }
+}
+
+/* 非同期処理完了時のコールバック */
+static void sensor_read_complete(struct my_device *dev, int result)
+{
+    struct io_uring_cmd *ioucmd = dev->pending_cmd;
+    /* 結果を CQE に書き込む */
+    io_uring_cmd_done(ioucmd, result, 0, 0);
+}
+
+/* file_operations に uring_cmd を登録 */
+static const struct file_operations my_fops = {
+    .owner      = THIS_MODULE,
+    .open       = my_open,
+    .release    = my_release,
+    .uring_cmd  = my_uring_cmd,  /* io_uring 対応 */
+};
+```
+
+```c
+/* ユーザ空間からの使用 */
+struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+
+sqe->opcode  = IORING_OP_URING_CMD;
+sqe->fd      = device_fd;
+sqe->cmd_op  = MY_CMD_READ_SENSOR;  /* ドライバ固有のコマンド */
+
+/* ドライバ固有のペイロード (最大 80 bytes in cmd[]) */
+struct my_sensor_req {
+    uint32_t channel;
+    uint32_t flags;
+} *req = (void *)sqe->cmd;
+req->channel = 0;
+req->flags   = 0;
+
+io_uring_submit(&ring);
+```
+
+### セキュリティ上の考慮事項
+
+> **io_uring のセキュリティリスク**
+>
+> `io_uring` は強力だが、カーネルのアタックサーフェスを大幅に増大させる:
+>
+> 1. **広大なコードパス**: 数万行のカーネルコードが追加されており、バグの温床になりやすい
+> 2. **seccomp バイパス**: `io_uring` はシステムコールを内部的に発行するため、seccomp フィルタを迂回する可能性がある。Google は一時期 Android で `io_uring` を無効にした
+> 3. **権限昇格**: `uring_cmd` を通じたドライバ固有コマンドに入力検証の不備があると、任意カーネルメモリアクセスにつながる
+> 4. **リソース制限**: 大量の SQE/CQE がカーネルメモリを消費する。`RLIMIT_MEMLOCK` で制限される
+>
+> 対策:
+> - `io_uring_setup` は `IORING_SETUP_R_DISABLED` フラグで初期段階では無効化できる
+> - コンテナ環境では `io_uring` を seccomp で禁止することが一般的
+> - `uring_cmd` を実装するドライバは、入力の厳密なバリデーションが必須
+
+---
+
+## 9. カーネルモジュールと IPC の関係
+
+### 全ての IPC の共通基盤: wait_queue_head_t
+
+ここまで見てきた全ての IPC メカニズムは、最終的に `wait_queue_head_t` に帰着する。
+
+```c
+/*
+ * カーネル内の IPC 実装は、すべて以下のパターンに従う:
+ *
+ * 1. データ/イベントの格納場所 (バッファ, カウンタ, キュー)
+ * 2. wait_queue_head_t (ブロッキングのため)
+ * 3. spinlock / mutex (排他制御のため)
+ *
+ * pipe:      pipe_buffer[]  + rd_wait/wr_wait
+ * eventfd:   __u64 count    + wqh
+ * signalfd:  sigpending     + (task の wait)
+ * timerfd:   hrtimer + ticks + wqh
+ * futex:     futex_word     + hash bucket の chain
+ * io_uring:  SQ/CQ rings   + sq_wait/cq_wait
+ */
+```
+
+### モジュールが IPC を公開するパターン
+
+カーネルモジュールがユーザ空間に IPC インターフェースを提供する方法は、`file_operations` の実装に帰着する。
+
+```c
+/*
+ * パターン 1: poll/read/write ベースのイベント通知デバイス
+ *
+ * ユーザ空間のプログラムが epoll_wait でイベントを待ち、
+ * read() でイベントデータを取得する。
+ */
+static const struct file_operations my_event_fops = {
+    .owner   = THIS_MODULE,
+    .open    = my_open,
+    .release = my_release,
+    .read    = my_read,       /* イベントデータの読み出し */
+    .write   = my_write,      /* 設定の書き込み */
+    .poll    = my_poll,       /* epoll/poll/select サポート */
+    .unlocked_ioctl = my_ioctl, /* 制御コマンド */
+};
+
+static __poll_t my_poll(struct file *file,
+                        struct poll_table_struct *wait)
+{
+    struct my_device *dev = file->private_data;
+    __poll_t mask = 0;
+
+    poll_wait(file, &dev->event_wq, wait);
+
+    spin_lock(&dev->lock);
+    if (dev->events_pending > 0)
+        mask |= EPOLLIN | EPOLLRDNORM;  /* 読み出し可能 */
+    if (dev->write_space > 0)
+        mask |= EPOLLOUT | EPOLLWRNORM; /* 書き込み可能 */
+    spin_unlock(&dev->lock);
+
+    return mask;
+}
+```
+
+```c
+/*
+ * パターン 2: eventfd によるカーネル→ユーザ空間通知
+ *
+ * ioctl で eventfd の fd を登録し、
+ * カーネル側のイベント発生時に eventfd_signal() で通知する。
+ * KVM, VFIO, UIO がこのパターンを使用。
+ */
+struct my_device {
+    /* ... */
+    struct eventfd_ctx *notify_ctx;  /* ユーザに通知するための eventfd */
+};
+
+static long my_ioctl(struct file *file, unsigned int cmd,
+                     unsigned long arg)
+{
+    struct my_device *dev = file->private_data;
+
+    switch (cmd) {
+    case MY_IOC_SET_EVENTFD: {
+        int fd = (int)arg;
+        if (dev->notify_ctx)
+            eventfd_ctx_put(dev->notify_ctx);
+        dev->notify_ctx = eventfd_ctx_fdget(fd);
+        if (IS_ERR(dev->notify_ctx)) {
+            dev->notify_ctx = NULL;
+            return PTR_ERR(dev->notify_ctx);
+        }
+        return 0;
+    }
+    }
+    return -ENOTTY;
+}
+
+/* 割り込みハンドラや workqueue からの通知 */
+static void my_event_handler(struct my_device *dev)
+{
+    if (dev->notify_ctx)
+        eventfd_signal(dev->notify_ctx);
+}
+
+static int my_release(struct inode *inode, struct file *file)
+{
+    struct my_device *dev = file->private_data;
+    if (dev->notify_ctx) {
+        eventfd_ctx_put(dev->notify_ctx);
+        dev->notify_ctx = NULL;
+    }
+    return 0;
+}
+```
+
+```c
+/*
+ * パターン 3: uring_cmd による高性能ドライバインターフェース
+ *
+ * io_uring 経由で非同期 I/O をサポートする。
+ * NVMe ドライバ (drivers/nvme/) がこのパターンの代表例。
+ *
+ * 利点:
+ * - システムコールオーバーヘッドの削減
+ * - バッチ処理による効率化
+ * - カーネル→ユーザへのゼロコピー完了通知
+ */
+static const struct file_operations my_high_perf_fops = {
+    .owner      = THIS_MODULE,
+    .open       = my_open,
+    .release    = my_release,
+    .read       = my_read,
+    .write      = my_write,
+    .poll       = my_poll,
+    .uring_cmd  = my_uring_cmd,  /* io_uring バックエンド */
+};
+```
+
+### IPC 選択のガイドライン (ドライバ開発者向け)
+
+| 要件 | 推奨 IPC | 理由 |
+|---|---|---|
+| 単純なイベント通知 (1 方向) | eventfd | 最小のオーバーヘッド、epoll 互換 |
+| データストリーム | read/write + poll | 標準的、全てのツールと互換 |
+| 高頻度 I/O | uring_cmd | システムコール削減、バッチ処理 |
+| 制御コマンド | ioctl | 型安全、多様なコマンド定義可能 |
+| デバッグ情報 | debugfs | 安定 ABI の制約なし |
+| 複数属性の公開 | sysfs | 1 ファイル = 1 属性、安定 ABI |
+
+---
+
+## まとめ
+
+この章では Linux カーネルの IPC メカニズムを内部構造から理解した。
+
+1. **シグナル** は最古の IPC であり、`sigpending` キューと `TIF_SIGPENDING` フラグによる非同期配送が行われる。ドライバでは `-ERESTARTSYS` の正しい返却が重要。
+
+2. **パイプ** は `pipe_buffer` リングバッファで実装され、`splice` によるゼロコピー転送が可能。
+
+3. **Unix ドメインソケット** は `SCM_RIGHTS` によるファイルディスクリプタ受け渡しが最大の特徴。
+
+4. **System V IPC** はレガシーだが、`msg_msg` のカーネルエクスプロイトでの悪用パターンは理解すべき。
+
+5. **eventfd** はカウンタベースのシンプルな通知手段で、KVM/VFIO でカーネル内部からも使われる。
+
+6. **signalfd/timerfd** はシグナルとタイマーをファイルディスクリプタ化し、epoll ベースのイベントループに統合できる。
+
+7. **Futex** は「ユーザ空間で解決できるなら解決する」哲学で、競合がない場合にシステムコールを完全に回避する。
+
+8. **io_uring** は共有メモリ上の SQ/CQ リングバッファにより、ゼロシステムコール I/O を実現する。`uring_cmd` でドライバ固有の高性能インターフェースも構築できる。
+
+9. **全ての IPC は `wait_queue_head_t` に帰着する**。カーネルモジュールは `file_operations` の実装を通じて、これらの IPC メカニズムをユーザ空間に公開する。
+
+### 次のステップ
+
+- [Ch 8b](/part4-device-drivers/12-blocking-io/) で wait queue の実践を復習する
+- [Ch 18](/part5-hardware/18-irq-timer-wq/) で割り込み/タイマーとの関係を確認する
+- 実際のカーネルソースを読む: `fs/pipe.c`, `fs/eventfd.c`, `kernel/futex/`, `io_uring/`

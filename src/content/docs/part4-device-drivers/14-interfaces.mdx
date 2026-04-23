@@ -1,0 +1,182 @@
+---
+title: "Ch 10. /proc, /sys, debugfs"
+description: procfs, sysfs, debugfs, configfs の使い分けとカーネルとユーザ空間の対話手法
+---
+
+## この章で学ぶこと
+
+- procfs, sysfs, debugfs, configfs の役割分担を説明できる
+- sysfs attribute でデバイス情報を公開する方法を理解する
+- debugfs でデバッグ用インターフェースを作れる
+- Rust 側の `kernel::debugfs` / `kernel::configfs` の概要を把握する
+
+:::note[Rust API ステータス]
+🟡 **開発中**: `kernel::debugfs` (6.17+ — Scope 型による自動クリーンアップ)
+🟡 **開発中**: `kernel::configfs`
+❌ **未実装**: procfs, sysfs attribute の Rust API
+:::
+
+## 前提
+
+- [Ch 11](/part4-device-drivers/11-chardev-c/)-[13](/part4-device-drivers/13-chardev-rust/) (文字デバイス) を完了している
+
+## 4 つのインターフェースの使い分け
+
+| ファイルシステム | マウント先 | ABI 安定性 | 主な用途 |
+|---|---|---|---|
+| **procfs** | `/proc` | 部分的に安定 | プロセス情報、カーネル統計 (レガシー) |
+| **sysfs** | `/sys` | **安定 ABI** | デバイスモデルの公開。1 ファイル = 1 属性 |
+| **debugfs** | `/sys/kernel/debug` | **安定性なし** | 開発者向けデバッグ情報 |
+| **configfs** | `/sys/kernel/config` | 安定 | ユーザが mkdir でオブジェクトを動的生成 |
+
+### 原則
+
+- 新しいドライバで procfs に新しいエントリを作るのは避ける (レガシー)
+- ユーザ空間ツールが依存する情報は sysfs に公開する (安定 ABI)
+- 開発中のデバッグ情報は debugfs に置く (いつでも変更・削除可能)
+- ユーザがランタイムにオブジェクトを生成する必要があれば configfs
+
+## procfs
+
+`/proc` は Linux 最古のカーネル情報インターフェースである。
+
+```bash
+cat /proc/cpuinfo      # CPU 情報
+cat /proc/meminfo      # メモリ情報
+cat /proc/modules      # ロード済みモジュール (lsmod の元データ)
+cat /proc/kallsyms     # カーネルシンボルテーブル
+ls /proc/1/            # PID 1 のプロセス情報
+```
+
+新規ドライバでは procfs よりも sysfs を推奨するが、
+既存のインターフェース (`/proc/meminfo` 等) は広く使われ続けている。
+
+## sysfs
+
+sysfs はカーネルのオブジェクトモデルをファイルシステムとして公開する。
+1 ファイルが 1 つの属性値を表す。
+
+```bash
+# デバイスの属性を読む
+cat /sys/class/net/eth0/mtu
+# 1500
+
+# 属性を書き換える
+echo 9000 > /sys/class/net/eth0/mtu
+```
+
+### デバイス属性の定義 (C)
+
+```c
+static ssize_t count_show(struct device *dev,
+                          struct device_attribute *attr, char *buf)
+{
+    struct my_device *mydev = dev_get_drvdata(dev);
+    return sysfs_emit(buf, "%d\n", mydev->count);
+}
+
+static ssize_t count_store(struct device *dev,
+                           struct device_attribute *attr,
+                           const char *buf, size_t count)
+{
+    struct my_device *mydev = dev_get_drvdata(dev);
+    int val;
+    if (kstrtoint(buf, 10, &val))
+        return -EINVAL;
+    mydev->count = val;
+    return count;
+}
+
+static DEVICE_ATTR_RW(count);
+/* /sys/devices/.../count として公開される */
+```
+
+`DEVICE_ATTR_RW` は読み書き可能な属性を定義するマクロ。
+`DEVICE_ATTR_RO` (読み取り専用) と `DEVICE_ATTR_WO` (書き込み専用) もある。
+
+## debugfs
+
+debugfs はカーネル開発者のためのデバッグインターフェースである。
+**ABI 安定性は一切保証されない**。ユーザ空間ツールが debugfs に依存してはならない。
+
+```c
+#include <linux/debugfs.h>
+
+static struct dentry *dbg_dir;
+static u32 debug_val;
+
+static int __init my_init(void)
+{
+    dbg_dir = debugfs_create_dir("my_driver", NULL);
+    debugfs_create_u32("value", 0644, dbg_dir, &debug_val);
+    return 0;
+}
+
+static void __exit my_exit(void)
+{
+    debugfs_remove_recursive(dbg_dir);
+}
+```
+
+```bash
+# 使い方
+mount -t debugfs debugfs /sys/kernel/debug  # 通常は自動マウント
+cat /sys/kernel/debug/my_driver/value
+echo 42 > /sys/kernel/debug/my_driver/value
+```
+
+### Rust 側の debugfs (6.17+)
+
+```rust
+use kernel::debugfs;
+
+let dir = debugfs::Dir::new(fmt!("my_driver"))?;
+let _file = dir.create_u32(fmt!("value"), 0o644, &my_value)?;
+// dir が drop されると自動的に remove_recursive
+```
+
+Rust 版は `Scope` 型による自動クリーンアップが特徴。
+C 版で必要な `debugfs_remove_recursive` が RAII で不要になる。
+
+## configfs
+
+configfs はユーザが `mkdir` でカーネルオブジェクトを動的に生成する仕組み。
+
+```bash
+# configfs をマウント
+mount -t configfs configfs /sys/kernel/config
+
+# ユーザがディレクトリを作ると、カーネル側でオブジェクトが生成される
+mkdir /sys/kernel/config/my_subsystem/instance1
+
+# 属性を設定
+echo 100 > /sys/kernel/config/my_subsystem/instance1/size
+
+# 削除
+rmdir /sys/kernel/config/my_subsystem/instance1
+```
+
+rnull (null block driver) は configfs を使って動的に null ブロックデバイスを生成する。
+
+## よくある罠
+
+1. **sysfs で複数の値を 1 ファイルに詰め込む** — 「1 ファイル = 1 値」が sysfs の原則。複数の値はファイルを分ける。
+2. **debugfs を安定 API として使う** — ユーザ空間ツールが debugfs に依存すると、カーネルアップデートで壊れる。
+3. **`debugfs_remove` を忘れる** — C 版ではモジュールアンロード時に手動で削除が必要。Rust 版は Drop で自動。
+4. **procfs に新しいエントリを追加する** — レガシー。新規ドライバでは sysfs を使う。
+
+## 章末演習
+
+1. [Ch 11](/part4-device-drivers/11-chardev-c/)/[13](/part4-device-drivers/13-chardev-rust/) のデバイスに debugfs エントリを追加し、内部バッファの使用状況をダンプできるようにせよ。
+
+2. `/sys/class/net/` 以下を探索し、自分のネットワークインターフェースが持つ sysfs 属性を 10 個列挙せよ。
+
+3. `cat /sys/kernel/debug/` の中身を確認し、どのサブシステムが debugfs を使っているか調べよ。
+
+## 参考資料
+
+- [debugfs (kernel.org)](https://docs.kernel.org/filesystems/debugfs.html)
+- [sysfs (kernel.org)](https://docs.kernel.org/filesystems/sysfs.html)
+- [configfs (kernel.org)](https://docs.kernel.org/filesystems/configfs.html)
+- [kernel::debugfs (rustdoc)](https://rust.docs.kernel.org/kernel/debugfs/)
+- [kernel::configfs (rustdoc)](https://rust.docs.kernel.org/kernel/configfs/)

@@ -1,0 +1,243 @@
+---
+title: "Ch 5. カーネルのメモリ管理"
+description: kmalloc, vmalloc, GFP フラグ, SLUB アロケータ, Rust の KBox/KVec を理解する
+---
+
+## この章で学ぶこと
+
+- カーネル空間とユーザ空間のアドレスレイアウトを把握する
+- `kmalloc` / `vmalloc` / `kvmalloc` の違いと選択基準を説明できる
+- GFP フラグ (`GFP_KERNEL`, `GFP_ATOMIC`, `GFP_NOWAIT`) の意味を理解する
+- Rust 側の `KBox`, `KVec` と fallible allocation を使える
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::alloc::KBox<T>`, `kernel::alloc::KVec<T>`, GFP フラグ (`GFP_KERNEL`, `GFP_ATOMIC`)
+❌ **未実装**: vmalloc の直接ラッパー (KVec で代替可能)
+:::
+
+## 前提
+
+- [Ch 4](/part2-first-module/04-hello-c/)–[Ch 5](/part2-first-module/05-hello-rust/) (C/Rust モジュール) を完了している
+
+## カーネル空間 vs ユーザ空間
+
+x86_64 で 4 レベルページテーブル (48 ビットアドレス) を使う場合、
+仮想アドレス空間は次のように分割される:
+
+```
+ユーザ空間:   0x0000_0000_0000_0000 — 0x0000_7FFF_FFFF_FFFF  (128 TB)
+              [非正規アドレス領域 — アクセス不可]
+カーネル空間: 0xFFFF_8000_0000_0000 — 0xFFFF_FFFF_FFFF_FFFF  (128 TB)
+```
+
+カーネル空間の中はさらに細かく分かれている:
+
+| 領域 | アドレス範囲 | 用途 |
+|---|---|---|
+| Direct mapping | `0xFFFF_8880_0000_0000` — | 全物理メモリの線形マッピング (64 TB) |
+| vmalloc 領域 | `0xFFFF_C900_0000_0000` — | `vmalloc` / `ioremap` 用 (32 TB) |
+| Module 領域 | `0xFFFF_FFFF_A000_0000` — | カーネルモジュールのコード (1520 MB) |
+| Kernel text | `0xFFFF_FFFF_8000_0000` — | カーネル本体のコード (512 MB) |
+
+`kmalloc` は direct mapping 領域からメモリを返す。物理的にも連続している。
+`vmalloc` は vmalloc 領域にページテーブルエントリを作って仮想的に連続させるだけで、
+物理ページはバラバラかもしれない。
+
+## kmalloc と vmalloc
+
+### kmalloc: 物理連続なメモリ
+
+```c
+#include <linux/slab.h>
+
+void *buf = kmalloc(256, GFP_KERNEL);
+if (!buf)
+    return -ENOMEM;
+
+/* ... buf を使う ... */
+
+kfree(buf);
+```
+
+- 物理メモリが **連続** している
+- DMA バッファに使える
+- 最大サイズは約 **4 MB** (x86_64, `MAX_ORDER=11`, ページサイズ 4KB)
+- 内部では **SLUB アロケータ** がキャッシュ管理する
+
+### vmalloc: 仮想連続なメモリ
+
+```c
+#include <linux/vmalloc.h>
+
+void *big = vmalloc(1024 * 1024);  /* 1 MB */
+if (!big)
+    return -ENOMEM;
+
+/* ... big を使う ... */
+
+vfree(big);
+```
+
+- 仮想的には連続だが、物理ページは **バラバラ**
+- DMA には使えない
+- ページテーブル操作が必要なため `kmalloc` より **遅い**
+- サイズ制限は vmalloc 領域全体まで理論上可能
+
+### kvmalloc: ハイブリッド
+
+```c
+void *buf = kvmalloc(size, GFP_KERNEL);
+/* ... */
+kvfree(buf);  /* kmalloc/vmalloc どちらでも正しく解放 */
+```
+
+まず `kmalloc` を試み、失敗したら `vmalloc` にフォールバックする。
+
+### 選択基準
+
+| 条件 | 使うもの |
+|---|---|
+| 小さい (< 数 KB) | `kmalloc` |
+| DMA バッファ | `kmalloc` (物理連続が必須) |
+| 大きい & 物理連続不要 | `vmalloc` |
+| サイズが不確定 | `kvmalloc` |
+
+## GFP フラグ
+
+GFP は **Get Free Pages** の略。メモリ割り当て時に
+「どこまで頑張ってメモリを確保してよいか」をカーネルに伝える。
+
+### 必須フラグ
+
+| フラグ | sleep 可? | 用途 |
+|---|---|---|
+| `GFP_KERNEL` | **Yes** | 通常のプロセスコンテキスト。メモリ回収や I/O を待てる |
+| `GFP_ATOMIC` | **No** | 割込コンテキスト、spinlock 保持中。緊急リザーブを使用 |
+| `GFP_NOWAIT` | **No** | `GFP_ATOMIC` と同様だが緊急リザーブは使わない |
+
+### 決定木
+
+```
+sleep できるか?
+  ├─ Yes → GFP_KERNEL
+  └─ No → 絶対に確保する必要があるか?
+       ├─ Yes → GFP_ATOMIC (緊急リザーブ使用)
+       └─ No  → GFP_NOWAIT (失敗 OK)
+```
+
+### 修飾子フラグ
+
+| フラグ | 効果 |
+|---|---|
+| `__GFP_ZERO` | メモリをゼロクリア。`kzalloc()` = `kmalloc()` + `__GFP_ZERO` |
+| `__GFP_HIGH` | 高優先度の確保要求 |
+| `__GFP_NOWARN` | 確保失敗時に警告を出さない |
+
+> **よくある罠:** spinlock を保持したまま `GFP_KERNEL` で `kmalloc` すると、
+> メモリ回収でスリープが発生し、デッドロックする。
+
+## SLUB アロケータ
+
+カーネルのメモリ割り当ては 3 層構造:
+
+1. **Buddy アロケータ** — 物理ページ (4 KB 単位) を管理。`2^order` ページずつ割り当てる
+2. **SLUB アロケータ** — Buddy からもらったページを小さなオブジェクトに分割
+3. **kmalloc / kzalloc** — ユーザが使う API。内部で SLUB を呼ぶ
+
+SLUB はサイズごとにキャッシュを持つ (`kmalloc-64`, `kmalloc-128`, `kmalloc-256` ...)。
+空きオブジェクトはフリーリストで管理される。
+
+```bash
+# SLUB キャッシュの使用状況
+cat /proc/slabinfo | grep kmalloc
+```
+
+## カーネルのスタックサイズ
+
+カーネルスレッドのスタックは **x86_64 で 16 KB** (4 ページ) しかない。
+ユーザランド (通常 8 MB) の **500 分の 1** である。
+
+```c
+/* 危険! スタックの 1/4 を消費 */
+void my_function(void) {
+    char buf[4096];
+}
+
+/* 安全: ヒープに確保 */
+void my_function(void) {
+    char *buf = kmalloc(4096, GFP_KERNEL);
+    if (!buf) return;
+    /* ... */
+    kfree(buf);
+}
+```
+
+数百バイトを超えるデータは `kmalloc` でヒープに確保すること。
+
+## Rust 側のメモリ管理
+
+### KBox: kmalloc のラッパー
+
+```rust
+use kernel::prelude::*;
+use kernel::alloc::KBox;
+
+let boxed: KBox<u32> = KBox::new(42u32, GFP_KERNEL)?;
+// Drop 時に自動で kfree
+```
+
+| C | Rust |
+|---|---|
+| `int *p = kmalloc(sizeof(*p), GFP_KERNEL);` | `let p = KBox::new(0i32, GFP_KERNEL)?;` |
+| `if (!p) return -ENOMEM;` | (`?` で自動) |
+| `kfree(p);` | (Drop で自動解放) |
+
+### KVec: 可変長配列
+
+```rust
+use kernel::alloc::KVec;
+
+let mut v = KVec::new();
+v.push(1, GFP_KERNEL)?;
+v.push(2, GFP_KERNEL)?;
+v.push(3, GFP_KERNEL)?;
+```
+
+### Fallible Allocation
+
+Rust カーネルのメモリ割り当ては全て fallible (失敗しうる) である。
+NULL チェック忘れは**コンパイルエラー**になる:
+
+```rust
+// コンパイルエラー: Result を無視できない
+let p = KBox::new(42, GFP_KERNEL);
+
+// 正しい: ? で伝播
+let p = KBox::new(42, GFP_KERNEL)?;
+```
+
+## よくある罠
+
+1. **`GFP_KERNEL` を割込コンテキストで使う** — デッドロック
+2. **大きな構造体を `KBox::new` に渡す** — スタック上で組んでからコピーする。`KBox::new_uninit` を使う
+3. **`std::collections::HashMap` を使おうとする** — `no_std` で使えない。`kernel::rbtree::RBTree` を使う
+4. **vmalloc で確保したメモリを kfree する** — `vfree` で解放する。`kvfree` なら両方対応
+
+## 章末演習
+
+1. C で `kmalloc(256, GFP_KERNEL)` と `vmalloc(256)` のアドレスを `pr_info` で出力し、範囲の違いを確認せよ。
+
+2. Rust で `KVec<u8>` を確保し、データを書き込んでから内容を出力するモジュールを書け。
+
+3. `cat /proc/slabinfo | grep kmalloc` で各キャッシュの使用状況を記録せよ。
+
+---
+
+次の章 → [Ch 9. 並行性と同期プリミティブ](/part3-kernel-concepts/09-concurrency/)
+
+## 参考資料
+
+- [Memory Allocation Guide (kernel.org)](https://docs.kernel.org/core-api/memory-allocation.html)
+- [kernel::alloc (rustdoc)](https://rust.docs.kernel.org/kernel/alloc/)
+- [x86_64 Memory Map (kernel.org)](https://www.kernel.org/doc/Documentation/x86/x86_64/mm.txt)
+- [LWN: How to write Rust in the kernel: part 1](https://lwn.net/Articles/1024202/)

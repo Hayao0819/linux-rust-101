@@ -1,0 +1,1963 @@
+---
+title: "VFS とファイルシステムの基礎"
+description: "superblock, inode, dentry, file, address_space — Linux VFS の5大構造体とファイルシステム実装の基本"
+---
+
+## この章で学ぶこと
+
+- VFS (Virtual Filesystem Switch) がユーザ空間のシステムコールと具体的な FS 実装を分離する仕組みを理解する
+- 5 大構造体 (`super_block`, `inode`, `dentry`, `file`, `address_space`) の役割・主要フィールド・操作テーブルを把握する
+- パス名解決 (namei) の RCU-walk / ref-walk 二段階戦略を説明できる
+- ページキャッシュの readahead・dirty page・writeback サイクルを追跡できる
+- `struct folio` が `struct page` を置き換える背景と利点を理解する
+- ファイルロック (`flock`, POSIX, OFD, lease) の違いを整理する
+- 拡張属性 (xattr) と POSIX ACL の関係を説明できる
+- fsnotify フレームワーク (inotify / fanotify) の仕組みを把握する
+- ramfs のソースコードを読み、最小限のファイルシステム登録を実装できる
+- tmpfs (shmem), FUSE, overlayfs の設計思想と用途を理解する
+- Block I/O 層の `struct bio` とスケジューラの概要を把握する
+- Rust カーネルにおける VFS 抽象化の現状と課題を知る
+---
+
+## VFS アーキテクチャ: 抽象化層としての役割
+
+Linux は ext4, XFS, Btrfs, NFS, tmpfs, FUSE など数十種類のファイルシステムをサポートしているが、
+ユーザ空間のプログラムは `open()`, `read()`, `write()`, `stat()` といった **同じシステムコール** で
+すべてのファイルシステムにアクセスできる。
+
+この透過性を実現しているのが **VFS (Virtual Filesystem Switch)** である。
+
+```
+┌────────────────────────────────────────────────────────┐
+│                  ユーザ空間                              │
+│     open("/mnt/data/report.txt", O_RDONLY)              │
+└──────────────────────┬─────────────────────────────────┘
+                       │ syscall
+┌──────────────────────▼─────────────────────────────────┐
+│                    VFS 層                               │
+│                                                         │
+│  ┌──────────┐  ┌──────────┐  ┌──────────┐              │
+│  │super_block│  │  inode   │  │  dentry  │              │
+│  │          │  │          │  │ (dcache) │              │
+│  └──────────┘  └──────────┘  └──────────┘              │
+│  ┌──────────┐  ┌───────────────┐                        │
+│  │   file   │  │ address_space │                        │
+│  │          │  │ (page cache)  │                        │
+│  └──────────┘  └───────────────┘                        │
+│                                                         │
+│     file_operations    inode_operations                  │
+│     super_operations   address_space_operations          │
+│     dentry_operations                                   │
+└──┬──────────┬──────────┬──────────┬────────────────────┘
+   │          │          │          │
+┌──▼───┐ ┌───▼──┐ ┌────▼──┐ ┌────▼───┐
+│ ext4 │ │ XFS  │ │ Btrfs │ │ tmpfs  │  ...
+└──────┘ └──────┘ └───────┘ └────────┘
+```
+
+VFS の設計はオブジェクト指向パターンに基づいている。
+各構造体には **操作テーブル (operations table)** と呼ばれる関数ポインタのテーブルが紐づいており、
+具体的なファイルシステムがこの関数ポインタを自分の実装で埋めることで多態性 (polymorphism) を実現している。
+C 言語における **vtable パターン** そのものである。
+
+```c
+/* VFS の多態性パターン */
+struct inode_operations {
+    int (*create)(struct mnt_idmap *, struct inode *,
+                  struct dentry *, umode_t, bool);
+    struct dentry * (*lookup)(struct inode *, struct dentry *,
+                              unsigned int);
+    int (*mkdir)(struct mnt_idmap *, struct inode *,
+                 struct dentry *, umode_t);
+    /* ... 数十の関数ポインタ ... */
+};
+
+/* ext4 はこれを具体的に埋める */
+const struct inode_operations ext4_dir_inode_operations = {
+    .create     = ext4_create,
+    .lookup     = ext4_lookup,
+    .mkdir      = ext4_mkdir,
+    /* ... */
+};
+```
+
+### システムコールの流れ
+
+`read(fd, buf, count)` を例に、システムコールが VFS を経由して
+具体的なファイルシステム実装に到達するまでの流れを示す。
+
+```
+ユーザ空間: read(fd, buf, 4096)
+    │
+    ▼ syscall 命令
+カーネル: ksys_read(fd, buf, count)
+    │
+    ▼ fd → struct file を取得 (fdtable 経由)
+vfs_read(file, buf, count, &pos)
+    │
+    ▼ file->f_op->read_iter を呼び出し
+ext4_file_read_iter(kiocb, iov_iter)
+    │
+    ▼ generic_file_read_iter → page cache を検索
+filemap_read(kiocb, iov_iter, already_read)
+    │
+    ├─ ページキャッシュにヒット → そのまま返す
+    │
+    └─ ミス → address_space_operations->readahead()
+              → ext4_readahead()
+              → submit_bio() → ブロック層 → ディスク
+```
+
+---
+
+## 5 大構造体の詳解
+
+### 1. struct super_block — ファイルシステムインスタンス
+
+`super_block` はマウントされた **ファイルシステム 1 つ** に対応する。
+ext4 パーティションを 2 回マウントすれば `super_block` は 2 つ生成される。
+
+```c title="include/linux/fs.h (抜粋・簡略化)"
+struct super_block {
+    struct list_head    s_list;       /* 全 super_block のグローバルリスト */
+    dev_t               s_dev;        /* デバイス識別子 */
+    unsigned char       s_blocksize_bits; /* ブロックサイズ (2^n) */
+    unsigned long       s_blocksize;  /* ブロックサイズ (バイト) */
+    loff_t              s_maxbytes;   /* ファイル最大サイズ */
+    struct file_system_type *s_type;  /* FS タイプ (ext4, xfs, ...) */
+    const struct super_operations *s_op;  /* 操作テーブル */
+    unsigned long       s_flags;      /* マウントフラグ (MS_RDONLY 等) */
+    unsigned long       s_magic;      /* マジックナンバー */
+    struct dentry       *s_root;      /* ルートディレクトリの dentry */
+    struct rw_semaphore s_umount;     /* umount 用セマフォ */
+    int                 s_count;      /* 参照カウント */
+    atomic_t            s_active;     /* アクティブ参照 */
+    struct list_head    s_inodes;     /* この FS の全 inode リスト */
+    struct list_head    s_mounts;     /* この FS のマウントリスト */
+    void                *s_fs_info;   /* FS 固有のプライベートデータ */
+    /* ... */
+};
+```
+
+**主要フィールドの役割:**
+
+| フィールド | 説明 |
+|---|---|
+| `s_op` | `super_operations` テーブルへのポインタ。inode 割り当て・解放・sync 等を定義 |
+| `s_root` | ファイルシステムのルートディレクトリを指す `dentry` |
+| `s_fs_info` | ファイルシステム固有のデータ。ext4 なら `ext4_sb_info` へのポインタ |
+| `s_blocksize` | ディスクブロックサイズ (通常 4096) |
+| `s_flags` | `SB_RDONLY`, `SB_NOSUID`, `SB_NOEXEC` 等のフラグ |
+
+```c title="super_operations の主要メンバ"
+struct super_operations {
+    struct inode *(*alloc_inode)(struct super_block *sb);
+    void (*destroy_inode)(struct inode *);
+    void (*free_inode)(struct inode *);  /* RCU 解放用 */
+
+    void (*dirty_inode)(struct inode *, int flags);
+    int (*write_inode)(struct inode *, struct writeback_control *);
+    void (*evict_inode)(struct inode *);
+
+    void (*put_super)(struct super_block *);
+    int (*sync_fs)(struct super_block *, int wait);
+    int (*statfs)(struct dentry *, struct kstatfs *);
+
+    int (*show_options)(struct seq_file *, struct dentry *);
+    /* ... */
+};
+```
+
+`alloc_inode` は VFS が新しい `inode` を必要としたときに呼ばれる。
+ファイルシステムは通常、VFS の `inode` を自分の拡張構造体に埋め込んでおり、
+`alloc_inode` でその拡張構造体ごと確保する。
+
+```c
+/* ext4 の拡張 inode 構造体 */
+struct ext4_inode_info {
+    __le32  i_data[15];           /* ブロックポインタ */
+    __u32   i_flags;              /* ext4 固有フラグ */
+    /* ... 多くの ext4 固有フィールド ... */
+    struct inode vfs_inode;       /* ← VFS inode を埋め込む */
+};
+
+/* container_of で VFS inode からext4_inode_info を取得 */
+static inline struct ext4_inode_info *EXT4_I(struct inode *inode)
+{
+    return container_of(inode, struct ext4_inode_info, vfs_inode);
+}
+```
+
+### 2. struct inode — ファイルのメタデータ
+
+`inode` はファイルやディレクトリの **メタデータ** を表現する。
+ディスク上の inode (ext4 の `struct ext4_inode`) とメモリ上の VFS `struct inode` は別物であり、
+VFS の `inode` は FS 非依存の統一的な表現を提供する。
+
+```c title="include/linux/fs.h (抜粋・簡略化)"
+struct inode {
+    umode_t             i_mode;       /* ファイルタイプ + パーミッション */
+    unsigned short      i_opflags;    /* 操作フラグ */
+    kuid_t              i_uid;        /* 所有者 UID */
+    kgid_t              i_gid;        /* 所有者 GID */
+    unsigned int        i_flags;      /* FS フラグ (S_IMMUTABLE 等) */
+
+    const struct inode_operations *i_op;   /* inode 操作テーブル */
+    struct super_block  *i_sb;        /* 所属する super_block */
+    struct address_space *i_mapping;  /* ページキャッシュマッピング */
+
+    unsigned long       i_ino;        /* inode 番号 */
+    atomic_t            i_count;      /* 参照カウント */
+    unsigned int        i_nlink;      /* ハードリンク数 */
+    dev_t               i_rdev;       /* デバイスファイルのデバイス番号 */
+    loff_t              i_size;       /* ファイルサイズ (バイト) */
+
+    struct timespec64   __i_atime;    /* 最終アクセス時刻 */
+    struct timespec64   __i_mtime;    /* 最終変更時刻 */
+    struct timespec64   __i_ctime;    /* 最終メタデータ変更時刻 */
+
+    spinlock_t          i_lock;       /* inode ロック */
+    unsigned short      i_bytes;      /* 使用バイト数の端数 */
+    blkcnt_t            i_blocks;     /* 使用ブロック数 */
+
+    union {
+        struct pipe_inode_info  *i_pipe;   /* パイプ */
+        struct cdev             *i_cdev;   /* 文字デバイス */
+        char                    *i_link;   /* シンボリックリンク先 */
+        unsigned                i_dir_seq; /* ディレクトリ用 */
+    };
+
+    const struct file_operations *i_fop;  /* デフォルトの file_operations */
+    struct address_space i_data;           /* 埋め込み address_space */
+    struct list_head     i_devices;        /* デバイスリスト */
+    struct list_head     i_sb_list;        /* super_block の inode リスト */
+    /* ... */
+};
+```
+
+**重要なポイント:**
+
+- `i_mode` にはファイルタイプ (`S_IFREG`, `S_IFDIR`, `S_IFLNK`, ...) とパーミッション (rwx) が格納される
+- `i_op` がディレクトリ操作 (`lookup`, `mkdir`, `create` 等) を定義する
+- `i_fop` がファイルオープン時にコピーされるデフォルトの `file_operations`
+- `i_mapping` がこのファイルのページキャッシュを管理する `address_space` を指す
+- `i_data` は埋め込みの `address_space` であり、通常 `i_mapping = &i_data` となる
+
+```c title="inode_operations の主要メンバ"
+struct inode_operations {
+    struct dentry * (*lookup)(struct inode *, struct dentry *,
+                              unsigned int);
+    int (*create)(struct mnt_idmap *, struct inode *,
+                  struct dentry *, umode_t, bool);
+    int (*link)(struct dentry *, struct inode *,
+                struct dentry *);
+    int (*unlink)(struct inode *, struct dentry *);
+    int (*symlink)(struct inode *, struct dentry *,
+                   const char *);
+    int (*mkdir)(struct mnt_idmap *, struct inode *,
+                 struct dentry *, umode_t);
+    int (*rmdir)(struct inode *, struct dentry *);
+    int (*rename)(struct mnt_idmap *, struct inode *,
+                  struct dentry *, struct inode *,
+                  struct dentry *, unsigned int);
+    int (*permission)(struct mnt_idmap *, struct inode *, int);
+    int (*getattr)(struct mnt_idmap *, const struct path *,
+                   struct kstat *, u32, unsigned int);
+    int (*setattr)(struct mnt_idmap *, struct dentry *,
+                   struct iattr *);
+    /* ... */
+};
+```
+
+### 3. struct dentry — ディレクトリエントリ (dcache)
+
+`dentry` はパス名の **各コンポーネント** に対応する。
+`/home/user/file.txt` というパスを解決するとき、VFS は `/`, `home`, `user`, `file.txt` の
+4 つの dentry を参照 (または生成) する。
+
+```c title="include/linux/dcache.h (抜粋・簡略化)"
+struct dentry {
+    unsigned int        d_flags;      /* dentry フラグ */
+    seqcount_spinlock_t d_seq;        /* シーケンスカウント (RCU-walk 用) */
+    struct hlist_bl_node d_hash;      /* dcache ハッシュテーブルのノード */
+    struct dentry       *d_parent;    /* 親ディレクトリの dentry */
+    struct qstr         d_name;       /* ファイル名 (+ ハッシュ値) */
+
+    struct inode        *d_inode;     /* 関連する inode (NULL = negative) */
+    unsigned char       d_iname[DNAME_INLINE_LEN]; /* 短い名前のインライン格納 */
+
+    struct lockref      d_lockref;    /* 参照カウント + ロック */
+    const struct dentry_operations *d_op; /* 操作テーブル */
+    struct super_block  *d_sb;        /* 所属する super_block */
+    unsigned long       d_time;       /* revalidate 用タイムスタンプ */
+    void                *d_fsdata;    /* FS 固有データ */
+
+    union {
+        struct list_head d_lru;       /* LRU リスト */
+        wait_queue_head_t *d_wait;    /* lookup 待ち */
+    };
+    struct hlist_node   d_sib;        /* 兄弟 dentry リスト */
+    struct hlist_head   d_children;   /* 子 dentry リスト */
+    /* ... */
+};
+```
+
+**dentry の 3 つの状態:**
+
+| 状態 | `d_inode` | `d_lockref.count` | 説明 |
+|---|---|---|---|
+| **正 (positive)** | 非 NULL | > 0 | 有効な inode に紐づいている。使用中 |
+| **未使用** | 非 NULL | 0 | 参照なし。LRU リストで dcache に残る |
+| **負 (negative)** | NULL | ≥ 0 | 存在しないファイルの記録。ルックアップ失敗のキャッシュ |
+
+**負の dentry (negative dentry)** は一見無駄に見えるが、存在しないパスへのアクセスが繰り返される場合に
+ディスク I/O を完全に省略できるため、性能上きわめて重要である。
+例えば `$PATH` を順に探す `execvp()` は多数の `stat()` 失敗を生むが、
+負の dentry があればディスクアクセスなしで `ENOENT` を返せる。
+
+**dcache ハッシュテーブル:**
+
+dcache はシステム全体で 1 つのハッシュテーブルを持つ。
+キーは `(親 dentry のポインタ, ファイル名のハッシュ)` のペアである。
+
+```
+dcache ハッシュテーブル
+┌─────┐
+│  0  │ → dentry("bin") → dentry("boot") → ...
+│  1  │ → dentry("etc") → ...
+│  2  │ → NULL
+│ ... │
+│  N  │ → dentry("home") → dentry("var") → ...
+└─────┘
+```
+
+### 4. struct file — オープンされたファイル
+
+`file` はプロセスが `open()` したファイルの **インスタンス** を表す。
+同じファイル (同じ inode) を複数のプロセスが開くと、`file` はその数だけ生成される。
+
+```c title="include/linux/fs.h (抜粋・簡略化)"
+struct file {
+    struct path         f_path;       /* vfsmount + dentry */
+    struct inode        *f_inode;     /* キャッシュされた inode ポインタ */
+    const struct file_operations *f_op;  /* ファイル操作テーブル */
+
+    atomic_long_t       f_count;      /* 参照カウント */
+    unsigned int        f_flags;      /* O_RDONLY, O_NONBLOCK, ... */
+    fmode_t             f_mode;       /* FMODE_READ, FMODE_WRITE, ... */
+    loff_t              f_pos;        /* 現在のファイルオフセット */
+    struct mutex        f_pos_lock;   /* f_pos のロック */
+
+    struct fown_struct  f_owner;      /* シグナル通知先 */
+    void                *private_data; /* ドライバ固有データ */
+    struct address_space *f_mapping;  /* ページキャッシュマッピング */
+    /* ... */
+};
+```
+
+`file_operations` はカーネル内で最も頻繁に目にする操作テーブルである。
+文字デバイスドライバの章 (Ch 8) でも詳しく扱ったが、VFS 文脈での主要メンバを改めて示す。
+
+```c title="file_operations の主要メンバ (VFS 視点)"
+struct file_operations {
+    struct module *owner;
+    loff_t (*llseek)(struct file *, loff_t, int);
+    ssize_t (*read)(struct file *, char __user *, size_t, loff_t *);
+    ssize_t (*write)(struct file *, const char __user *, size_t, loff_t *);
+    ssize_t (*read_iter)(struct kiocb *, struct iov_iter *);
+    ssize_t (*write_iter)(struct kiocb *, struct iov_iter *);
+
+    int (*iterate_shared)(struct file *, struct dir_context *);
+    __poll_t (*poll)(struct file *, struct poll_table_struct *);
+    long (*unlocked_ioctl)(struct file *, unsigned int, unsigned long);
+    int (*mmap)(struct file *, struct vm_area_struct *);
+
+    int (*open)(struct inode *, struct file *);
+    int (*flush)(struct file *, fl_owner_t);
+    int (*release)(struct inode *, struct file *);
+    int (*fsync)(struct file *, loff_t, loff_t, int);
+
+    int (*flock)(struct file *, int, struct file_lock *);
+    ssize_t (*splice_read)(struct file *, loff_t *,
+                           struct pipe_inode_info *, size_t, unsigned int);
+    ssize_t (*splice_write)(struct pipe_inode_info *, struct file *,
+                            loff_t *, size_t, unsigned int);
+    /* ... */
+};
+```
+
+**`read` vs `read_iter`:** 現在のカーネルでは `read_iter` (scatter/gather I/O 対応) が推奨されている。
+`read` は後方互換性のために残されているが、新しいファイルシステムでは `read_iter` のみを実装すべきである。
+
+### 5. struct address_space — ページキャッシュ
+
+`address_space` はファイル (正確には inode) ごとのページキャッシュを管理する。
+ファイルの内容がメモリ上にキャッシュされるとき、そのページは `address_space` の XArray (`i_pages`) に格納される。
+
+```c title="include/linux/fs.h (抜粋・簡略化)"
+struct address_space {
+    struct inode        *host;        /* 所有者の inode */
+    struct xarray       i_pages;     /* キャッシュされたページの XArray */
+    struct rw_semaphore invalidate_lock;  /* invalidate 用ロック */
+    gfp_t               gfp_mask;    /* ページ割り当てフラグ */
+    atomic_t            i_mmap_writable;  /* 書き込み可能な mmap 数 */
+    struct rb_root_cached i_mmap;    /* mmap されたVMA のツリー */
+    unsigned long       nrpages;     /* キャッシュ中のページ数 */
+    pgoff_t             writeback_index; /* writeback 開始位置 */
+    const struct address_space_operations *a_ops; /* 操作テーブル */
+    unsigned long       flags;       /* AS_* フラグ */
+    spinlock_t          i_private_lock; /* プライベートロック */
+    struct list_head    i_private_list; /* プライベートリスト */
+    errseq_t            wb_err;      /* writeback エラーの追跡 */
+    /* ... */
+};
+```
+
+```c title="address_space_operations の主要メンバ"
+struct address_space_operations {
+    int (*writepage)(struct page *, struct writeback_control *);
+    int (*read_folio)(struct file *, struct folio *);
+    void (*readahead)(struct readahead_control *);
+
+    int (*write_begin)(struct file *, struct address_space *,
+                       loff_t, unsigned, struct page **,
+                       void **);
+    int (*write_end)(struct file *, struct address_space *,
+                     loff_t, unsigned, unsigned,
+                     struct page *, void *);
+
+    sector_t (*bmap)(struct address_space *, sector_t);
+    int (*dirty_folio)(struct address_space *, struct folio *);
+
+    bool (*release_folio)(struct folio *, gfp_t);
+    void (*free_folio)(struct folio *);
+
+    int (*direct_IO)(struct kiocb *, struct iov_iter *);
+    /* ... */
+};
+```
+
+### 5 大構造体の関係図
+
+```
+プロセス
+  │
+  │ fdtable[fd]
+  ▼
+struct file ──── f_op ────→ file_operations (read_iter, write_iter, ...)
+  │
+  ├─ f_inode ──→ struct inode ──── i_op ──→ inode_operations (lookup, create, ...)
+  │                │
+  │                ├─ i_sb ──→ struct super_block ──── s_op ──→ super_operations
+  │                │                │
+  │                │                └─ s_root ──→ struct dentry (ルートディレクトリ)
+  │                │
+  │                └─ i_mapping ──→ struct address_space ── a_ops ──→ address_space_operations
+  │                                    │
+  │                                    └─ i_pages (XArray) ──→ struct folio / page
+  │
+  └─ f_path.dentry ──→ struct dentry ──── d_parent ──→ 親 dentry
+                          │
+                          ├─ d_inode ──→ struct inode (同じ inode を指す)
+                          │
+                          └─ d_children ──→ 子 dentry のリスト
+```
+
+---
+
+## パス名解決 (namei): `/home/user/file.txt` を辿る
+
+ユーザが `open("/home/user/file.txt", O_RDONLY)` を呼ぶとき、
+VFS はこのパス文字列を各コンポーネントに分解し、
+`/` → `home` → `user` → `file.txt` と順にディレクトリを辿って目的の inode に到達する。
+この処理は `fs/namei.c` に実装されており、 **namei (name-to-inode)** と呼ばれる。
+
+### パス解決の全体フロー
+
+```
+open("/home/user/file.txt", O_RDONLY)
+    │
+    ▼
+path_openat()
+    │
+    ▼
+link_path_walk("/home/user/file.txt", nd)
+    │
+    ├── (1) "/" を認識 → nd->path を root に設定
+    │
+    ├── (2) "home" を lookup
+    │   │
+    │   ├─ dcache ヒット → dentry 取得、次へ
+    │   └─ dcache ミス  → inode->i_op->lookup() を呼び出し
+    │                      → ディスクからディレクトリエントリを読む
+    │                      → 新しい dentry を dcache に追加
+    │
+    ├── (3) "user" を lookup (同様)
+    │
+    └── (4) "file.txt" を lookup
+            │
+            ▼
+        do_open() → ファイルオープン完了
+```
+
+### RCU-walk と ref-walk
+
+パス名解決はカーネルで最も頻繁に実行される操作の一つであり、
+性能が極めて重要である。Linux は 2 段階の戦略をとる。
+
+**第 1 段階: RCU-walk (楽観的・高速パス)**
+
+- ロックを一切取らず、RCU 読み取り側セクション内で dcache を走査する
+- dentry の `d_seq` (シーケンスカウント) を使って、走査中にデータが変更されていないかを検証する
+- 成功すれば、ロックなしでパス解決が完了する
+- すべてのコンポーネントが dcache にヒットし、かつ競合がない場合に高速に動作する
+
+**第 2 段階: ref-walk (保守的・フォールバック)**
+
+- RCU-walk が失敗 (競合検出、dcache ミス、シンボリックリンク等) した場合にフォールバックする
+- dentry の参照カウントを取得し、通常のロック機構を使って走査する
+- ディスクアクセスが必要な場合は必ずこちらのパスを通る
+
+```
+path_openat(nd, flags)
+    │
+    ▼
+┌──────────────────────┐
+│ LOOKUP_RCU フラグ付き │
+│ RCU-walk 開始         │
+└──────────┬───────────┘
+           │
+    ┌──────▼──────┐
+    │ dcache 検索  │◄───────────────────────┐
+    │             │                         │
+    │ ヒット?     │                         │
+    ├─ Yes ──┐   │                         │
+    │        │   │                         │
+    │   d_seq│検証│                         │
+    │        │   │                         │
+    │   OK?  │   │                         │
+    ├─ Yes ──┤   │     次のコンポーネントへ │
+    │   次へ─┼───┼─────────────────────────┘
+    │        │   │
+    │  No ───┤   │   ← シーケンス不一致 (競合)
+    │        │   │
+    └─ No ──┼───┘   ← dcache ミス
+            │
+            ▼
+    ┌───────────────┐
+    │ ref-walk に    │
+    │ フォールバック  │
+    │ (ロック取得)    │
+    └───────┬───────┘
+            │
+            ▼
+    inode->i_op->lookup()
+    (ディスク I/O)
+```
+
+### マウントポイントの横断
+
+パス解決の途中でマウントポイントに遭遇すると、VFS はマウント先の
+ファイルシステムのルート dentry に遷移する。
+
+```
+/          (rootfs の dentry)
+├── home/  (ext4 が /home にマウントされている場合)
+│   └── [マウントポイント検出]
+│       └── ext4 の s_root (dentry) に遷移
+│           └── user/
+│               └── file.txt
+```
+
+この処理は `follow_managed()` で行われ、`d_flags` の `DCACHE_MOUNTED` フラグを
+チェックしてマウントの有無を判定する。
+
+### 負の dentry の具体例
+
+```bash
+$ strace -e stat bash -c 'type nonexistent_command'
+# $PATH の各ディレクトリで stat() が ENOENT を返す
+stat("/usr/local/bin/nonexistent_command") = -1 ENOENT
+stat("/usr/bin/nonexistent_command")       = -1 ENOENT
+stat("/bin/nonexistent_command")           = -1 ENOENT
+# ...
+```
+
+最初の `stat()` 失敗で負の dentry がキャッシュされるため、
+同じコマンドを再度実行すると dcache ヒットで即座に `ENOENT` が返り、ディスク I/O は発生しない。
+
+---
+
+## ページキャッシュ
+
+ページキャッシュは Linux のファイル I/O 性能の要である。
+ファイルの内容は最初の読み出し時にメモリにキャッシュされ、以降のアクセスではディスク I/O を省略できる。
+
+### ライフサイクル
+
+```
+          ┌──────────────────────────────────────────────────────────┐
+          │                    ページキャッシュ                        │
+          │                                                          │
+read()    │  ┌──────────┐    readahead    ┌──────────┐              │
+─────────►│  │ uptodate │◄──────────────── │ ディスク │              │
+          │  │ (clean)  │                 └──────────┘              │
+          │  └────┬─────┘                                           │
+          │       │                                                  │
+          │  write()                                                 │
+          │       │                                                  │
+          │  ┌────▼─────┐                                           │
+          │  │  dirty   │  ── ページが変更された状態                  │
+          │  └────┬─────┘                                           │
+          │       │                                                  │
+          │  writeback (flusher スレッド / sync)                     │
+          │       │                                                  │
+          │  ┌────▼──────┐   submit_bio    ┌──────────┐            │
+          │  │ writeback │───────────────►  │ ディスク │            │
+          │  │ (under    │                 └──────────┘            │
+          │  │  I/O)     │                                          │
+          │  └────┬──────┘                                          │
+          │       │ I/O 完了                                        │
+          │       ▼                                                  │
+          │  ┌──────────┐                                           │
+          │  │ uptodate │  ← clean 状態に戻る                       │
+          │  │ (clean)  │                                           │
+          │  └──────────┘                                           │
+          │                                                          │
+          │  メモリ不足時 → LRU で回収 (clean ページのみ)            │
+          └──────────────────────────────────────────────────────────┘
+```
+
+### Readahead (先読み)
+
+シーケンシャルアクセスを検出すると、カーネルは実際に要求されたよりも先のページを
+先読みしてキャッシュに載せる。
+
+```c
+/*
+ * readahead の呼び出しチェーン:
+ * filemap_read()
+ *   → page_cache_sync_readahead() / page_cache_async_readahead()
+ *     → ondemand_readahead()
+ *       → do_page_cache_ra()
+ *         → a_ops->readahead()
+ */
+```
+
+readahead ウィンドウは動的に調整される。
+最初は小さく (通常 4 ページ = 16 KB)、シーケンシャルアクセスが続くと
+最大 `vm.max_readahead_kb` (デフォルト 128 KB / 256 KB) まで拡大する。
+
+```bash
+# 現在の readahead 設定を確認
+$ cat /sys/class/bdi/*/read_ahead_kb
+128
+
+# blockdev コマンドでも確認・変更可能
+$ blockdev --getra /dev/sda
+256    # 単位は 512 バイトセクタ = 128 KB
+```
+
+### Dirty ページと Writeback
+
+`write()` でファイルを変更すると、ページは **dirty** にマークされるだけで
+即座にはディスクに書き込まれない。これを **遅延書き込み (delayed write)** と呼ぶ。
+
+dirty ページがディスクに書き戻されるトリガーは 3 つある。
+
+| トリガー | 説明 |
+|---|---|
+| **タイマー** | `dirty_writeback_centisecs` (デフォルト 500 = 5 秒) ごとに flusher スレッドが起動 |
+| **閾値** | dirty ページが `dirty_ratio` (デフォルト 20%) を超えると書き戻し開始 |
+| **`sync` / `fsync`** | ユーザからの明示的な書き戻し要求 |
+
+```bash
+# writeback 関連のパラメータ
+$ sysctl vm.dirty_ratio
+vm.dirty_ratio = 20
+
+$ sysctl vm.dirty_background_ratio
+vm.dirty_background_ratio = 10
+
+$ sysctl vm.dirty_writeback_centisecs
+vm.dirty_writeback_centisecs = 500
+```
+
+**flusher スレッド** (ワーカースレッド `kworker/u*:*+flush-*`) は
+バックグラウンドで dirty ページを処理する。
+`dirty_background_ratio` (デフォルト 10%) を超えると flusher が起動し、
+`dirty_ratio` (デフォルト 20%) に達すると書き込みプロセス自体がブロックされて書き戻しに参加する。
+
+---
+
+## struct folio: struct page の後継
+
+### なぜ folio が必要か
+
+`struct page` はカーネルで最も基本的なメモリ管理構造体だが、深刻な問題を抱えていた。
+
+1. **compound page の曖昧さ**: `struct page` が指すのが base page なのか、
+   compound page の head page なのか、tail page なのかが型レベルで区別できない
+2. **関数の前提条件が不明確**: `page` を引数に取る関数が、head page を期待しているのか、
+   任意の tail page でもよいのかが API からわからない
+3. **サイズの仮定**: `PAGE_SIZE` (通常 4 KB) を暗黙に仮定するコードが散在していた
+
+Matthew Wilcox が 2021 年に導入した `struct folio` は、以下の保証を持つ。
+
+- **常に head page (またはそれに対応する単位) を指す**
+- tail page を `folio` として扱うことはできない
+- コンパイル時に型チェックで誤用を防げる
+
+```c title="include/linux/mm_types.h (概念的)"
+struct folio {
+    /* 最初のメンバは struct page と共通レイアウト */
+    unsigned long flags;       /* ページフラグ */
+    struct list_head lru;      /* LRU リスト */
+    struct address_space *mapping;  /* 所属する address_space */
+    pgoff_t index;             /* ファイル内オフセット (ページ単位) */
+    unsigned long private;     /* FS 固有データ */
+    atomic_t _mapcount;        /* マッピング数 */
+    atomic_t _refcount;        /* 参照カウント */
+    /* ... */
+};
+```
+
+### page と folio の対比
+
+```c
+/* 旧 API (page ベース) */
+struct page *page = find_get_page(mapping, index);
+lock_page(page);
+SetPageDirty(page);
+
+/* 新 API (folio ベース) */
+struct folio *folio = filemap_get_folio(mapping, index);
+folio_lock(folio);
+folio_mark_dirty(folio);
+```
+
+`address_space_operations` でも `read_folio` が `readpage` を置き換え、
+`dirty_folio` が `set_page_dirty` を置き換えている。
+カーネル 6.x 系では folio API への移行が急速に進んでいる。
+
+---
+
+## ファイルロック
+
+Linux は複数のファイルロック機構を提供している。それぞれ意味論が異なるため、混同しないよう注意が必要である。
+
+### 1. flock() — BSD ロック
+
+```c
+#include <sys/file.h>
+
+int fd = open("data.txt", O_RDWR);
+flock(fd, LOCK_EX);   /* 排他ロックを取得 */
+/* ... 書き込み ... */
+flock(fd, LOCK_UN);   /* アンロック */
+```
+
+- ファイル全体をロックする (バイト範囲指定不可)
+- `open()` の **ファイルディスクリプション** (file description) に紐づく
+- `dup()` / `fork()` で fd を共有すると同じロックを参照する
+- **勧告ロック (advisory)** — 無視するプロセスには効果がない
+
+### 2. POSIX ロック — fcntl F_SETLK / F_SETLKW
+
+```c
+#include <fcntl.h>
+
+struct flock fl = {
+    .l_type   = F_WRLCK,     /* 書き込みロック */
+    .l_whence = SEEK_SET,
+    .l_start  = 0,            /* オフセット 0 から */
+    .l_len    = 100,          /* 100 バイト分 */
+};
+
+int fd = open("data.txt", O_RDWR);
+fcntl(fd, F_SETLKW, &fl);   /* ブロッキングで排他ロック取得 */
+/* ... 書き込み ... */
+fl.l_type = F_UNLCK;
+fcntl(fd, F_SETLK, &fl);    /* アンロック */
+```
+
+- **バイト範囲ロック** が可能
+- **プロセス** に紐づく (PID ベース)
+- 致命的な問題: **同一プロセス内のどの fd を `close()` しても、そのファイルの全ロックが解放される**
+
+```c
+/* POSIX ロックの罠 */
+int fd1 = open("data.txt", O_RDWR);
+fcntl(fd1, F_SETLK, &lock);  /* ロック取得 */
+
+int fd2 = open("data.txt", O_RDONLY);
+close(fd2);                   /* ← fd1 のロックも解放されてしまう! */
+```
+
+### 3. OFD ロック — Open File Description Locks
+
+```c
+struct flock fl = {
+    .l_type   = F_WRLCK,
+    .l_whence = SEEK_SET,
+    .l_start  = 0,
+    .l_len    = 0,         /* ファイル全体 */
+    .l_pid    = 0,         /* OFD ロックでは無視される */
+};
+
+fcntl(fd, F_OFD_SETLKW, &fl);   /* OFD ロックを取得 */
+```
+
+- Linux 3.15 で追加された
+- POSIX ロックの `close()` 問題を修正
+- **ファイルディスクリプション** に紐づく (flock と同じ)
+- バイト範囲ロックが可能 (POSIX ロックと同じ)
+- マルチスレッドプログラムで安全に使える
+
+### 4. リース (Lease)
+
+```c
+fcntl(fd, F_SETLEASE, F_RDLCK);  /* 読み取りリースを取得 */
+```
+
+- ファイルが他のプロセスに開かれそうになると **シグナル** (SIGIO) で通知を受ける
+- Samba サーバで Windows のオプロック (oplock) を実装するために使われる
+- リース保持者がリースを解放するか、タイムアウトするまでオープンがブロックされる
+
+### ロック機構の比較
+
+| 特性 | flock | POSIX | OFD | リース |
+|---|---|---|---|---|
+| 粒度 | ファイル全体 | バイト範囲 | バイト範囲 | ファイル全体 |
+| 紐づき | fd 記述 | プロセス | fd 記述 | inode |
+| close 問題 | なし | **あり** | なし | なし |
+| スレッド安全 | Yes | **No** | Yes | Yes |
+| 推奨度 | 用途次第 | 非推奨 | 推奨 | 特殊用途 |
+
+---
+
+## 拡張属性 (xattr) と POSIX ACL
+
+### 拡張属性 (Extended Attributes)
+
+通常の UNIX パーミッション (owner/group/other) では表現できないメタデータを
+ファイルに付与する仕組みが **拡張属性 (xattr)** である。
+
+xattr は名前空間で分類される。
+
+| 名前空間 | プレフィックス | 用途 |
+|---|---|---|
+| `user` | `user.` | ユーザ定義の任意データ |
+| `security` | `security.` | SELinux, AppArmor ラベル |
+| `system` | `system.` | POSIX ACL |
+| `trusted` | `trusted.` | 特権プロセス用 |
+
+```bash
+# xattr の操作
+$ setfattr -n user.description -v "important report" report.txt
+$ getfattr -n user.description report.txt
+# file: report.txt
+user.description="important report"
+
+# すべての xattr を表示
+$ getfattr -d report.txt
+
+# SELinux ラベルの確認
+$ getfattr -n security.selinux /etc/passwd
+```
+
+カーネル内での xattr 操作は `inode_operations` の以下のメンバで実装される。
+
+```c
+struct inode_operations {
+    /* ... */
+    int (*setattr)(struct mnt_idmap *, struct dentry *, struct iattr *);
+    ssize_t (*listxattr)(struct dentry *, char *, size_t);
+    /* xattr は xattr_handler テーブルで処理される */
+};
+
+/* ext4 の xattr ハンドラ */
+const struct xattr_handler ext4_xattr_user_handler = {
+    .prefix = XATTR_USER_PREFIX,
+    .list   = ext4_xattr_user_list,
+    .get    = ext4_xattr_user_get,
+    .set    = ext4_xattr_user_set,
+};
+```
+
+### POSIX ACL
+
+POSIX ACL (Access Control List) は標準の rwx パーミッションを拡張し、
+特定のユーザ・グループに対して個別のアクセス権を設定できる。
+実装上は `system.posix_acl_access` / `system.posix_acl_default` という xattr として格納される。
+
+```bash
+# ACL の設定: ユーザ alice に読み取り権限を追加
+$ setfacl -m u:alice:r report.txt
+
+# ACL の確認
+$ getfacl report.txt
+# file: report.txt
+# owner: bob
+# group: staff
+user::rw-
+user:alice:r--
+group::r--
+mask::r--
+other::---
+
+# デフォルト ACL (ディレクトリ用: 新規ファイルに継承)
+$ setfacl -d -m u:alice:rwx shared_dir/
+```
+
+VFS レベルでは、`generic_permission()` がパーミッションチェック時に ACL を考慮する。
+
+---
+
+## fsnotify フレームワーク (inotify / fanotify)
+
+### fsnotify の構造
+
+Linux にはファイルシステムイベントを監視する仕組みとして **inotify** と **fanotify** がある。
+両者は内部的に共通の **fsnotify** フレームワークの上に構築されている。
+
+```
+┌───────────────────────────────────────────────┐
+│                ユーザ空間                       │
+│                                                │
+│  inotify_init1()          fanotify_init()      │
+│  inotify_add_watch()      fanotify_mark()      │
+│  read()                   read()               │
+└───────────┬──────────────────┬─────────────────┘
+            │                  │
+┌───────────▼──────────────────▼─────────────────┐
+│              fsnotify フレームワーク             │
+│                                                 │
+│  fsnotify_group → fsnotify_mark → 対象 inode   │
+│                                                 │
+│  VFS 操作時にフックが呼ばれる:                   │
+│    vfs_write() → fsnotify_modify()              │
+│    vfs_open()  → fsnotify_open()                │
+│    vfs_unlink()→ fsnotify_delete()              │
+└─────────────────────────────────────────────────┘
+```
+
+### inotify
+
+```c
+#include <sys/inotify.h>
+
+int ifd = inotify_init1(IN_NONBLOCK);
+
+/* /tmp ディレクトリを監視 */
+int wd = inotify_add_watch(ifd, "/tmp",
+                           IN_CREATE | IN_DELETE | IN_MODIFY);
+
+/* イベントを読み取る */
+char buf[4096];
+ssize_t len = read(ifd, buf, sizeof(buf));
+
+struct inotify_event *event;
+for (char *ptr = buf; ptr < buf + len;
+     ptr += sizeof(*event) + event->len) {
+    event = (struct inotify_event *)ptr;
+    if (event->mask & IN_CREATE)
+        printf("Created: %s\n", event->name);
+    if (event->mask & IN_DELETE)
+        printf("Deleted: %s\n", event->name);
+}
+```
+
+**inotify の制限:**
+
+- ディレクトリの再帰的な監視はサポートされない (各サブディレクトリに watch を追加する必要がある)
+- rename でファイルが移動すると追跡が困難
+- watch 数の上限: `/proc/sys/fs/inotify/max_user_watches` (デフォルト 8192~65536)
+
+### fanotify
+
+fanotify は inotify の後継として設計されたもので、以下の拡張機能を持つ。
+
+- **マウントポイント全体** を一括監視できる (FS_MARK_MOUNT)
+- **ファイルシステム全体** を監視できる (FAN_MARK_FILESYSTEM, Linux 4.20+)
+- **アクセス制御**: `FAN_OPEN_PERM` / `FAN_ACCESS_PERM` でファイルオープンの **許可/拒否** を制御できる
+  (アンチウイルスソフトウェアで利用)
+- イベントにファイルディスクリプタが含まれるため、`/proc/self/fd/<fd>` 経由でファイルにアクセスできる
+
+```c
+#include <fcntl.h>
+#include <sys/fanotify.h>
+
+/* fanotify の初期化 */
+int fan_fd = fanotify_init(FAN_CLASS_NOTIF | FAN_REPORT_FID,
+                           O_RDONLY);
+
+/* ファイルシステム全体を監視 */
+fanotify_mark(fan_fd, FAN_MARK_ADD | FAN_MARK_FILESYSTEM,
+              FAN_CREATE | FAN_DELETE | FAN_MODIFY,
+              AT_FDCWD, "/mnt/data");
+```
+
+---
+
+## ramfs ウォークスルー: 最小限のファイルシステム
+
+ramfs は Linux カーネルに含まれる **最もシンプルなファイルシステム** である。
+ディスクバッキングストアを持たず、すべてのデータはページキャッシュ上にのみ存在する。
+ソースコードは `fs/ramfs/` ディレクトリにあり、約 300 行と非常にコンパクトである。
+
+ramfs を読み解くことで、ファイルシステムの登録から inode 作成までの一連の流れを理解できる。
+
+### ramfs の構造
+
+```
+fs/ramfs/
+├── inode.c       ← メインの実装 (super_block 初期化, inode 作成)
+├── file-mmu.c    ← file_operations (MMU あり環境)
+├── file-nommu.c  ← file_operations (MMU なし環境)
+└── internal.h    ← 内部ヘッダ
+
+実装のサイズ:
+  inode.c       ≈ 250 行
+  file-mmu.c    ≈  40 行
+  合計          ≈ 300 行 未満
+```
+
+### file_system_type の登録
+
+ファイルシステムはまず `file_system_type` 構造体を定義し、
+`register_filesystem()` でカーネルに登録する。
+
+```c title="fs/ramfs/inode.c (簡略化)"
+static struct file_system_type ramfs_fs_type = {
+    .name       = "ramfs",
+    .init_fs_context = ramfs_init_fs_context,
+    .parameters = ramfs_fs_parameters,
+    .kill_sb    = ramfs_kill_sb,
+    .fs_flags   = FS_USERNS_MOUNT,
+};
+
+static int __init init_ramfs_fs(void)
+{
+    return register_filesystem(&ramfs_fs_type);
+}
+fs_initcall(init_ramfs_fs);
+```
+
+`init_fs_context` はマウント時に呼ばれ、fs_context を初期化する。
+従来の `mount` コールバックに代わる新しい API (Linux 5.x+) である。
+
+```c title="fs/ramfs/inode.c"
+int ramfs_init_fs_context(struct fs_context *fc)
+{
+    struct ramfs_fs_info *fsi;
+
+    fsi = kzalloc(sizeof(*fsi), GFP_KERNEL);
+    if (!fsi)
+        return -ENOMEM;
+
+    fsi->mount_opts.mode = RAMFS_DEFAULT_MODE;
+    fc->s_fs_info = fsi;
+    fc->ops = &ramfs_context_ops;
+    return 0;
+}
+```
+
+### ramfs_fill_super(): super_block の初期化
+
+`fill_super` はファイルシステムマウントの核心部分である。
+`super_block` を初期化し、ルート inode とルート dentry を作成する。
+
+```c title="fs/ramfs/inode.c (簡略化)"
+static int ramfs_fill_super(struct super_block *sb, struct fs_context *fc)
+{
+    struct ramfs_fs_info *fsi = sb->s_fs_info;
+    struct inode *inode;
+
+    sb->s_maxbytes       = MAX_LFS_FILESIZE;
+    sb->s_blocksize      = PAGE_SIZE;
+    sb->s_blocksize_bits = PAGE_SHIFT;
+    sb->s_magic          = RAMFS_MAGIC;
+    sb->s_op             = &ramfs_ops;
+    sb->s_time_gran      = 1;  /* ナノ秒精度 */
+
+    /* ルート inode を作成 */
+    inode = ramfs_get_inode(sb, NULL, S_IFDIR | fsi->mount_opts.mode, 0);
+    if (!inode)
+        return -ENOMEM;
+
+    /* ルート dentry を作成 */
+    sb->s_root = d_make_root(inode);
+    if (!sb->s_root)
+        return -ENOMEM;
+
+    return 0;
+}
+```
+
+### ramfs_get_inode(): inode の作成
+
+```c title="fs/ramfs/inode.c (簡略化)"
+struct inode *ramfs_get_inode(struct super_block *sb,
+                              const struct inode *dir,
+                              umode_t mode, dev_t dev)
+{
+    struct inode *inode = new_inode(sb);
+
+    if (inode) {
+        inode->i_ino = get_next_ino();
+        inode_init_owner(&nop_mnt_idmap, inode, dir, mode);
+
+        inode->i_mapping->a_ops = &ram_aops;
+        mapping_set_gfp_mask(inode->i_mapping,
+                             GFP_HIGHUSER | __GFP_ZERO);
+        mapping_set_unevictable(inode->i_mapping);
+
+        simple_inode_init_ts(inode);
+
+        switch (mode & S_IFMT) {
+        case S_IFREG:       /* 通常ファイル */
+            inode->i_op  = &ramfs_file_inode_operations;
+            inode->i_fop = &ramfs_file_operations;
+            break;
+        case S_IFDIR:       /* ディレクトリ */
+            inode->i_op  = &ramfs_dir_inode_operations;
+            inode->i_fop = &simple_dir_operations;
+            inc_nlink(inode);  /* "." エントリ分 */
+            break;
+        case S_IFLNK:       /* シンボリックリンク */
+            inode->i_op = &page_symlink_inode_operations;
+            inode_nohighmem(inode);
+            break;
+        default:            /* デバイスノード等 */
+            init_special_inode(inode, mode, dev);
+            break;
+        }
+    }
+    return inode;
+}
+```
+
+**重要なポイント:**
+
+- `new_inode()` は VFS の汎用関数で、`super_operations->alloc_inode` を呼んで inode を確保する
+  (ramfs は独自の `alloc_inode` を定義していないため、デフォルトの汎用 inode が使われる)
+- `mapping_set_unevictable()` により、ページキャッシュからの回収 (eviction) が禁止される
+  (ramfs にはバッキングストアがないため、ページを捨てるとデータが消失する)
+- ファイルタイプに応じて異なる操作テーブルを設定する
+
+### ramfs の操作テーブル
+
+```c title="fs/ramfs/inode.c"
+static const struct super_operations ramfs_ops = {
+    .statfs      = simple_statfs,
+    .drop_inode  = generic_delete_inode,
+    .show_options = ramfs_show_options,
+};
+
+static const struct inode_operations ramfs_dir_inode_operations = {
+    .create     = ramfs_create,
+    .lookup     = simple_lookup,
+    .link       = simple_link,
+    .unlink     = simple_unlink,
+    .symlink    = ramfs_symlink,
+    .mkdir      = ramfs_mkdir,
+    .rmdir      = simple_rmdir,
+    .mknod      = ramfs_mknod,
+    .rename     = simple_rename,
+};
+```
+
+`simple_` プレフィックスの関数は `fs/libfs.c` に定義された **VFS ライブラリ関数** である。
+ディスクアクセスが不要な単純なファイルシステムは、これらの汎用実装を再利用できる。
+
+```c title="fs/ramfs/file-mmu.c"
+const struct file_operations ramfs_file_operations = {
+    .read_iter      = generic_file_read_iter,
+    .write_iter     = generic_file_write_iter,
+    .mmap           = generic_file_mmap,
+    .fsync          = noop_fsync,
+    .splice_read    = filemap_splice_read,
+    .splice_write   = iter_file_splice_write,
+    .llseek         = generic_file_llseek,
+    .get_unmapped_area = ramfs_mmu_get_unmapped_area,
+};
+```
+
+ramfs のファイル操作はほぼすべて VFS 汎用関数を使っている。
+`generic_file_read_iter` / `generic_file_write_iter` はページキャッシュ経由の
+汎用読み書き関数であり、`address_space_operations` の `read_folio` / `write_begin` / `write_end` を
+内部で呼び出す。
+
+### ramfs 全体のオブジェクト関係
+
+```
+register_filesystem(&ramfs_fs_type)
+    │
+    ▼ マウント時
+ramfs_fill_super(sb)
+    │
+    ├── sb->s_op = &ramfs_ops            ← super_operations
+    │
+    ├── ramfs_get_inode(sb, S_IFDIR)     ← ルート inode 作成
+    │   │
+    │   ├── inode->i_op = &ramfs_dir_inode_operations
+    │   ├── inode->i_fop = &simple_dir_operations
+    │   └── inode->i_mapping->a_ops = &ram_aops
+    │
+    └── d_make_root(inode)               ← ルート dentry 作成
+        │
+        └── sb->s_root = dentry
+
+ファイル作成時:
+  ramfs_create(dir, dentry, mode)
+      │
+      └── ramfs_get_inode(sb, S_IFREG)
+          │
+          ├── inode->i_op  = &ramfs_file_inode_operations
+          ├── inode->i_fop = &ramfs_file_operations
+          └── d_instantiate(dentry, inode)  ← dentry と inode を結合
+```
+
+---
+
+## tmpfs (shmem): ramfs + swap
+
+tmpfs は ramfs を拡張したファイルシステムで、以下の重要な違いがある。
+
+| 特性 | ramfs | tmpfs |
+|---|---|---|
+| サイズ制限 | なし (メモリを使い尽くす可能性) | あり (`-o size=...`) |
+| swap 対応 | なし | **あり** (メモリ不足時にスワップアウト) |
+| ページ回収 | 不可 (unevictable) | 可能 |
+| 用途 | カーネル内部 (initramfs 等) | `/tmp`, `/dev/shm`, ユーザ向け |
+
+実装は `mm/shmem.c` にあり、ramfs よりはるかに複雑 (約 5000 行) だが、
+基本的な VFS インタフェースの構造は同じである。
+
+```c
+/* tmpfs のマウント */
+static struct file_system_type shmem_fs_type = {
+    .name       = "tmpfs",
+    .init_fs_context = shmem_init_fs_context,
+    .parameters = shmem_fs_parameters,
+    .kill_sb    = kill_litter_super,
+    .fs_flags   = FS_USERNS_MOUNT | FS_ALLOW_IDMAP,
+};
+```
+
+tmpfs が swap を利用できるのは、`shmem_writepage()` が `address_space_operations->writepage` として
+実装されているためである。メモリ回収時にこの関数が呼ばれ、ページを swap 領域に書き出す。
+
+```bash
+# tmpfs のマウント
+$ mount -t tmpfs -o size=512M,mode=1777 tmpfs /tmp
+
+# 使用状況の確認
+$ df -h /tmp
+Filesystem      Size  Used Avail Use% Mounted on
+tmpfs           512M  4.0K  512M   1% /tmp
+```
+
+---
+
+## FUSE: ユーザ空間ファイルシステム
+
+### FUSE の仕組み
+
+FUSE (Filesystem in Userspace) はファイルシステムの実装を **ユーザ空間** で行うための仕組みである。
+カーネルモジュールの開発が不要で、任意の言語でファイルシステムを実装できる。
+sshfs, rclone mount, s3fs などが FUSE を利用している。
+
+```
+┌────────────────────────────────────────────────────────┐
+│                    ユーザ空間                            │
+│                                                         │
+│  アプリ ──(syscall)──┐                                  │
+│                       │                                  │
+│                       │                                  │
+│  FUSE デーモン ◄──────┼──── /dev/fuse から読み取り       │
+│  (sshfs 等)           │     リクエストを処理             │
+│       │               │     /dev/fuse に応答を書き込み   │
+│       │               │                                  │
+└───────┼───────────────┼──────────────────────────────────┘
+        │               │
+========│===============│====== ユーザ/カーネル境界 ========
+        │               │
+┌───────▼───────────────▼──────────────────────────────────┐
+│                    カーネル空間                           │
+│                                                          │
+│  /dev/fuse ◄──────── FUSE カーネルモジュール              │
+│  (misc device)        │                                   │
+│                       │                                   │
+│                  ┌────▼────┐                              │
+│                  │  VFS    │                              │
+│                  └─────────┘                              │
+└──────────────────────────────────────────────────────────┘
+```
+
+### FUSE リクエストの流れ
+
+```
+1. アプリが open("/mnt/fuse/file.txt") を呼ぶ
+       │
+2.     ▼ VFS → FUSE カーネルモジュール
+       FUSE リクエストをキューに入れる
+       (FUSE_LOOKUP, FUSE_OPEN 等)
+       │
+3.     ▼ FUSE デーモンが /dev/fuse を read()
+       カーネルからリクエストを受け取る
+       │
+4.     ▼ FUSE デーモンがリクエストを処理
+       (SSH 経由でリモートファイルを取得等)
+       │
+5.     ▼ FUSE デーモンが /dev/fuse に write()
+       カーネルに応答を返す
+       │
+6.     ▼ FUSE カーネルモジュール → VFS → アプリ
+       結果がアプリに返る
+```
+
+### libfuse を使った最小実装
+
+```c title="hello_fuse.c (libfuse 3.x)"
+#define FUSE_USE_VERSION 31
+#include <fuse3/fuse.h>
+#include <string.h>
+#include <errno.h>
+
+static const char *hello_path = "/hello";
+static const char *hello_str  = "Hello, FUSE!\n";
+
+static int hello_getattr(const char *path, struct stat *stbuf,
+                          struct fuse_file_info *fi)
+{
+    memset(stbuf, 0, sizeof(struct stat));
+
+    if (strcmp(path, "/") == 0) {
+        stbuf->st_mode = S_IFDIR | 0755;
+        stbuf->st_nlink = 2;
+    } else if (strcmp(path, hello_path) == 0) {
+        stbuf->st_mode = S_IFREG | 0444;
+        stbuf->st_nlink = 1;
+        stbuf->st_size = strlen(hello_str);
+    } else {
+        return -ENOENT;
+    }
+    return 0;
+}
+
+static int hello_readdir(const char *path, void *buf,
+                          fuse_fill_dir_t filler,
+                          off_t offset,
+                          struct fuse_file_info *fi,
+                          enum fuse_readdir_flags flags)
+{
+    if (strcmp(path, "/") != 0)
+        return -ENOENT;
+
+    filler(buf, ".", NULL, 0, 0);
+    filler(buf, "..", NULL, 0, 0);
+    filler(buf, hello_path + 1, NULL, 0, 0);  /* "hello" */
+    return 0;
+}
+
+static int hello_read(const char *path, char *buf, size_t size,
+                       off_t offset, struct fuse_file_info *fi)
+{
+    size_t len = strlen(hello_str);
+    if (strcmp(path, hello_path) != 0)
+        return -ENOENT;
+    if (offset >= (off_t)len)
+        return 0;
+    if (offset + size > len)
+        size = len - offset;
+    memcpy(buf, hello_str + offset, size);
+    return size;
+}
+
+static const struct fuse_operations hello_ops = {
+    .getattr = hello_getattr,
+    .readdir = hello_readdir,
+    .read    = hello_read,
+};
+
+int main(int argc, char *argv[])
+{
+    return fuse_main(argc, argv, &hello_ops, NULL);
+}
+```
+
+```bash
+# コンパイルとマウント
+$ gcc -Wall hello_fuse.c -o hello_fuse $(pkg-config --cflags --libs fuse3)
+$ mkdir /tmp/mnt
+$ ./hello_fuse /tmp/mnt
+$ cat /tmp/mnt/hello
+Hello, FUSE!
+$ fusermount3 -u /tmp/mnt
+```
+
+### FUSE の性能特性
+
+FUSE の最大の弱点はユーザ/カーネル空間のコンテキストスイッチのオーバーヘッドである。
+1 回のシステムコールにつき最低 2 回の追加コンテキストスイッチが発生する。
+
+```
+通常の FS:   アプリ → (syscall) → VFS → FS 実装 → (return) → アプリ
+FUSE:        アプリ → (syscall) → VFS → FUSE kernel →
+             (context switch) → FUSE daemon → (context switch) →
+             FUSE kernel → (return) → アプリ
+```
+
+性能改善のための機能:
+
+- **splice**: データコピーを削減 (`FUSE_SPLICE_READ` / `FUSE_SPLICE_WRITE`)
+- **writeback cache**: dirty ページをカーネル側でバッファリング (`-o writeback_cache`)
+- **FUSE passthrough** (Linux 6.9+): 読み書きをカーネル内で直接処理し、ユーザ空間への往復を省略
+
+---
+
+## overlayfs: ユニオンマウント
+
+### 概要
+
+overlayfs は複数のディレクトリを **重ね合わせて** 1 つのファイルシステムとして見せる仕組みである。
+Docker をはじめとするコンテナランタイムで **レイヤードイメージ** を実現するために広く使われている。
+
+```
+マウントコマンド:
+  mount -t overlay overlay \
+    -o lowerdir=/lower,upperdir=/upper,workdir=/work \
+    /merged
+
+結果:
+  /merged  ←  統合されたビュー
+    │
+    ├── upper/ の内容が優先 (読み書き可能)
+    │
+    └── lower/ の内容がフォールバック (読み取り専用)
+```
+
+### レイヤーの構造
+
+```
+/merged (マウントポイント)           ← ユーザから見えるビュー
+    │
+    ├── file_A.txt   ← upper に存在 → upper/file_A.txt を参照
+    ├── file_B.txt   ← upper になし → lower/file_B.txt を参照
+    ├── file_C.txt   ← upper で whiteout → 削除されたように見える
+    └── dir/
+        └── file_D.txt
+
+┌──────────────────────────────────────────────────────────┐
+│  upper (読み書き層)                                       │
+│  /upper/                                                  │
+│    ├── file_A.txt          (新規作成 or 変更済み)          │
+│    ├── .wh.file_C.txt      (whiteout: 削除マーカー)       │
+│    └── dir/                                               │
+│        └── file_D.txt                                     │
+└──────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────┐
+│  lower (読み取り専用層)                                   │
+│  /lower/                                                  │
+│    ├── file_A.txt          (元のバージョン — 上書きされた)  │
+│    ├── file_B.txt          (変更なし — そのまま見える)      │
+│    ├── file_C.txt          (whiteout で隠された)           │
+│    └── dir/                                               │
+└──────────────────────────────────────────────────────────┘
+
+┌──────────────────────────────────────────────────────────┐
+│  work (overlayfs の内部作業ディレクトリ)                   │
+│  /work/                                                   │
+│    └── (overlayfs がアトミック操作に使う一時領域)           │
+└──────────────────────────────────────────────────────────┘
+```
+
+### Copy-up
+
+lower 層のファイルを変更しようとすると、overlayfs は **copy-up** を実行する。
+ファイル全体を upper 層にコピーしてから変更を適用する。
+
+```
+ユーザ: write("/merged/file_B.txt", data)
+    │
+    ▼ VFS → overlayfs
+(1) file_B.txt は lower にのみ存在 → copy-up が必要
+    │
+(2) lower/file_B.txt を upper/file_B.txt にコピー
+    (データ + メタデータ + xattr)
+    │
+(3) upper/file_B.txt に対して write を実行
+    │
+    ▼ 以降のアクセスは upper/file_B.txt を参照する
+```
+
+copy-up の注意点:
+
+- ファイル全体がコピーされるため、巨大ファイルでは時間がかかる
+- コピー後は lower 層の変更が反映されなくなる
+- `metacopy` オプション (Linux 4.19+) を使うと、データなしでメタデータのみの copy-up が可能
+
+### コンテナでの利用
+
+Docker のイメージレイヤーは overlayfs の multi-lower 機能で実現されている。
+
+```
+コンテナのファイルシステム:
+mount -t overlay overlay \
+  -o lowerdir=/layer3:/layer2:/layer1,upperdir=/container,workdir=/work \
+  /merged
+
+┌──────────────────┐
+│ /container       │  ← コンテナの書き込み層
+├──────────────────┤
+│ /layer3 (upper)  │  ← アプリケーション層
+├──────────────────┤
+│ /layer2          │  ← ランタイム/ライブラリ層
+├──────────────────┤
+│ /layer1 (lowest) │  ← ベース OS 層 (ubuntu:22.04 等)
+└──────────────────┘
+```
+
+複数のコンテナが同じ lower 層を共有できるため、ディスク使用量が大幅に削減される。
+
+---
+
+## Block I/O 層の基礎
+
+ファイルシステムがディスクにデータを読み書きする場合、最終的に Block I/O 層を経由する。
+
+### struct bio
+
+`struct bio` はブロック I/O リクエストの基本単位である。
+1 つの `bio` は連続したセクタ範囲に対する I/O 操作を表現する。
+
+```c title="include/linux/blk_types.h (抜粋・簡略化)"
+struct bio {
+    struct bio          *bi_next;     /* リクエストキュー内の次の bio */
+    struct block_device *bi_bdev;     /* 対象ブロックデバイス */
+    unsigned int        bi_opf;       /* 操作 + フラグ (REQ_OP_READ 等) */
+    unsigned short      bi_flags;     /* bio フラグ */
+    unsigned short      bi_ioprio;    /* I/O 優先度 */
+
+    struct bvec_iter    bi_iter;      /* セクタ位置・残りサイズ */
+    bio_end_io_t        *bi_end_io;   /* I/O 完了コールバック */
+    void                *bi_private;  /* プライベートデータ */
+
+    unsigned short      bi_vcnt;      /* bio_vec の数 */
+    unsigned short      bi_max_vecs;  /* bio_vec の最大数 */
+    atomic_t            bi_cnt;       /* 参照カウント */
+
+    struct bio_vec      *bi_io_vec;   /* ページの配列 */
+    /* ... */
+};
+```
+
+`bio_vec` はページとオフセット・長さの組で、scatter/gather I/O を実現する。
+
+```c
+struct bio_vec {
+    struct page  *bv_page;    /* メモリページ */
+    unsigned int  bv_len;     /* バイト長 */
+    unsigned int  bv_offset;  /* ページ内オフセット */
+};
+```
+
+### bio の submit から完了まで
+
+```
+ファイルシステム (ext4 等)
+    │
+    ▼ bio を構築
+bio_alloc()           ← bio を確保
+bio_set_dev(bio, bdev)  ← 対象デバイスを設定
+bio->bi_iter.bi_sector = sector  ← 開始セクタ
+bio_add_page(bio, page, len, offset)  ← ページを追加
+bio->bi_end_io = callback  ← 完了コールバック
+    │
+    ▼
+submit_bio(bio)       ← bio を送信
+    │
+    ▼
+Block 層のキュー
+    │
+    ├── I/O スケジューラ (mq-deadline, bfq, kyber, none)
+    │   ├── マージ: 隣接する bio をまとめる
+    │   ├── ソート: セクタ順に並べ替え (シーク最小化)
+    │   └── 優先度: cgroup, ionice に基づく制御
+    │
+    ▼
+デバイスドライバ (NVMe, SCSI, virtio-blk 等)
+    │
+    ▼ ハードウェア I/O
+ディスク / SSD
+    │
+    ▼ 完了割り込み
+bio->bi_end_io(bio)   ← コールバック呼び出し
+```
+
+### I/O スケジューラ
+
+Linux 5.0 以降はすべてのブロックデバイスが **Multi-Queue Block I/O (blk-mq)** を使用する。
+利用可能なスケジューラは以下の通り。
+
+| スケジューラ | 特徴 | 適した用途 |
+|---|---|---|
+| `none` | スケジューリングなし。FIFO | NVMe SSD (高速デバイス) |
+| `mq-deadline` | デッドラインベース。読み取り優先 | HDD, 汎用 |
+| `bfq` | 公平帯域幅配分。CFS 的 | デスクトップ, 低速デバイス |
+| `kyber` | レイテンシ目標ベース。軽量 | 高速 SSD |
+
+```bash
+# 現在のスケジューラを確認
+$ cat /sys/block/sda/queue/scheduler
+[mq-deadline] kyber bfq none
+
+# スケジューラを変更
+$ echo bfq > /sys/block/sda/queue/scheduler
+```
+
+---
+
+## Rust VFS の現状
+
+### カーネルにおける Rust VFS 抽象化の試み
+
+Rust for Linux プロジェクトにおいて VFS の Rust 抽象化は **最も議論の多いテーマの一つ** であり、
+2026 年 4 月時点でもメインラインにはまだマージされていない。
+
+### Wedson Almeida Filho の VFS RFC
+
+2024 年に Wedson Almeida Filho が VFS の Rust 抽象化 RFC を投稿した。
+この RFC は以下のような構造を提案していた。
+
+```rust
+// RFC で提案された Rust VFS 抽象化の概念 (簡略化)
+use kernel::fs;
+
+struct MyFs;
+
+impl fs::FileSystem for MyFs {
+    const NAME: &'static CStr = c_str!("myfs");
+
+    fn fill_super(sb: &mut fs::SuperBlock<Self>) -> Result {
+        let inode = sb.new_inode()?;
+        // ...
+        Ok(())
+    }
+}
+
+impl fs::INodeOperations for MyFs {
+    fn lookup(parent: &fs::INode<Self>,
+              dentry: &fs::DEntry<Self>) -> Result<Option<fs::INode<Self>>> {
+        // ...
+    }
+}
+```
+
+しかし、この RFC はいくつかの理由で議論が停滞した。
+
+1. **VFS メンテナの慎重な姿勢**: VFS は Linux カーネルの最も中心的なサブシステムの一つであり、
+   C 実装との 1:1 の互換性が求められる。Rust の型システムで VFS の複雑なロック規約を
+   正確に表現できるかについて懸念が示された
+
+2. **ライフタイムの複雑さ**: `super_block`, `inode`, `dentry` 間の参照関係は非常に複雑で、
+   Rust のライフタイムシステムで安全に表現するのが困難
+
+3. **API の安定性**: VFS の内部 API はリリースごとに変更されうるため、
+   Rust 抽象化層の保守コストが高い
+
+### PuzzleFS と tarfs: 実験的な取り組み
+
+VFS 抽象化の不在にもかかわらず、いくつかの実験的な Rust ファイルシステムが開発されている。
+
+- **PuzzleFS**: コンテナイメージ用の FS。overlayfs の代替を目指す
+- **tarfs**: tar アーカイブを読み取り専用でマウントする FS
+
+これらは VFS 抽象化なしで、`unsafe` ブロックを使って C の VFS API を直接呼び出す形で実装されている。
+メインラインへのマージを目指しているが、VFS 抽象化の不在が障壁となっている。
+
+### 現実的な見通し
+
+Rust VFS 抽象化が実現するには、以下の段階が必要と考えられる。
+
+1. より小さなサブシステム (ブロックデバイスドライバ等) で Rust 抽象化の実績を積む
+2. VFS メンテナとの合意形成を進める
+3. 最小限の読み取り専用 FS (tarfs のような) から始めて段階的に拡張する
+
+現時点では、Rust でファイルシステムを書くには C の VFS API を `unsafe` で直接使うか、
+FUSE を使ってユーザ空間で実装するのが現実的な選択肢である。
+
+---
+
+## よくある罠
+
+### 1. dcache の negative dentry によるメモリ消費
+
+大量の存在しないファイルにアクセスすると、negative dentry がメモリを圧迫する。
+`sysctl vm.vfs_cache_pressure` を調整するか、`echo 2 > /proc/sys/vm/drop_caches` で
+dentry キャッシュを手動で解放できる。
+
+### 2. ramfs のメモリリーク
+
+ramfs にはサイズ制限がないため、データを書き込み続けるとシステムメモリを使い尽くして
+OOM killer が発動する。ユーザ向けの用途には必ず tmpfs を使うこと。
+
+### 3. POSIX ロックの close() 問題
+
+前述の通り、POSIX ロック (`fcntl F_SETLK`) は同一プロセス内の任意の fd の `close()` で
+全ロックが解放される。新規コードでは OFD ロック (`F_OFD_SETLK`) を使うべきである。
+
+### 4. overlayfs の copy-up によるディスク消費
+
+lower 層の巨大ファイルを 1 バイトでも変更すると、ファイル全体が upper 層にコピーされる。
+コンテナイメージの設計時は、頻繁に変更されるファイルを上位レイヤーに配置する。
+
+### 5. FUSE のデッドロック
+
+FUSE デーモンが `mmap` 等でマウントポイント配下のファイルにアクセスすると、
+自分自身にリクエストが送信されてデッドロックする。
+FUSE デーモンは自身のマウントポイントにアクセスしてはならない。
+
+### 6. inotify のイベントオーバーフロー
+
+カーネルのイベントキューが溢れると `IN_Q_OVERFLOW` イベントが発行され、
+個別のイベントは失われる。
+大量のイベントが予想される場合は `max_queued_events` を増やすか、fanotify を検討する。
+
+### 7. page cache と O_DIRECT の不整合
+
+同じファイルに対して通常 I/O と `O_DIRECT` I/O を混在させると、
+page cache と disk の内容が不整合になる可能性がある。
+1 つのファイルに対しては I/O 方式を統一する。
+
+### 8. xattr のサイズ制限
+
+xattr の名前と値のペアは FS ごとにサイズ制限がある。ext4 では 1 つの xattr が
+最大約 4 KB (ブロックサイズ依存)。巨大なメタデータの格納には向かない。
+
+---
+
+## 章末演習
+
+### 演習 1: VFS 構造体の観察
+
+`debugfs` と `/proc` を使って VFS の内部状態を観察せよ。
+
+```bash
+# (a) マウントされたファイルシステムの super_block 情報を確認
+$ cat /proc/filesystems
+$ mount | grep -E 'ext4|tmpfs|overlay'
+
+# (b) inode の情報を stat コマンドで確認
+$ stat /etc/passwd
+# inode 番号, リンク数, ブロック数, アクセス時刻等を確認せよ
+
+# (c) dentry キャッシュの統計
+$ cat /proc/sys/fs/dentry-state
+# [nr_dentry] [nr_unused] [age_limit] [want_pages] [nr_negative] [dummy]
+# 各数値の意味を調べよ
+
+# (d) inode キャッシュの統計
+$ cat /proc/sys/fs/inode-state
+```
+
+### 演習 2: ページキャッシュの観察
+
+```bash
+# (a) 大きなファイルを読み込み、ページキャッシュの変化を確認
+$ free -m    # Before
+$ dd if=/dev/zero of=/tmp/testfile bs=1M count=100
+$ free -m    # After (cached が増加)
+
+# (b) dirty ページの確認
+$ cat /proc/vmstat | grep -E 'dirty|writeback'
+
+# (c) ページキャッシュの手動クリア (要 root)
+$ echo 1 > /proc/sys/vm/drop_caches   # pagecache のみ
+$ echo 2 > /proc/sys/vm/drop_caches   # dentry + inode
+$ echo 3 > /proc/sys/vm/drop_caches   # すべて
+
+# (d) vmtouch (要インストール) でファイルのキャッシュ状態を確認
+$ vmtouch /tmp/testfile
+```
+
+### 演習 3: ramfs / tmpfs の動作検証
+
+```bash
+# (a) ramfs をマウントしてファイルを作成
+$ mkdir /tmp/ramfs_test
+$ sudo mount -t ramfs ramfs /tmp/ramfs_test
+$ echo "hello ramfs" > /tmp/ramfs_test/test.txt
+$ cat /tmp/ramfs_test/test.txt
+$ df -h /tmp/ramfs_test   # サイズ表示はどうなるか?
+
+# (b) tmpfs をマウントしてサイズ制限を検証
+$ mkdir /tmp/tmpfs_test
+$ sudo mount -t tmpfs -o size=1M tmpfs /tmp/tmpfs_test
+$ dd if=/dev/zero of=/tmp/tmpfs_test/big bs=1M count=2
+# エラーが発生するか確認せよ
+
+# (c) クリーンアップ
+$ sudo umount /tmp/ramfs_test /tmp/tmpfs_test
+$ rmdir /tmp/ramfs_test /tmp/tmpfs_test
+```
+
+### 演習 4: inotify によるファイル監視
+
+以下の C プログラムを作成・実行し、別のターミナルでファイル操作を行ってイベントを観察せよ。
+
+```c title="watch_dir.c"
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/inotify.h>
+#include <unistd.h>
+#include <string.h>
+
+#define BUF_LEN (10 * (sizeof(struct inotify_event) + NAME_MAX + 1))
+
+int main(int argc, char *argv[])
+{
+    if (argc != 2) {
+        fprintf(stderr, "Usage: %s <directory>\n", argv[0]);
+        exit(1);
+    }
+
+    int ifd = inotify_init();
+    if (ifd < 0) { perror("inotify_init"); exit(1); }
+
+    int wd = inotify_add_watch(ifd, argv[1],
+                                IN_CREATE | IN_DELETE |
+                                IN_MODIFY | IN_MOVED_FROM |
+                                IN_MOVED_TO);
+    if (wd < 0) { perror("inotify_add_watch"); exit(1); }
+
+    printf("Watching %s ...\n", argv[1]);
+
+    char buf[BUF_LEN];
+    for (;;) {
+        ssize_t len = read(ifd, buf, BUF_LEN);
+        if (len <= 0) break;
+
+        for (char *ptr = buf; ptr < buf + len; ) {
+            struct inotify_event *ev = (struct inotify_event *)ptr;
+            if (ev->mask & IN_CREATE)  printf("CREATE: ");
+            if (ev->mask & IN_DELETE)  printf("DELETE: ");
+            if (ev->mask & IN_MODIFY)  printf("MODIFY: ");
+            if (ev->mask & IN_MOVED_FROM) printf("MOVED_FROM: ");
+            if (ev->mask & IN_MOVED_TO)   printf("MOVED_TO: ");
+            if (ev->len) printf("%s", ev->name);
+            printf("\n");
+            ptr += sizeof(*ev) + ev->len;
+        }
+    }
+
+    close(ifd);
+    return 0;
+}
+```
+
+```bash
+$ gcc -o watch_dir watch_dir.c
+$ ./watch_dir /tmp &
+
+# 別ターミナルで:
+$ touch /tmp/newfile.txt
+$ echo "data" >> /tmp/newfile.txt
+$ mv /tmp/newfile.txt /tmp/renamed.txt
+$ rm /tmp/renamed.txt
+```
+
+### 演習 5: overlayfs のレイヤー構造
+
+```bash
+# (a) overlayfs を手動で構成
+$ mkdir -p /tmp/overlay/{lower,upper,work,merged}
+$ echo "from lower" > /tmp/overlay/lower/file_A.txt
+$ echo "from lower" > /tmp/overlay/lower/file_B.txt
+
+$ sudo mount -t overlay overlay \
+    -o lowerdir=/tmp/overlay/lower,\
+upperdir=/tmp/overlay/upper,\
+workdir=/tmp/overlay/work \
+    /tmp/overlay/merged
+
+# (b) merged ビューを確認
+$ ls /tmp/overlay/merged/
+$ cat /tmp/overlay/merged/file_A.txt
+
+# (c) ファイルを変更して copy-up を観察
+$ echo "modified" >> /tmp/overlay/merged/file_A.txt
+$ ls /tmp/overlay/upper/    # file_A.txt が出現するか?
+$ cat /tmp/overlay/upper/file_A.txt
+
+# (d) ファイルを削除して whiteout を観察
+$ rm /tmp/overlay/merged/file_B.txt
+$ ls -la /tmp/overlay/upper/  # whiteout ファイルが存在するか?
+
+# (e) クリーンアップ
+$ sudo umount /tmp/overlay/merged
+$ rm -rf /tmp/overlay
+```
+
+### 演習 6: ソースコード読解
+
+カーネルソースコードを読み、以下の質問に答えよ。
+
+1. `fs/ramfs/inode.c` の `ramfs_get_inode()` で `mapping_set_unevictable()` が
+   呼ばれる理由を説明せよ
+2. `fs/namei.c` の `link_path_walk()` で RCU-walk が ref-walk にフォールバックする
+   具体的な条件を 3 つ挙げよ
+3. `mm/filemap.c` の `filemap_read()` で readahead が発動する条件を追跡せよ
+4. `fs/overlayfs/copy_up.c` の `ovl_copy_up_one()` がコピーする情報を列挙せよ
+
+---
+
+## 参考資料
+
+### 書籍
+
+- Robert Love, *Linux Kernel Development*, 3rd Edition — VFS とブロック I/O の概要
+- Jonathan Corbet, Alessandro Rubini, Greg Kroah-Hartman, *Linux Device Drivers*, 3rd Edition — ファイルシステム操作テーブルの解説
+- Wolfgang Mauerer, *Professional Linux Kernel Architecture* — VFS 内部の詳細な解説
+
+### カーネルドキュメント
+
+- `Documentation/filesystems/vfs.rst` — VFS の公式ドキュメント
+- `Documentation/filesystems/ramfs-rootfs-initramfs.rst` — ramfs / rootfs の解説
+- `Documentation/filesystems/overlayfs.rst` — overlayfs の詳細
+- `Documentation/filesystems/fuse.rst` — FUSE プロトコルの仕様
+- `Documentation/filesystems/locking.rst` — VFS ロック規約
+- `Documentation/mm/page_cache.rst` — ページキャッシュの解説
+- `Documentation/mm/folio.rst` — folio の設計と移行ガイド
+
+### カーネルソースコード
+
+- `fs/namei.c` — パス名解決 (namei) の実装
+- `fs/ramfs/inode.c` — ramfs の完全な実装
+- `mm/shmem.c` — tmpfs (shmem) の実装
+- `mm/filemap.c` — ページキャッシュの汎用操作 (`generic_file_read_iter` 等)
+- `fs/fuse/` — FUSE カーネルモジュール
+- `fs/overlayfs/` — overlayfs の実装
+- `block/blk-core.c` — ブロック I/O 層のコア
+
+### LWN.net 記事
+
+- *A brief history of union mounts* (LWN) — overlayfs 以前のユニオンマウント手法の歴史
+- *Filesystem in Userspace* (LWN) — FUSE の設計思想
+- *An introduction to compound pages* (LWN) — compound page と folio の背景
+- *Folio status update* (LWN) — folio API 移行の進捗
+- *Rust and the Linux VFS* (LWN) — Rust VFS 抽象化の議論
+
+### man ページ
+
+- `man 2 open`, `man 2 read`, `man 2 write` — 基本 I/O システムコール
+- `man 2 flock` — BSD ファイルロック
+- `man 2 fcntl` — POSIX / OFD ロック、リース
+- `man 7 inotify` — inotify API
+- `man 7 fanotify` — fanotify API
+- `man 5 attr` — 拡張属性
+- `man 5 acl` — POSIX ACL
+- `man 8 mount` — マウントオプション (overlayfs 含む)

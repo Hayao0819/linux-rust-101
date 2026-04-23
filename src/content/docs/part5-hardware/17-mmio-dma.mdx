@@ -1,0 +1,403 @@
+---
+title: "Ch 12b. I/O メモリと DMA — ハードウェアと通信する"
+description: MMIO, ioremap, DMA (coherent/streaming), mmap によるデバイスメモリアクセスを学ぶ
+---
+
+## この章で学ぶこと
+
+- I/O ポートと I/O メモリ (MMIO) の違いを理解する
+- `ioremap` / `devm_ioremap_resource` でレジスタにアクセスする方法を習得する
+- Coherent DMA と Streaming DMA の使い分けを把握する
+- `mmap` でユーザ空間にデバイスメモリを公開する手法を知る
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::io::mem::IoMem` (Devres 経由の MMIO アクセス)
+🟡 **開発中**: `kernel::dma::CoherentAllocation` (6.17+ — coherent DMA)
+❌ **未実装**: Streaming DMA (`dma_map_single` 相当), mmap の Rust API
+:::
+
+## 前提
+
+- [Ch 8](/part3-kernel-concepts/08-memory/) (カーネルメモリ管理) を完了している
+- [Ch 16](/part5-hardware/16-drivers/) (Platform / PCI ドライバ) を完了している
+
+## I/O ポートと I/O メモリ
+
+デバイスドライバがハードウェアと通信する方法は、歴史的に 2 つ存在する。
+
+### I/O ポート (Port I/O)
+
+x86 アーキテクチャ固有の仕組みで、通常のメモリアドレス空間とは独立した 64K の I/O アドレス空間を持つ。専用の CPU 命令 (`in` / `out`) でアクセスする。
+
+```c
+#include <linux/ioport.h>
+#include <asm/io.h>
+
+/* レガシーデバイス (例: シリアルポート 0x3F8) */
+u8 val = inb(0x3F8);       /* 8 ビット読み取り */
+outb(0x00, 0x3F8);          /* 8 ビット書き込み */
+
+u16 val16 = inw(port);     /* 16 ビット */
+u32 val32 = inl(port);     /* 32 ビット */
+```
+
+**現在はほぼ使われない。** レガシー PC デバイス (シリアルポート、PS/2 キーボード、ISA バスデバイス) のためだけに残っている。ARM などの非 x86 アーキテクチャには I/O ポートの概念自体が存在しない。
+
+### I/O メモリ (MMIO: Memory-Mapped I/O)
+
+現代のデバイスは、**デバイスのレジスタを物理メモリ空間上のアドレスにマッピング**する MMIO 方式を採用する。CPU から見ると通常のメモリアクセスと同じだが、実際にはバスを経由してデバイスのレジスタを読み書きしている。
+
+PCI デバイスの BAR (Base Address Register) や Device Tree の `reg` プロパティで指定されるアドレスが、このMMIO 領域である。
+
+| 方式 | アクセス手段 | アドレス空間 | アーキテクチャ |
+|---|---|---|---|
+| I/O ポート | `inb/outb` | 独立 (64K) | x86 のみ |
+| MMIO | `readl/writel` | 物理メモリ空間 | 全アーキテクチャ |
+
+## MMIO アクセス
+
+### ioremap によるマッピング
+
+デバイスの物理アドレスを直接ポインタでアクセスすることはできない。カーネルは仮想アドレスを使用するため、まず物理アドレスを仮想アドレスにマッピングする必要がある。
+
+```c
+#include <asm/io.h>
+
+/* 物理アドレスをカーネル仮想アドレスにマッピング */
+void __iomem *base = ioremap(phys_addr, size);
+if (!base)
+    return -ENOMEM;
+
+/* 使い終わったら解放 */
+iounmap(base);
+```
+
+`__iomem` は Sparse (静的解析ツール) 用のアノテーションである。通常のポインタと `__iomem` ポインタを混ぜて使うと警告が出る。
+
+### devm_ioremap_resource (推奨)
+
+実際のドライバでは、`devm_ioremap_resource` を使うのが推奨される。リソースの request と ioremap を一括で行い、デバイス解放時に自動的に unmap する。
+
+```c title="mmio_example.c"
+#include <linux/platform_device.h>
+#include <linux/io.h>
+
+static int my_probe(struct platform_device *pdev)
+{
+    struct resource *res;
+    void __iomem *base;
+
+    res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+    base = devm_ioremap_resource(&pdev->dev, res);
+    if (IS_ERR(base))
+        return PTR_ERR(base);
+
+    /* レジスタ読み書き */
+    u32 status = readl(base + 0x00);   /* STATUS register */
+    writel(0x1, base + 0x04);          /* CONTROL register */
+
+    dev_info(&pdev->dev, "status=0x%08x\n", status);
+    return 0;
+}
+```
+
+`devm_ioremap_resource` は以下を一括で行う:
+1. `devm_request_mem_region` — メモリ領域の排他的予約
+2. `devm_ioremap` — 仮想アドレスへのマッピング
+
+### readl/writel ファミリ
+
+| 関数 | サイズ | 用途 |
+|---|---|---|
+| `readb` / `writeb` | 8 ビット | バイト単位のレジスタ |
+| `readw` / `writew` | 16 ビット | ハーフワードレジスタ |
+| `readl` / `writel` | 32 ビット | 最も一般的 |
+| `readq` / `writeq` | 64 ビット | 64 ビットレジスタ (64 ビットアーキテクチャのみ) |
+
+これらの関数は適切なメモリバリアを含んでおり、コンパイラやCPUの最適化によるアクセス順序の変更を防ぐ。
+
+### メモリバリア
+
+MMIO レジスタへのアクセスでは、順序が重要な場合がある。例えば「CONTROL レジスタに書き込んでから STATUS レジスタを読む」順序が入れ替わると正しく動作しない。
+
+```c
+writel(cmd, base + CONTROL);
+/* readl/writel は暗黙的にバリアを含むが、
+   明示的に保証したい場合: */
+mb();   /* full memory barrier */
+status = readl(base + STATUS);
+```
+
+| バリア | 説明 |
+|---|---|
+| `mb()` | 読み書き両方のバリア |
+| `rmb()` | 読み取りバリア |
+| `wmb()` | 書き込みバリア |
+| `ioread32` / `iowrite32` | `readl`/`writel` と同等だが、I/O ポートにも対応する汎用版 |
+
+**実用上の注意**: `readl` / `writel` は ARM と x86 の両方でバリアセマンティクスを含む。明示的な `mb()` が必要になるケースはまれだが、複数デバイス間の順序保証が必要な場合などに使う。
+
+## DMA の基礎
+
+### なぜ DMA が必要か
+
+大量のデータ転送 (ネットワークパケット、ディスク I/O、音声ストリーム) で CPU が 1 バイトずつ `readl` / `writel` するのは非効率的である。**DMA (Direct Memory Access)** を使えば、デバイスが CPU を介さずにメモリとの間でデータを直接転送できる。
+
+```
+CPU なしの転送:
+  デバイス ←→ DMA コントローラ ←→ メインメモリ
+  CPU は転送中に別の処理が可能
+```
+
+### Coherent DMA vs Streaming DMA
+
+Linux DMA API には 2 つの主要な方式がある。
+
+#### Coherent DMA (一貫性 DMA)
+
+CPU とデバイスが**常に同じデータを見る**ことが保証されるバッファを確保する。ハードウェアまたはソフトウェアがキャッシュコヒーレンシを維持する。
+
+```c
+#include <linux/dma-mapping.h>
+
+dma_addr_t dma_handle;
+void *buf = dma_alloc_coherent(&pdev->dev, BUF_SIZE,
+                               &dma_handle, GFP_KERNEL);
+if (!buf)
+    return -ENOMEM;
+
+/*
+ * buf        = CPU 側仮想アドレス (カーネルが使う)
+ * dma_handle = DMA アドレス (デバイスに渡す)
+ */
+
+/* デバイスのレジスタに DMA アドレスを書き込む */
+writel(lower_32_bits(dma_handle), base + DMA_ADDR_LOW);
+writel(upper_32_bits(dma_handle), base + DMA_ADDR_HIGH);
+
+/* 使い終わったら解放 */
+dma_free_coherent(&pdev->dev, BUF_SIZE, buf, dma_handle);
+```
+
+**特徴**: セットアップが簡単だが、キャッシュコヒーレンシのオーバーヘッドがある。コマンドキューやデスクリプタリングなど、頻繁に CPU とデバイスの両方がアクセスするバッファに適する。
+
+#### Streaming DMA (ストリーミング DMA)
+
+既存のカーネルバッファを一時的に DMA 用にマッピングする。高速だが、**所有権の概念**を守る必要がある。
+
+```c
+#include <linux/dma-mapping.h>
+
+/* 既存の kbuf を DMA マッピング */
+dma_addr_t addr = dma_map_single(&pdev->dev, kbuf, len, DMA_TO_DEVICE);
+if (dma_mapping_error(&pdev->dev, addr))
+    return -ENOMEM;
+
+/*
+ * ここからデバイスが所有者。
+ * CPU は kbuf に触ってはいけない。
+ */
+
+/* デバイスに addr を書き込んで転送を開始 */
+writel(lower_32_bits(addr), base + DMA_ADDR);
+writel(len, base + DMA_LEN);
+writel(DMA_START, base + DMA_CTRL);
+
+/* ... 転送完了 (割り込みで通知されるのが一般的) ... */
+
+/* マッピング解除: CPU に所有権を返す */
+dma_unmap_single(&pdev->dev, addr, len, DMA_TO_DEVICE);
+```
+
+### DMA 方向
+
+| 定数 | 意味 | 用途例 |
+|---|---|---|
+| `DMA_TO_DEVICE` | メモリ → デバイス | ネットワーク送信、ディスク書き込み |
+| `DMA_FROM_DEVICE` | デバイス → メモリ | ネットワーク受信、ディスク読み取り |
+| `DMA_BIDIRECTIONAL` | 双方向 | デバイスが読み書き両方する場合 |
+
+方向を間違えるとキャッシュの不整合が起き、データ化けの原因になる。
+
+### Streaming DMA の所有権ルール
+
+Streaming DMA では「誰がバッファを使えるか」を厳密に管理する:
+
+1. `dma_map_single` → デバイスが所有者、CPU はアクセス禁止
+2. 転送中に CPU がデータを見たい場合 → `dma_sync_single_for_cpu` で一時的に取り戻す
+3. 再びデバイスに渡す → `dma_sync_single_for_device`
+4. `dma_unmap_single` → CPU に所有権を完全に返す
+
+```c
+/* 転送中にCPUがデータを覗きたい場合 */
+dma_sync_single_for_cpu(&pdev->dev, addr, len, DMA_FROM_DEVICE);
+/* ここで kbuf を読める */
+dma_sync_single_for_device(&pdev->dev, addr, len, DMA_FROM_DEVICE);
+/* デバイスに所有権を戻す */
+```
+
+### IOMMU の概念
+
+物理メモリアドレスをそのまま DMA アドレスとして使うと、デバイスがシステムの任意のメモリにアクセスできてしまう。**IOMMU (I/O Memory Management Unit)** は、デバイス側のアドレス変換テーブルを管理し、以下を実現する:
+
+- **メモリ保護**: デバイスがアクセスできる領域を制限
+- **アドレス変換**: 物理的に離散したメモリを連続した DMA アドレスとして見せる (scatter-gather)
+- **仮想化対応**: ゲスト OS のデバイスパススルー
+
+Linux では `dma_map_*` API が内部で IOMMU を透過的に利用する。ドライバ作者が IOMMU を直接操作する必要は通常ない。
+
+## mmap: ユーザ空間にデバイスメモリを公開
+
+### なぜ mmap が必要か
+
+フレームバッファやビデオキャプチャデバイスなど、大量のデータをユーザ空間に渡す場合、`read` / `copy_to_user` では毎回データコピーが発生する。`mmap` を使えば、ユーザ空間のプロセスがデバイスメモリ (または DMA バッファ) に直接アクセスでき、コピーが不要になる。
+
+### file_operations の .mmap
+
+```c title="mmap_example.c"
+static int my_mmap(struct file *file, struct vm_area_struct *vma)
+{
+    unsigned long size = vma->vm_end - vma->vm_start;
+    unsigned long pfn = phys_addr >> PAGE_SHIFT;
+
+    /* キャッシュ無効化 (デバイスメモリに必要) */
+    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
+
+    if (remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot))
+        return -EAGAIN;
+
+    return 0;
+}
+
+static const struct file_operations my_fops = {
+    .owner = THIS_MODULE,
+    .mmap  = my_mmap,
+};
+```
+
+### vm_area_struct の概要
+
+`mmap` のコールバックに渡される `struct vm_area_struct` (VMA) は、ユーザ空間のメモリ領域を表す:
+
+| フィールド | 説明 |
+|---|---|
+| `vm_start` | マッピング開始の仮想アドレス |
+| `vm_end` | マッピング終了の仮想アドレス |
+| `vm_pgoff` | ページオフセット (`mmap` の offset 引数 / PAGE_SIZE) |
+| `vm_page_prot` | ページ保護属性 |
+| `vm_flags` | VM_READ, VM_WRITE, VM_SHARED など |
+
+### remap_pfn_range
+
+`remap_pfn_range` は、物理ページフレーム番号 (PFN) をユーザ空間の仮想アドレスにマッピングする。デバイスの物理メモリや DMA バッファをユーザ空間から直接アクセス可能にする。
+
+```c
+int remap_pfn_range(struct vm_area_struct *vma,
+                    unsigned long addr,      /* 仮想アドレス開始 */
+                    unsigned long pfn,       /* 物理ページフレーム番号 */
+                    unsigned long size,      /* マッピングサイズ */
+                    pgprot_t prot);          /* ページ保護属性 */
+```
+
+ユーザ空間からの使い方:
+
+```c title="test_mmap.c"
+#include <sys/mman.h>
+#include <fcntl.h>
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void)
+{
+    int fd = open("/dev/mydev", O_RDWR);
+    volatile uint32_t *regs = mmap(NULL, 4096, PROT_READ | PROT_WRITE,
+                                   MAP_SHARED, fd, 0);
+    if (regs == MAP_FAILED) {
+        perror("mmap");
+        return 1;
+    }
+
+    printf("status = 0x%08x\n", regs[0]);  /* offset 0x00 */
+    regs[1] = 0x1;                          /* offset 0x04 */
+
+    munmap((void *)regs, 4096);
+    close(fd);
+    return 0;
+}
+```
+
+## Rust 側の状況
+
+### ioremap: Devres 経由
+
+Rust ドライバでの MMIO アクセスは、`Devres<IoMem>` (device-managed I/O メモリ) 経由で行う。C の `devm_ioremap_resource` に相当する。
+
+```rust
+use kernel::io::mem::IoMem;
+
+// probe 内で IoMem を取得
+// Devres<T> により、デバイス解放時に自動 unmap される
+```
+
+型システムにより、`__iomem` アノテーションに頼らずとも、通常のメモリポインタと I/O メモリポインタを混同することが型レベルで防止される。
+
+### DMA from Rust (6.17+)
+
+Linux 6.17 以降、Rust からの DMA 基本サポートが導入されつつある。`kernel::dma` モジュールは coherent DMA バッファの確保・解放を安全に行う API を提供する。
+
+```rust
+use kernel::dma::CoherentAllocation;
+
+// CoherentAllocation<T> は dma_alloc_coherent のラッパー
+// Drop 時に dma_free_coherent が自動呼び出しされる
+```
+
+主な特徴:
+
+- **RAII**: `Drop` トレイトにより、バッファの解放忘れを防止する
+- **型安全**: DMA アドレスと CPU 仮想アドレスが異なる型で表現される
+- **Streaming DMA**: 2026 年時点ではまだ限定的なサポート。今後の拡充が予定されている
+
+### C ⇔ Rust 対比
+
+| C | Rust |
+|---|---|
+| `devm_ioremap_resource()` | `Devres<IoMem>` |
+| `readl(base + offset)` | `iomem.readl(offset)` |
+| `dma_alloc_coherent()` | `CoherentAllocation::alloc()` |
+| `dma_free_coherent()` | `Drop` で自動解放 |
+| `__iomem` アノテーション | 型システムで強制 |
+
+## よくある罠
+
+1. **`ioremap` したアドレスを通常のポインタとしてアクセスする** — `readl` / `writel` を使わず `*(u32 *)base` のようにアクセスすると、コンパイラの最適化やキャッシュの問題で正しく動作しない。
+2. **DMA アドレスと仮想アドレスを取り違える** — `dma_handle` をデバイスに、`buf` を CPU コードに使う。逆にするとカーネルパニックやデータ化けが起きる。
+3. **DMA の方向を間違える** — `DMA_TO_DEVICE` と `DMA_FROM_DEVICE` を逆にするとキャッシュ不整合の原因になる。
+4. **mmap でキャッシュを無効化し忘れる** — デバイスメモリを mmap する場合、`pgprot_noncached` を設定しないとキャッシュされた古いデータが見える。
+5. **`dma_mapping_error` のチェックを省略する** — マッピングが失敗した場合のアドレスは不定であり、そのまま使うとシステムが破壊される。
+6. **`devm_ioremap_resource` ではなく `ioremap` を使い、`iounmap` を忘れる** — device-managed API を使えばリーク防止になる。
+
+## 章末演習
+
+1. QEMU の `-device pci-testdev` を使い、BAR 0 の MMIO 領域を `devm_ioremap_resource` でマッピングしてレジスタを読み書きするドライバを作成せよ。
+
+2. `dma_alloc_coherent` で 4KB のバッファを確保し、CPU 側とデバイス側の両方のアドレスをログ出力するドライバを書け。IOMMU の有無でアドレスが変わることを確認せよ。
+
+3. (発展) 上記の DMA バッファを `mmap` でユーザ空間に公開し、ユーザランドプログラムから直接読み書きできることを確認せよ。
+
+4. (発展) Streaming DMA を使い、`dma_map_single` → 転送 → `dma_unmap_single` の流れを実装せよ。`dma_sync_single_for_cpu` の効果を ftrace で観察せよ。
+
+---
+
+次の章 → [Ch 18. 割り込み・タイマー・workqueue](/part5-hardware/18-irq-timer-wq/)
+
+## 参考資料
+
+- [DMA API HOWTO (kernel.org)](https://docs.kernel.org/core-api/dma-api-howto.html)
+- [DMA API (kernel.org)](https://docs.kernel.org/core-api/dma-api.html)
+- [I/O Memory (LDD3 Ch.9)](https://lwn.net/Kernel/LDD3/)
+- [Device Memory Mapping (kernel.org)](https://docs.kernel.org/driver-api/device-io.html)
+- [kernel::dma (rustdoc)](https://rust.docs.kernel.org/kernel/dma/)
+- [Ch 8. カーネルメモリ管理](/part3-kernel-concepts/08-memory/) — メモリの基礎
+- [Ch 16. Platform Driver と PCI Driver](/part5-hardware/16-drivers/) — ドライバの骨格
+- [Ch 18. 割り込み・タイマー・workqueue](/part5-hardware/18-irq-timer-wq/) — DMA 完了割り込み

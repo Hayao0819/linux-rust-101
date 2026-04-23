@@ -1,0 +1,38 @@
+{
+  "globs": ["src/content/docs/**/*.{md,mdx}"],
+  "ignores": ["node_modules/**", "dist/**", ".astro/**"],
+  "frontMatter": "(^---\\s*$[^]*?^---\\s*$)(\\r\\n|\\r|\\n|$)",
+  "gitignore": true,
+  "config": {
+    "default": true,
+    "MD003": { "style": "atx" },
+    "MD013": false,
+    "MD024": { "siblings_only": true },
+    "MD033": {
+      "allowed_elements": [
+        "br",
+        "details",
+        "summary",
+        "sup",
+        "sub",
+        "kbd",
+        "img",
+        "Aside",
+        "Badge",
+        "Card",
+        "CardGrid",
+        "Code",
+        "FileTree",
+        "Icon",
+        "LinkCard",
+        "Steps",
+        "Tabs",
+        "TabItem"
+      ]
+    },
+    "MD041": false,
+    "MD046": { "style": "fenced" },
+    "MD049": { "style": "asterisk" },
+    "MD050": { "style": "asterisk" }
+  }
+}

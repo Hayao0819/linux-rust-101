@@ -1,0 +1,1990 @@
+---
+title: "ネットワークスタック詳解"
+description: "sk_buff, net_device, NAPI, Netfilter, TC, ソケット層 — カーネルネットワーキングの全体像"
+---
+
+## この章で学ぶこと
+
+- パケット受信パスの全体フロー (NIC → ソケット) を追跡できる
+- `sk_buff` の 4 ポインタモデルとヘッダー操作関数を完全に理解する
+- `struct net_device` と `net_device_ops` によるドライバインターフェースを把握する
+- NAPI の割り込み抑制メカニズムと budget 制御を説明できる
+- Netfilter の 5 つのフックポイントとコネクション追跡を理解する
+- TC (Traffic Control) の qdisc / class / filter 階層を把握する
+- ソケット層の二重構造 (`struct socket` vs `struct sock`) を理解する
+- GRO / GSO / TSO によるオフロード機構を説明できる
+- ネットワーク名前空間による分離の仕組みを理解する
+- Rust によるネットワークスタック抽象の現状と限界を認識する
+
+:::note[Rust API ステータス]
+🟢 **安定**: `kernel::net::phy` (PHY ドライバ — 3 件が upstream 済み)
+❌ **未実装**: `net_device`, `sk_buff`, NAPI, Netfilter, TC, socket 層の Rust バインディング
+:::
+
+## 前提
+
+- [Ch 8](/part3-kernel-concepts/08-memory/) (カーネルメモリ管理) を完了している
+- [Ch 18](/part5-hardware/18-irq-timer-wq/) (割り込み・タイマー・workqueue) を完了している
+- [Ch 28](/part8-practice/28-rust-frontiers/) のネットワーク概要を読んでいると望ましい
+
+---
+
+## ネットワークスタックの全体像
+
+Linux のネットワークスタックは、物理的な NIC ハードウェアからユーザ空間のソケットまでを
+縦断する巨大なサブシステムである。まず全体の構成を俯瞰してから、各層を掘り下げていく。
+
+```
+┌──────────────────────────────────────────────────────────┐
+│                    ユーザ空間                              │
+│             socket(), send(), recv(), ...                 │
+├──────────────────────────────────────────────────────────┤
+│  ソケット層  (struct socket / struct sock)                 │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │  proto_ops (socket操作)  │  struct proto (プロトコル) │  │
+│  └────────────────────────────────────────────────────┘  │
+├──────────────────────────────────────────────────────────┤
+│  トランスポート層  (TCP / UDP / SCTP / ...)               │
+├──────────────────────────────────────────────────────────┤
+│  ネットワーク層  (IPv4 / IPv6 / ルーティング)              │
+├──────────────────────────────────────────────────────────┤
+│  Netfilter  (NF_INET_PRE_ROUTING → ... → POST_ROUTING)  │
+├──────────────────────────────────────────────────────────┤
+│  TC (Traffic Control)  — qdisc / class / filter          │
+├──────────────────────────────────────────────────────────┤
+│  デバイス層  (struct net_device / net_device_ops)          │
+│  ┌──────────────────────────────────────────────────┐    │
+│  │  GRO / GSO / TSO   │   NAPI   │   ethtool        │    │
+│  └──────────────────────────────────────────────────┘    │
+├──────────────────────────────────────────────────────────┤
+│  NIC ドライバ  (リングバッファ / DMA / 割り込み)           │
+├──────────────────────────────────────────────────────────┤
+│  ハードウェア  (NIC = MAC + PHY)                          │
+└──────────────────────────────────────────────────────────┘
+```
+
+この章では下から上に向かって (受信パスの順序で) 各層を解説する。
+
+---
+
+## 1. パケット受信パス — NIC からソケットまで
+
+パケットが NIC に到達してからアプリケーションに届くまでの全経路を追跡する。
+これはカーネルネットワーキングの最も基本的なフローであり、後続のすべてのセクションの基盤となる。
+
+### 受信パスの全体フロー
+
+```
+                         パケット受信パス (Rx Path)
+
+ ┌─────────┐
+ │   NIC   │  1. パケットが物理層に到達
+ │ (PHY)   │     PHY がアナログ信号をデジタルフレームに変換
+ └────┬────┘
+      │
+      ▼
+ ┌─────────┐
+ │   NIC   │  2. DMA でリングバッファに書き込み
+ │ (MAC)   │     NIC が事前に確保されたバッファにパケットデータを転送
+ └────┬────┘     ディスクリプタリングの該当エントリを「完了」に更新
+      │
+      ▼
+ ┌─────────┐
+ │   IRQ   │  3. ハードウェア割り込み発生
+ │ Handler │     NIC が CPU に MSI/MSI-X 割り込みを送信
+ │(top half)│    ドライバの IRQ ハンドラが起動
+ └────┬────┘     → napi_schedule() を呼び出し
+      │          → NIC の割り込みを無効化 (これ以上の IRQ を抑制)
+      │          → IRQ_HANDLED を返す
+      ▼
+ ┌─────────┐
+ │  NAPI   │  4. softirq (NET_RX_SOFTIRQ) コンテキストで NAPI poll 実行
+ │  poll   │     ドライバの poll 関数が呼ばれる
+ │(bottom  │     → リングバッファからパケットを取り出す
+ │  half)  │     → sk_buff (skb) を割り当て・構築する
+ └────┬────┘     → skb にメタデータ (プロトコル, デバイス等) を設定
+      │          → napi_gro_receive() または netif_receive_skb() に渡す
+      │          → budget 消化後 napi_complete_done() で割り込みを再有効化
+      ▼
+ ┌─────────┐
+ │  GRO    │  5. Generic Receive Offload
+ │         │     同一フローの小さなパケットを集約して 1 つの大きな skb にする
+ └────┬────┘     (TCP の場合、連続するセグメントをマージ)
+      │
+      ▼
+ ┌─────────┐
+ │netif_   │  6. netif_receive_skb()
+ │receive_ │     パケットタイプ (ETH_P_IP, ETH_P_IPV6 等) に基づき
+ │  skb()  │     適切なプロトコルハンドラにディスパッチ
+ └────┬────┘     ※ tcpdump (AF_PACKET) はここでパケットのコピーを受け取る
+      │
+      ▼
+ ┌─────────┐
+ │Netfilter│  7. NF_INET_PRE_ROUTING フック
+ │PREROUTING│    DNAT やコネクション追跡の入り口
+ └────┬────┘
+      │
+      ▼
+ ┌─────────┐
+ │  IP層   │  8. ルーティング判断
+ │ Routing │     宛先 IP を見て自ホスト宛か転送かを判断
+ │Decision │     → 自ホスト宛: ip_local_deliver() → NF_INET_LOCAL_IN
+ └────┬────┘     → 転送: ip_forward() → NF_INET_FORWARD → POST_ROUTING
+      │
+      ▼ (自ホスト宛の場合)
+ ┌─────────┐
+ │Transport│  9. トランスポート層 (TCP/UDP)
+ │  Layer  │     TCP: tcp_v4_rcv() → TCB 検索 → 受信キューに追加
+ └────┬────┘     UDP: udp_rcv() → ソケット検索 → 受信キューに追加
+      │
+      ▼
+ ┌─────────┐
+ │ Socket  │  10. ソケット受信キュー
+ │  Queue  │      sk->sk_receive_queue に skb を繋ぐ
+ └────┬────┘      sk_data_ready() でブロック中のプロセスを起こす
+      │
+      ▼
+ ┌─────────┐
+ │  User   │  11. アプリケーション
+ │  Space  │      recv() / read() で skb からデータをコピー
+ └─────────┘
+```
+
+### コード上の呼び出し連鎖 (IPv4 TCP の場合)
+
+上図をカーネル関数レベルで追跡すると以下のようになる。
+
+```c
+/* ドライバの IRQ ハンドラ */
+my_irq_handler()
+    → napi_schedule(&priv->napi)
+
+/* softirq コンテキスト */
+net_rx_action()                          /* net/core/dev.c */
+    → napi_poll()
+        → driver_poll()                  /* ドライバの poll 関数 */
+            → napi_gro_receive()         /* GRO 処理 */
+                → netif_receive_skb()    /* net/core/dev.c */
+                    → __netif_receive_skb_core()
+                        → deliver_skb() → ip_rcv()          /* IPv4 */
+                            → NF_HOOK(NFPROTO_IPV4, NF_INET_PRE_ROUTING, ...)
+                            → ip_rcv_finish()
+                                → ip_route_input()          /* ルーティング */
+                                → dst_input()
+                                    → ip_local_deliver()     /* 自ホスト宛 */
+                                        → NF_HOOK(... NF_INET_LOCAL_IN ...)
+                                        → ip_local_deliver_finish()
+                                            → tcp_v4_rcv()   /* TCP */
+                                                → tcp_v4_do_rcv()
+                                                    → tcp_rcv_state_process()
+                                                    → sk->sk_data_ready()
+```
+
+ここで重要なのは、パケット処理の大半が **softirq コンテキスト** で行われるという点である。
+つまり、sleep は不可能であり、mutex も取得できない。
+これは [Ch 18](/part5-hardware/18-irq-timer-wq/) で学んだ割込コンテキストの制約と同じである。
+
+---
+
+## 2. sk_buff (skb) — カーネル内パケット表現
+
+`struct sk_buff` はカーネルネットワークスタックの **中心的データ構造** である。
+ネットワークスタック内を移動するパケットはすべて skb として表現される。
+
+skb の設計は以下の要件を同時に満たすことを目指している。
+
+- プロトコル階層の各層がヘッダーを効率的に追加・除去できること
+- ゼロコピー (データの不要なコピーを避ける) を実現すること
+- 参照カウントによる安全な共有が可能なこと
+- フラグメント化されたデータ (paged data) を透過的に扱えること
+
+### 2.1 4 ポインタモデル
+
+skb は 4 つのポインタでバッファ領域を管理する。
+
+```
+          sk_buff の 4 ポインタモデル
+
+    head                    end
+      │                      │
+      ▼                      ▼
+      ┌──────────────────────────────────────────────┐
+      │  headroom  │  data region  │  tailroom       │
+      └──────────────────────────────────────────────┘
+                   ▲               ▲
+                   │               │
+                 data            tail
+
+
+    head:  バッファの物理的な先頭。skb_reserve() で headroom を確保した後も変わらない
+    data:  現在のパケットデータの先頭。skb_push()/skb_pull() で移動する
+    tail:  現在のパケットデータの末尾。skb_put() で移動する
+    end:   バッファの物理的な末尾。変わらない
+
+    headroom = data - head    (ヘッダー追加用の予備領域)
+    data_len = tail - data    (実際のパケットデータ長)
+    tailroom = end - tail     (データ追加用の予備領域)
+```
+
+### 2.2 パケット構築過程 — ヘッダー操作の実例
+
+送信時のパケット構築過程を追跡すると、各関数の役割が明確になる。
+
+```
+  1. 初期状態: alloc_skb(size, GFP_KERNEL) 直後
+     head                                         end
+       │                                           │
+       ▼                                           ▼
+       ┌───────────────────────────────────────────┐
+       │                 空き領域                    │
+       └───────────────────────────────────────────┘
+       ▲
+       │
+     data = tail  (データなし)
+
+
+  2. skb_reserve(skb, header_len): headroom を確保
+     head                                         end
+       │                                           │
+       ▼                                           ▼
+       ┌──────────┬────────────────────────────────┐
+       │ headroom │          空き領域               │
+       └──────────┴────────────────────────────────┘
+                  ▲
+                  │
+                data = tail  (データなし、ポインタが右に移動)
+
+
+  3. skb_put(skb, payload_len): ペイロードを追加 (tail を後方に移動)
+     head                                         end
+       │                                           │
+       ▼                                           ▼
+       ┌──────────┬──────────────────┬─────────────┐
+       │ headroom │   payload data   │  tailroom   │
+       └──────────┴──────────────────┴─────────────┘
+                  ▲                  ▲
+                  │                  │
+                data               tail
+
+
+  4. skb_push(skb, udp_hdr_len): UDP ヘッダーを先頭に追加 (data を前方に移動)
+     head                                         end
+       │                                           │
+       ▼                                           ▼
+       ┌──────┬────┬─────────────────┬─────────────┐
+       │ room │UDP │   payload data  │  tailroom   │
+       └──────┴────┴─────────────────┴─────────────┘
+              ▲                      ▲
+              │                      │
+            data                   tail
+
+
+  5. skb_push(skb, ip_hdr_len): IP ヘッダーを追加
+     head                                         end
+       │                                           │
+       ▼                                           ▼
+       ┌──┬────┬────┬────────────────┬─────────────┐
+       │rm│ IP │UDP │ payload data   │  tailroom   │
+       └──┴────┴────┴────────────────┴─────────────┘
+          ▲                          ▲
+          │                          │
+        data                       tail
+
+
+  6. skb_push(skb, eth_hdr_len): Ethernet ヘッダーを追加
+     head                                         end
+       │                                           │
+       ▼                                           ▼
+       ┌──────┬────┬────┬────────────┬─────────────┐
+       │ ETH  │ IP │UDP │  payload   │  tailroom   │
+       └──────┴────┴────┴────────────┴─────────────┘
+       ▲                             ▲
+       │                             │
+     data                          tail
+```
+
+受信時は逆方向に `skb_pull()` を繰り返すことで、各層がヘッダーを剥がしていく。
+
+### 2.3 ヘッダー操作関数
+
+```c
+#include <linux/skbuff.h>
+
+/* headroom を確保 (data と tail を後方に移動) */
+/* パケット構築の最初に呼び、後で skb_push() する分の空間を作る */
+void skb_reserve(struct sk_buff *skb, int len);
+
+/* tail を後方に移動してデータ領域を拡張し、旧 tail を返す */
+/* ペイロードを末尾に追加する際に使用する */
+void *skb_put(struct sk_buff *skb, unsigned int len);
+
+/* data を前方に移動してヘッダー領域を拡張し、新 data を返す */
+/* プロトコルヘッダーを先頭に追加する際に使用する */
+void *skb_push(struct sk_buff *skb, unsigned int len);
+
+/* data を後方に移動してヘッダーを除去し、新 data を返す */
+/* 受信時にプロトコルヘッダーを剥がす際に使用する */
+void *skb_pull(struct sk_buff *skb, unsigned int len);
+```
+
+各関数の安全性チェック:
+
+| 関数 | 不正使用時 | チェック内容 |
+|---|---|---|
+| `skb_put()` | tail が end を超える | `BUG_ON(skb->tail > skb->end)` |
+| `skb_push()` | data が head を下回る | `BUG_ON(skb->data < skb->head)` |
+| `skb_pull()` | 引く量が data_len を超える | len > skb->len のチェック |
+
+### 2.4 skb_clone() vs skb_copy()
+
+パケットを複数のパスで処理する必要がある場合 (例: tcpdump + 通常処理)、
+skb のコピーが必要になる。しかし完全なコピーはコストが高い。
+
+```
+  skb_clone() — 軽量コピー (参照の共有)
+  ┌──────────────┐      ┌──────────────┐
+  │  skb (元)    │      │  skb (clone)  │
+  │  refcnt = 2  │      │  refcnt = 2   │
+  │  data ──────────┐   │  data ──────────┐
+  │  ...         │  │   │  ...          │  │
+  └──────────────┘  │   └──────────────┘  │
+                    │                     │
+                    ▼                     ▼
+               ┌────────────────────────────┐
+               │     共有されたデータバッファ   │  ← dataref カウントで管理
+               │     (パケットデータ本体)      │
+               └────────────────────────────┘
+
+  ・skb メタデータ (struct sk_buff) のみコピー
+  ・データバッファは共有 (dataref をインクリメント)
+  ・片方の skb のメタデータ変更は他方に影響しない
+  ・データバッファの変更は両方に影響する (書き込み時は注意)
+  ・非常に高速 (データコピーなし)
+
+
+  skb_copy() — 完全コピー (独立したバッファ)
+  ┌──────────────┐      ┌──────────────┐
+  │  skb (元)    │      │  skb (copy)   │
+  │  data ─────┐ │      │  data ─────┐  │
+  │  ...       │ │      │  ...       │  │
+  └────────────┘ │      └────────────┘  │
+                 │                      │
+                 ▼                      ▼
+         ┌──────────────┐      ┌──────────────┐
+         │   バッファ A  │      │  バッファ B   │  ← 完全に独立
+         │  (元データ)   │      │ (コピーデータ) │
+         └──────────────┘      └──────────────┘
+
+  ・skb メタデータもデータバッファも完全にコピー
+  ・互いに完全に独立
+  ・コストが高い (全データのメモリコピーが発生)
+  ・データを変更する必要がある場合に使用
+```
+
+```c
+/* 軽量コピー — メタデータのみ複製、データバッファは共有 */
+struct sk_buff *skb_clone(struct sk_buff *skb, gfp_t gfp_mask);
+
+/* 完全コピー — メタデータもデータも独立した複製 */
+struct sk_buff *skb_copy(const struct sk_buff *skb, gfp_t gfp_mask);
+
+/* skb_clone() の後にデータを変更したい場合: 書き込み可能なコピーを確保 */
+/* 共有されていればコピーを作り、共有されていなければ何もしない */
+struct sk_buff *skb_cow(struct sk_buff *skb, unsigned int headroom);
+```
+
+使い分けの原則:
+
+| 場面 | 使用する関数 |
+|---|---|
+| パケットを読むだけ (tcpdump 等) | `skb_clone()` |
+| ヘッダーを書き換える (NAT 等) | `skb_cow()` (必要時のみコピー) |
+| パケット全体を変更する | `skb_copy()` |
+
+### 2.5 線形データと paged データ
+
+sk_buff は 2 種類のデータ格納方式を持つ。
+
+```
+  sk_buff のデータ構造
+
+  ┌─────────────────────────────────────────────────────┐
+  │                  struct sk_buff                      │
+  │  head, data, tail, end  →  線形データ領域             │
+  │  data_len               →  paged データの長さ         │
+  │  len                    →  全データ長 (線形+paged)     │
+  └───────────────────┬─────────────────────────────────┘
+                      │
+                      ▼
+  ┌─────────────────────────────────────────────────────┐
+  │              skb_shared_info                         │
+  │  (skb->end の直後に配置される)                         │
+  │                                                     │
+  │  nr_frags:   paged フラグメントの数                    │
+  │  frags[]:    skb_frag_t の配列                        │
+  │    frags[0]: { page, offset, size }                  │
+  │    frags[1]: { page, offset, size }                  │
+  │    ...                                               │
+  │  frag_list:  skb のチェーン (フラグメント化用)          │
+  └─────────────────────────────────────────────────────┘
+
+  ┌──────────────────┐  ┌──────────────────┐
+  │  Page (frags[0])  │  │  Page (frags[1])  │
+  │  offset ──► data  │  │  offset ──► data  │
+  │         size bytes │  │         size bytes │
+  └──────────────────┘  └──────────────────┘
+```
+
+**線形データ** (`head` ~ `end`): プロトコルヘッダーなど、頻繁にアクセスされる小さなデータ。
+`skb->data` で直接アクセスできる。
+
+**paged データ** (`skb_shinfo(skb)->frags[]`): ペイロードの大部分。
+ページ参照 (`struct page *`) とオフセットで管理される。
+ゼロコピー受信 (NIC が DMA でページに直接書き込む) を実現するための仕組みである。
+
+```c
+/* skb_shared_info へのアクセスマクロ */
+#define skb_shinfo(skb)  ((struct skb_shared_info *)(skb_end_pointer(skb)))
+
+/* paged データを含む全データ長 */
+unsigned int total_len = skb->len;          /* 線形 + paged */
+unsigned int linear_len = skb_headlen(skb); /* 線形データのみ */
+unsigned int paged_len = skb->data_len;     /* paged データのみ */
+
+/* paged データを線形化する (パフォーマンスに注意) */
+int err = skb_linearize(skb);  /* 全 paged データを線形領域にコピー */
+```
+
+paged データを直接操作する必要がある場合は `skb_frag_page()`, `skb_frag_off()`, `skb_frag_size()` を使う。
+ただし、可能な限り `skb_linearize()` や `skb_copy_bits()` などの
+高レベル API を使うべきである。
+
+---
+
+## 3. struct net_device — ネットワークインターフェース
+
+`struct net_device` は `eth0`, `wlan0`, `lo` といったネットワークインターフェースを表現する
+カーネル内の構造体である。約 200 のフィールドを持ち、`task_struct` に次ぐ巨大な構造体の一つである。
+
+### 3.1 主要フィールド
+
+```c
+struct net_device {
+    char                    name[IFNAMSIZ];     /* インターフェース名 (eth0 等) */
+    int                     ifindex;            /* インターフェース番号 */
+    unsigned int            flags;              /* IFF_UP, IFF_BROADCAST 等 */
+    unsigned int            mtu;                /* Maximum Transmission Unit */
+    unsigned char           addr_len;           /* ハードウェアアドレス長 */
+    unsigned char           dev_addr[MAX_ADDR_LEN]; /* MAC アドレス */
+
+    const struct net_device_ops  *netdev_ops;   /* ドライバ操作テーブル */
+    const struct ethtool_ops     *ethtool_ops;  /* ethtool 操作テーブル */
+
+    struct netdev_rx_queue  *_rx;               /* 受信キュー配列 */
+    struct netdev_queue     *_tx;               /* 送信キュー配列 */
+    unsigned int            num_rx_queues;      /* 受信キュー数 */
+    unsigned int            num_tx_queues;      /* 送信キュー数 */
+
+    struct net              *nd_net;            /* 所属するネットワーク名前空間 */
+    /* ... 他にも多数のフィールド */
+};
+```
+
+### 3.2 net_device_ops — ドライバが実装する操作テーブル
+
+ネットワークドライバは `net_device_ops` の関数ポインタテーブルを実装する。
+VFS の `file_operations` と同じパターンである。
+
+```c
+struct net_device_ops {
+    /* インターフェースの起動 (ip link set eth0 up) */
+    int  (*ndo_open)(struct net_device *dev);
+
+    /* インターフェースの停止 (ip link set eth0 down) */
+    int  (*ndo_stop)(struct net_device *dev);
+
+    /* パケット送信 — ドライバの最重要コールバック */
+    netdev_tx_t (*ndo_start_xmit)(struct sk_buff *skb,
+                                  struct net_device *dev);
+
+    /* MAC アドレスの変更 */
+    int  (*ndo_set_mac_address)(struct net_device *dev, void *addr);
+
+    /* MTU の変更 */
+    int  (*ndo_change_mtu)(struct net_device *dev, int new_mtu);
+
+    /* 統計情報の取得 */
+    void (*ndo_get_stats64)(struct net_device *dev,
+                            struct rtnl_link_stats64 *stats);
+
+    /* VLAN の追加/削除 */
+    int  (*ndo_vlan_rx_add_vid)(struct net_device *dev,
+                                __be16 proto, u16 vid);
+    int  (*ndo_vlan_rx_kill_vid)(struct net_device *dev,
+                                 __be16 proto, u16 vid);
+
+    /* ... 他にも約 50 のコールバック */
+};
+```
+
+### 3.3 最小限の NIC ドライバ例 (C)
+
+```c title="simple_nic.c"
+#include <linux/module.h>
+#include <linux/netdevice.h>
+#include <linux/etherdevice.h>
+
+struct my_nic_priv {
+    struct napi_struct napi;
+    /* ドライバ固有のデータ */
+};
+
+static int my_nic_open(struct net_device *dev)
+{
+    struct my_nic_priv *priv = netdev_priv(dev);
+
+    /* NAPI を有効化 */
+    napi_enable(&priv->napi);
+
+    /* 送信キューを開始 */
+    netif_start_queue(dev);
+
+    /* ハードウェアの割り込みを有効化 */
+    /* my_hw_enable_irq(priv); */
+
+    return 0;
+}
+
+static int my_nic_stop(struct net_device *dev)
+{
+    struct my_nic_priv *priv = netdev_priv(dev);
+
+    /* 送信キューを停止 */
+    netif_stop_queue(dev);
+
+    /* NAPI を無効化 */
+    napi_disable(&priv->napi);
+
+    /* ハードウェアの割り込みを無効化 */
+    /* my_hw_disable_irq(priv); */
+
+    return 0;
+}
+
+static netdev_tx_t my_nic_start_xmit(struct sk_buff *skb,
+                                      struct net_device *dev)
+{
+    struct my_nic_priv *priv = netdev_priv(dev);
+
+    /* リングバッファに空きがなければ停止 */
+    if (/* ring is full */) {
+        netif_stop_queue(dev);  /* カーネルに「これ以上送るな」と通知 */
+        return NETDEV_TX_BUSY;
+    }
+
+    /* DMA マッピングとハードウェアへの送信指示 */
+    /* ... */
+
+    /* 統計情報の更新 */
+    dev->stats.tx_packets++;
+    dev->stats.tx_bytes += skb->len;
+
+    /* skb はドライバが責任を持って解放する */
+    dev_kfree_skb(skb);
+
+    return NETDEV_TX_OK;
+}
+
+static const struct net_device_ops my_nic_ops = {
+    .ndo_open       = my_nic_open,
+    .ndo_stop       = my_nic_stop,
+    .ndo_start_xmit = my_nic_start_xmit,
+};
+
+static int my_nic_probe(struct pci_dev *pdev,
+                         const struct pci_device_id *id)
+{
+    struct net_device *dev;
+    struct my_nic_priv *priv;
+
+    /* net_device を割り当て (private データ領域付き) */
+    dev = alloc_etherdev(sizeof(struct my_nic_priv));
+    if (!dev)
+        return -ENOMEM;
+
+    priv = netdev_priv(dev);
+    SET_NETDEV_DEV(dev, &pdev->dev);
+    dev->netdev_ops = &my_nic_ops;
+
+    /* MAC アドレスの設定 */
+    eth_hw_addr_random(dev);
+
+    /* NAPI の初期化 */
+    netif_napi_add(dev, &priv->napi, my_nic_poll);
+
+    /* ネットワークデバイスを登録 */
+    if (register_netdev(dev)) {
+        free_netdev(dev);
+        return -ENODEV;
+    }
+
+    pci_set_drvdata(pdev, dev);
+    return 0;
+}
+
+static void my_nic_remove(struct pci_dev *pdev)
+{
+    struct net_device *dev = pci_get_drvdata(pdev);
+
+    unregister_netdev(dev);   /* ネットワークデバイスの登録解除 */
+    free_netdev(dev);         /* メモリ解放 */
+}
+```
+
+### 3.4 net_device のライフサイクル
+
+```
+  alloc_etherdev()          net_device の割り当て + 初期化
+       │
+       ▼
+  netdev_ops の設定          ドライバの操作テーブルを登録
+       │
+       ▼
+  netif_napi_add()          NAPI を net_device に関連付け
+       │
+       ▼
+  register_netdev()         ─── sysfs, procfs に登場。ip link で見えるようになる
+       │
+       ▼
+  ndo_open()                ─── ip link set up 時に呼ばれる
+       │                        netif_start_queue() で送信キュー開始
+       │                        napi_enable() で NAPI 有効化
+       ▼
+  (稼働中 — パケット送受信)
+       │
+       ▼
+  ndo_stop()                ─── ip link set down 時に呼ばれる
+       │                        netif_stop_queue() で送信キュー停止
+       │                        napi_disable() で NAPI 無効化
+       ▼
+  unregister_netdev()       ─── sysfs, procfs から消える
+       │
+       ▼
+  free_netdev()             ─── メモリ解放
+```
+
+### 3.5 フロー制御: netif_stop_queue / netif_wake_queue
+
+NIC の送信リングバッファが一杯になった場合、ドライバはカーネルに
+「これ以上パケットを送らないでくれ」と通知する必要がある。
+
+```c
+/* 送信リングが一杯 → カーネルに送信停止を要請 */
+netif_stop_queue(dev);
+
+/* 送信完了割り込みで空きができたら → カーネルに送信再開を通知 */
+netif_wake_queue(dev);
+```
+
+マルチキューデバイスの場合は、キューごとに制御できる。
+
+```c
+netif_stop_subqueue(dev, queue_index);
+netif_wake_subqueue(dev, queue_index);
+```
+
+---
+
+## 4. NAPI (New API) — 高スループット受信
+
+### 4.1 なぜ NAPI が必要か
+
+従来のネットワークドライバは、パケットが到着するたびに割り込みを発生させていた。
+低トラフィック時はこれで問題ないが、高トラフィック時 (例: 10Gbps で秒間数百万パケット) では
+割り込みオーバーヘッドが CPU 時間の大半を消費してしまう。
+
+```
+  割り込み駆動 (従来方式) の問題:
+
+  パケット到着:  │▓│ │▓│ │▓│ │▓│ │▓│ │▓│ │▓│ │▓│ │▓│ │▓│  (高頻度)
+  割り込み:      │!│ │!│ │!│ │!│ │!│ │!│ │!│ │!│ │!│ │!│  (全パケットで IRQ)
+  CPU 時間:      [IRQ][IRQ][IRQ][IRQ][IRQ][IRQ][IRQ]...    (割り込みだらけ)
+                                                           → 実処理の時間がない!
+
+  NAPI (ハイブリッド方式):
+
+  パケット到着:  │▓│▓│▓│▓│▓│▓│▓│▓│▓│▓│▓│▓│▓│▓│▓│▓│  (高頻度)
+  割り込み:      │!│                    │!│              (最初の 1 回だけ)
+  poll:              │▓▓▓▓▓▓▓▓▓▓▓▓▓▓│      │▓▓▓▓│     (まとめて処理)
+  CPU 時間:      [IRQ][===== poll =====][IRQ][= poll =]  (効率的!)
+```
+
+NAPI は **interrupt coalescing** (割り込み統合) のソフトウェア的な実装であり、
+以下のように動作する。
+
+1. 最初のパケットが到着すると **割り込み** が発生する
+2. IRQ ハンドラは割り込みを **無効化** し、NAPI をスケジュールする
+3. softirq コンテキストで **ポーリング** (poll) を実行し、パケットをバッチ処理する
+4. 処理すべきパケットがなくなったら割り込みを **再有効化** する
+
+### 4.2 napi_struct
+
+```c
+struct napi_struct {
+    struct list_head    poll_list;    /* スケジュールされた NAPI のリスト */
+    unsigned long       state;       /* NAPI_STATE_SCHED 等 */
+    int                 weight;      /* 1 回の poll で処理する最大パケット数 */
+    int                 (*poll)(struct napi_struct *napi, int budget);
+    /* ... */
+};
+```
+
+`weight` はデフォルトで **64** である。
+1 回の poll 呼び出しで最大 64 パケットを処理する。
+64 パケットを使い切ったら、NAPI は再スケジュールされ、
+他のデバイスにも CPU 時間が回るようにする。
+
+### 4.3 NAPI のライフサイクル
+
+```c
+/* 1. 初期化 (probe 時) */
+netif_napi_add(dev, &priv->napi, my_poll);
+    /* weight はデフォルトで NAPI_POLL_WEIGHT (64) */
+
+/* 2. 有効化 (ndo_open 時) */
+napi_enable(&priv->napi);
+
+/* 3. IRQ ハンドラでスケジュール */
+static irqreturn_t my_irq_handler(int irq, void *dev_id)
+{
+    struct my_nic_priv *priv = dev_id;
+
+    /* NIC の割り込みを無効化 */
+    my_hw_disable_irq(priv);
+
+    /* NAPI をスケジュール (NET_RX_SOFTIRQ を発火) */
+    napi_schedule(&priv->napi);
+
+    return IRQ_HANDLED;
+}
+
+/* 4. poll 関数 (softirq コンテキスト) */
+static int my_poll(struct napi_struct *napi, int budget)
+{
+    struct my_nic_priv *priv = container_of(napi,
+                                struct my_nic_priv, napi);
+    int work_done = 0;
+
+    while (work_done < budget) {
+        struct sk_buff *skb;
+
+        /* リングバッファから次のパケットを取得 */
+        if (!my_hw_has_packet(priv))
+            break;
+
+        /* skb を割り当て・構築 */
+        skb = napi_alloc_skb(napi, pkt_len);
+        if (!skb)
+            break;
+
+        /* DMA バッファから skb にデータをコピー */
+        my_hw_read_packet(priv, skb);
+
+        skb->protocol = eth_type_trans(skb, napi->dev);
+
+        /* GRO を経由して上位層へ渡す */
+        napi_gro_receive(napi, skb);
+
+        work_done++;
+    }
+
+    /* budget を使い切らなかった = 処理すべきパケットがもうない */
+    if (work_done < budget) {
+        napi_complete_done(napi, work_done);
+        /* NIC の割り込みを再有効化 */
+        my_hw_enable_irq(priv);
+    }
+    /* budget を使い切った場合は再スケジュールされる (自動) */
+
+    return work_done;
+}
+
+/* 5. 無効化 (ndo_stop 時) */
+napi_disable(&priv->napi);
+
+/* 6. 削除 (remove 時) */
+netif_napi_del(&priv->napi);
+```
+
+### 4.4 budget メカニズム
+
+```
+  budget の動作:
+
+  ┌──────────────────────────────────────────────────────────┐
+  │  net_rx_action() — NET_RX_SOFTIRQ ハンドラ               │
+  │                                                          │
+  │  total budget = netdev_budget (デフォルト 300)             │
+  │                                                          │
+  │  for each scheduled NAPI:                                │
+  │    ┌──────────────────────────────────────────────┐      │
+  │    │  napi->poll(napi, per_device_budget=64)      │      │
+  │    │                                              │      │
+  │    │  返り値 < 64 → 「もうパケットない」             │      │
+  │    │    → napi_complete_done() で NAPI 完了         │      │
+  │    │    → 割り込み再有効化                           │      │
+  │    │                                              │      │
+  │    │  返り値 == 64 → 「まだパケットあるかも」        │      │
+  │    │    → リストの末尾に再スケジュール               │      │
+  │    │    → 他のデバイスの NAPI にも公平にCPU配分      │      │
+  │    └──────────────────────────────────────────────┘      │
+  │                                                          │
+  │  total budget を使い切る or 時間切れ → softirq 終了       │
+  └──────────────────────────────────────────────────────────┘
+```
+
+budget 関連のカーネルパラメータ:
+
+| パラメータ | デフォルト | 説明 |
+|---|---|---|
+| `netdev_budget` | 300 | 1 回の softirq で処理する合計パケット数 |
+| `netdev_budget_usecs` | 2000 | 1 回の softirq の最大実行時間 (マイクロ秒) |
+| NAPI weight | 64 | デバイスあたりの 1 回の poll で処理する最大パケット数 |
+
+```bash
+# 確認方法
+sysctl net.core.netdev_budget
+sysctl net.core.netdev_budget_usecs
+```
+
+---
+
+## 5. Netfilter / nftables — パケットフィルタリング
+
+Netfilter は Linux カーネルのパケットフィルタリングフレームワークであり、
+ファイアウォール (`nftables` / `iptables`)、NAT、コネクション追跡の基盤である。
+
+### 5.1 5 つのフックポイント
+
+Netfilter はパケット処理パスの 5 箇所にフックを設けている。
+
+```
+                      Netfilter Hook Chain (IPv4)
+
+                              ┌────────────┐
+                              │ ローカル    │
+                              │ プロセス    │
+                              └──────┬─────┘
+                                ▲    │
+                                │    ▼
+                       ┌────────┴──────────┐
+                       │  NF_INET_LOCAL_IN │   ④ NF_INET_LOCAL_OUT
+                       │  ②                │
+                       └────────┬──────────┘
+                                ▲    │
+                                │    ▼
+  ┌──────┐   ┌────────────┐  ┌─┴────┴──┐  ┌────────────────┐  ┌──────┐
+  │  NIC │──▶│ NF_INET_   │──▶│Routing  │──▶│ NF_INET_       │──▶│  NIC │
+  │  (入) │   │ PRE_ROUTING│  │Decision │  │ POST_ROUTING   │   │ (出)  │
+  └──────┘   │ ①          │  └─────────┘  │ ⑤              │  └──────┘
+              └────────────┘       │       └────────────────┘
+                                   │              ▲
+                                   ▼              │
+                              ┌────┴──────────────┴─┐
+                              │   NF_INET_FORWARD    │
+                              │   ③                  │
+                              └─────────────────────┘
+
+
+  パケットの流れ:
+
+  [受信 → 自ホスト宛]  ① PRE_ROUTING → Routing → ② LOCAL_IN → ローカルプロセス
+
+  [受信 → 転送]        ① PRE_ROUTING → Routing → ③ FORWARD → ⑤ POST_ROUTING → 送信
+
+  [ローカル発信]        ローカルプロセス → ④ LOCAL_OUT → Routing → ⑤ POST_ROUTING → 送信
+```
+
+各フックポイントの役割:
+
+| # | フック | 位置 | 主な用途 |
+|---|---|---|---|
+| 1 | `NF_INET_PRE_ROUTING` | 受信直後、ルーティング前 | DNAT, raw テーブル, conntrack 開始 |
+| 2 | `NF_INET_LOCAL_IN` | ルーティング後、自ホスト宛 | 入力フィルタリング (INPUT チェーン) |
+| 3 | `NF_INET_FORWARD` | 転送パケット | 転送フィルタリング (FORWARD チェーン) |
+| 4 | `NF_INET_LOCAL_OUT` | ローカル発信、ルーティング前 | 出力フィルタリング (OUTPUT チェーン) |
+| 5 | `NF_INET_POST_ROUTING` | 送信直前 | SNAT, MASQUERADE |
+
+### 5.2 フック関数の登録
+
+```c
+#include <linux/netfilter.h>
+#include <linux/netfilter_ipv4.h>
+
+/* フック関数の実装 */
+static unsigned int my_hook_fn(void *priv,
+                                struct sk_buff *skb,
+                                const struct nf_hook_state *state)
+{
+    struct iphdr *iph = ip_hdr(skb);
+
+    /* 例: 特定の IP アドレスからのパケットを拒否 */
+    if (iph->saddr == htonl(0xC0A80164)) {  /* 192.168.1.100 */
+        pr_info("Dropped packet from 192.168.1.100\n");
+        return NF_DROP;
+    }
+
+    return NF_ACCEPT;
+}
+
+/* フック操作構造体 */
+static struct nf_hook_ops my_hook_ops = {
+    .hook     = my_hook_fn,
+    .pf       = NFPROTO_IPV4,              /* IPv4 */
+    .hooknum  = NF_INET_PRE_ROUTING,       /* フックポイント */
+    .priority = NF_IP_PRI_FIRST,           /* 優先度 (小さいほど先) */
+};
+
+/* モジュール初期化時に登録 */
+static int __init my_nf_init(void)
+{
+    return nf_register_net_hook(&init_net, &my_hook_ops);
+}
+
+/* モジュール終了時に解除 */
+static void __exit my_nf_exit(void)
+{
+    nf_unregister_net_hook(&init_net, &my_hook_ops);
+}
+```
+
+フック関数の戻り値:
+
+| 値 | 意味 |
+|---|---|
+| `NF_ACCEPT` | パケットを受け入れ、次のフックに進む |
+| `NF_DROP` | パケットを破棄する |
+| `NF_STOLEN` | パケットの所有権を引き取る (フレームワークは skb を解放しない) |
+| `NF_QUEUE` | パケットをユーザ空間のキューに送る (NFQUEUE) |
+| `NF_REPEAT` | 同じフックをもう一度呼び出す |
+
+### 5.3 コネクション追跡 (nf_conntrack)
+
+コネクション追跡はステートフルファイアウォールと NAT の基盤である。
+すべてのパケットをフロー (コネクション) に関連付けて追跡する。
+
+```c
+/* コネクション追跡エントリ */
+struct nf_conn {
+    struct nf_conntrack ct_general;    /* 参照カウント */
+
+    /* タプル: コネクションの識別子 */
+    struct nf_conntrack_tuple_hash tuplehash[IP_CT_DIR_MAX];
+    /*  [IP_CT_DIR_ORIGINAL]:  元方向 (src → dst) */
+    /*  [IP_CT_DIR_REPLY]:     応答方向 (dst → src) */
+
+    unsigned long status;              /* IPS_CONFIRMED, IPS_ASSURED 等 */
+    /* ... */
+};
+
+/* タプルの構成要素 */
+struct nf_conntrack_tuple {
+    struct {
+        __be32 ip;                     /* 送信元 IP */
+        union {
+            __be16 port;               /* 送信元ポート */
+        } u;
+    } src;
+    struct {
+        __be32 ip;                     /* 宛先 IP */
+        union {
+            __be16 port;               /* 宛先ポート */
+        } u;
+        u8 protonum;                   /* プロトコル番号 (TCP=6, UDP=17) */
+    } dst;
+};
+```
+
+コネクション追跡の状態:
+
+| 状態 | 意味 |
+|---|---|
+| `NEW` | 新しいコネクションの最初のパケット |
+| `ESTABLISHED` | 双方向でパケットが確認されたコネクション |
+| `RELATED` | 既存コネクションに関連する新コネクション (例: FTP データ接続) |
+| `INVALID` | どのコネクションにも属さない不正なパケット |
+
+```bash
+# 現在のコネクション追跡テーブルを確認
+conntrack -L
+
+# テーブルのサイズ
+sysctl net.netfilter.nf_conntrack_max
+sysctl net.netfilter.nf_conntrack_count
+```
+
+### 5.4 NAT メカニズム
+
+NAT (Network Address Translation) はコネクション追跡の上に構築されている。
+
+```
+  SNAT (Source NAT) — POST_ROUTING で実行
+
+  [内部ネットワーク]                    [外部ネットワーク]
+  192.168.1.10:5000  →  NAT  →  203.0.113.1:40000  →  93.184.216.34:80
+                       ┌───────────────────────────┐
+                       │ conntrack テーブル:         │
+                       │ ORIGINAL: 192.168.1.10:5000│
+                       │     → 93.184.216.34:80     │
+                       │ REPLY:    93.184.216.34:80  │
+                       │     → 203.0.113.1:40000    │
+                       └───────────────────────────┘
+  応答パケットは conntrack を参照して自動的に逆変換される。
+
+
+  DNAT (Destination NAT) — PRE_ROUTING で実行
+
+  外部から 203.0.113.1:80 へ  →  NAT  →  内部の 192.168.1.20:8080 へ転送
+```
+
+nftables での設定例:
+
+```bash
+# SNAT (MASQUERADE) の設定
+nft add table nat
+nft add chain nat postrouting { type nat hook postrouting priority 100 \; }
+nft add rule nat postrouting oifname "eth0" masquerade
+
+# DNAT (ポートフォワーディング) の設定
+nft add chain nat prerouting { type nat hook prerouting priority -100 \; }
+nft add rule nat prerouting iifname "eth0" tcp dport 80 \
+    dnat to 192.168.1.20:8080
+```
+
+---
+
+## 6. TC (Traffic Control) — トラフィック制御
+
+TC はカーネルのパケットスケジューリングフレームワークであり、
+帯域制御、パケットの優先度付け、遅延の追加、パケットロスのシミュレーションなどを行う。
+
+### 6.1 アーキテクチャ
+
+TC は 3 つの基本要素で構成される。
+
+```
+  TC の構成要素
+
+  ┌──────────────────────────────────────────────────────────┐
+  │                      root qdisc                          │
+  │  (各 net_device に 1 つ割り当てられる)                      │
+  │                                                          │
+  │  ┌────────────────────────────────────────────────────┐  │
+  │  │  class 1:1 (rate: 100mbit)                         │  │
+  │  │  ┌──────────────────┐  ┌──────────────────┐        │  │
+  │  │  │ class 1:10       │  │ class 1:20       │        │  │
+  │  │  │ (rate: 30mbit)   │  │ (rate: 70mbit)   │        │  │
+  │  │  │  ┌────────────┐  │  │  ┌────────────┐  │        │  │
+  │  │  │  │ leaf qdisc │  │  │  │ leaf qdisc │  │        │  │
+  │  │  │  │ (fq_codel) │  │  │  │ (fq_codel) │  │        │  │
+  │  │  │  └────────────┘  │  │  └────────────┘  │        │  │
+  │  │  └──────────────────┘  └──────────────────┘        │  │
+  │  └────────────────────────────────────────────────────┘  │
+  │                                                          │
+  │  filter: パケットをどの class に分類するかのルール         │
+  │    u32, flower, bpf, cgroup, matchall, ...               │
+  └──────────────────────────────────────────────────────────┘
+```
+
+| 要素 | 役割 |
+|---|---|
+| **qdisc** (Queueing Discipline) | パケットのキューイングとスケジューリングを行う。FIFO, 優先度付き, 帯域制限付きなど |
+| **class** | 階層的なトラフィック分類。帯域幅の割り当てを定義する |
+| **filter** | パケットを適切な class に振り分けるルール |
+
+### 6.2 主要な qdisc
+
+**classless qdisc** (class を持たない):
+
+| qdisc | 説明 |
+|---|---|
+| `pfifo_fast` | Linux のデフォルト qdisc (3 バンド優先度キュー)。ToS フィールドに基づいて 3 つのバンドに振り分ける |
+| `fq_codel` | Fair Queuing + Controlled Delay。多くのディストリビューションでデフォルトに採用。バッファ肥大化 (bufferbloat) を防ぐ |
+| `noqueue` | キューイングなし。ループバックデバイスなどで使用 |
+| `netem` | ネットワークエミュレーション。遅延、パケットロス、重複、順序入替のシミュレーション |
+| `tbf` | Token Bucket Filter。単純な帯域制限 |
+
+**classful qdisc** (class を持つ):
+
+| qdisc | 説明 |
+|---|---|
+| `HTB` | Hierarchical Token Bucket。階層的な帯域制限。最も広く使われている |
+| `HFSC` | Hierarchical Fair Service Curve。遅延保証が可能 |
+| `PRIO` | 優先度キュー。class ごとに異なる優先度を設定 |
+| `DRR` | Deficit Round Robin。クラス間の公平なスケジューリング |
+
+### 6.3 TC の設定例
+
+```bash
+# 帯域制限の設定 (HTB)
+tc qdisc add dev eth0 root handle 1: htb default 20
+
+# ルートクラス: 100Mbps の上限
+tc class add dev eth0 parent 1: classid 1:1 htb rate 100mbit
+
+# 子クラス 1: 優先トラフィック (30Mbps 保証, 100Mbps まで借用可)
+tc class add dev eth0 parent 1:1 classid 1:10 htb \
+    rate 30mbit ceil 100mbit prio 1
+
+# 子クラス 2: 通常トラフィック (70Mbps 保証)
+tc class add dev eth0 parent 1:1 classid 1:20 htb \
+    rate 70mbit ceil 100mbit prio 2
+
+# 各 leaf に fq_codel を設定 (bufferbloat 対策)
+tc qdisc add dev eth0 parent 1:10 fq_codel
+tc qdisc add dev eth0 parent 1:20 fq_codel
+
+# フィルタ: ポート 22 (SSH) を優先クラスに
+tc filter add dev eth0 parent 1: protocol ip u32 \
+    match ip dport 22 0xffff flowid 1:10
+
+# netem: 100ms の遅延と 1% のパケットロスを追加 (テスト用)
+tc qdisc add dev eth0 root netem delay 100ms loss 1%
+```
+
+### 6.4 TC-BPF: eBPF プログラムによるパケット処理
+
+TC は eBPF プログラムのアタッチポイントとしても機能する。
+XDP (eXpress Data Path) よりも後段 (skb が構築された後) で動作し、
+より多くのメタデータにアクセスできる利点がある。
+
+```
+  TC-BPF の位置
+
+  NIC → [XDP] → skb構築 → [TC ingress] → netif_receive_skb → プロトコル層
+                                                         ↓
+  NIC ← [TC egress] ← qdisc ← dev_queue_xmit ← プロトコル層
+```
+
+```c
+/* TC-BPF プログラムの例 (BPF C) */
+#include <linux/bpf.h>
+#include <bpf/bpf_helpers.h>
+
+SEC("tc")
+int tc_prog(struct __sk_buff *skb)
+{
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    struct ethhdr *eth = data;
+
+    if ((void *)(eth + 1) > data_end)
+        return TC_ACT_OK;
+
+    /* 例: VLAN タグの追加 */
+    if (eth->h_proto == htons(ETH_P_IP)) {
+        bpf_skb_vlan_push(skb, htons(ETH_P_8021Q), 100);
+    }
+
+    return TC_ACT_OK;
+}
+```
+
+```bash
+# TC-BPF プログラムのアタッチ
+tc qdisc add dev eth0 clsact
+tc filter add dev eth0 ingress bpf da obj tc_prog.o sec tc
+```
+
+TC-BPF の戻り値:
+
+| 値 | 意味 |
+|---|---|
+| `TC_ACT_OK` | パケットを通過させる |
+| `TC_ACT_SHOT` | パケットを破棄する |
+| `TC_ACT_REDIRECT` | パケットを別のインターフェースにリダイレクト |
+| `TC_ACT_PIPE` | 次のフィルタに渡す |
+
+---
+
+## 7. ソケット層 — ユーザ空間とカーネルの境界
+
+### 7.1 二重構造: struct socket vs struct sock
+
+ソケット層は 2 つの構造体で構成される。この分離は、VFS (ファイルシステム) の要件と
+プロトコル実装の要件を切り離すための設計である。
+
+```
+  ユーザ空間
+  ─────────────────────────────────────────────────────
+  カーネル空間
+
+  ┌──────────────────────────────────────────────────┐
+  │  VFS 層                                          │
+  │  struct file  →  f_op = &socket_file_ops         │
+  │                   (read, write, poll, ...)        │
+  └────────────────────────┬─────────────────────────┘
+                           │
+                           ▼
+  ┌──────────────────────────────────────────────────┐
+  │  struct socket (VFS 側)                           │
+  │  ┌────────────────────────────────────────────┐  │
+  │  │  file:    対応する struct file へのポインタ   │  │
+  │  │  ops:     struct proto_ops *  ← AF ごとの操作 │  │
+  │  │  sk:      struct sock *  ← プロトコル層への橋 │  │
+  │  │  type:    SOCK_STREAM / SOCK_DGRAM / ...    │  │
+  │  │  state:   SS_UNCONNECTED / SS_CONNECTED     │  │
+  │  └────────────────────────────────────────────┘  │
+  └────────────────────────┬─────────────────────────┘
+                           │ socket->sk
+                           ▼
+  ┌──────────────────────────────────────────────────┐
+  │  struct sock (プロトコル側)                        │
+  │  ┌────────────────────────────────────────────┐  │
+  │  │  sk_prot:          struct proto *           │  │
+  │  │  sk_receive_queue: 受信パケットキュー        │  │
+  │  │  sk_write_queue:   送信パケットキュー        │  │
+  │  │  sk_state:         TCP_ESTABLISHED 等       │  │
+  │  │  sk_rcvbuf:        受信バッファサイズ        │  │
+  │  │  sk_sndbuf:        送信バッファサイズ        │  │
+  │  │  sk_data_ready:    データ到着通知コールバック │  │
+  │  └────────────────────────────────────────────┘  │
+  └──────────────────────────────────────────────────┘
+```
+
+| 構造体 | 関心事 | 寿命 |
+|---|---|---|
+| `struct socket` | VFS との統合、ファイルディスクリプタ管理 | fd の open ~ close |
+| `struct sock` | プロトコル状態、パケットキュー、タイマー | コネクションの存続期間 |
+
+### 7.2 proto_ops と struct proto
+
+操作テーブルも 2 層構造になっている。
+
+```c
+/* proto_ops: ソケット操作 (AF ごと) */
+/* socket(2) のシステムコールに対応する操作 */
+struct proto_ops {
+    int family;
+    int (*bind)(struct socket *sock,
+                struct sockaddr *myaddr, int sockaddr_len);
+    int (*connect)(struct socket *sock,
+                   struct sockaddr *vaddr, int sockaddr_len, int flags);
+    int (*accept)(struct socket *sock,
+                  struct socket *newsock, int flags, bool kern);
+    int (*listen)(struct socket *sock, int backlog);
+    int (*sendmsg)(struct socket *sock,
+                   struct msghdr *m, size_t total_len);
+    int (*recvmsg)(struct socket *sock,
+                   struct msghdr *m, size_t total_len, int flags);
+    /* ... */
+};
+
+/* struct proto: プロトコル操作 (プロトコルごと) */
+/* トランスポート層の内部実装 */
+struct proto {
+    int  (*connect)(struct sock *sk,
+                    struct sockaddr *uaddr, int addr_len);
+    int  (*sendmsg)(struct sock *sk, struct msghdr *msg, size_t len);
+    int  (*recvmsg)(struct sock *sk, struct msghdr *msg,
+                    size_t len, int flags, int *addr_len);
+    void (*close)(struct sock *sk, long timeout);
+    int  (*init)(struct sock *sk);
+    void (*destroy)(struct sock *sk);
+    int  (*setsockopt)(struct sock *sk, int level, int optname,
+                       sockptr_t optval, unsigned int optlen);
+    /* ... */
+};
+```
+
+IPv4 TCP の場合:
+
+```c
+/* net/ipv4/af_inet.c */
+const struct proto_ops inet_stream_ops = {
+    .family    = PF_INET,
+    .bind      = inet_bind,
+    .connect   = inet_stream_connect,
+    .accept    = inet_accept,
+    .listen    = inet_listen,
+    .sendmsg   = inet_sendmsg,    /* → tcp_sendmsg() を呼ぶ */
+    .recvmsg   = inet_recvmsg,    /* → tcp_recvmsg() を呼ぶ */
+    /* ... */
+};
+
+/* net/ipv4/tcp_ipv4.c */
+struct proto tcp_prot = {
+    .name       = "TCP",
+    .connect    = tcp_v4_connect,
+    .sendmsg    = tcp_sendmsg,
+    .recvmsg    = tcp_recvmsg,
+    .close      = tcp_close,
+    .init       = tcp_v4_init_sock,
+    /* ... */
+};
+```
+
+### 7.3 ソケット作成パス
+
+`socket()` システムコールの内部動作を追跡する。
+
+```c
+/* ユーザ空間 */
+int fd = socket(AF_INET, SOCK_STREAM, 0);
+```
+
+```
+  socket(AF_INET, SOCK_STREAM, 0) の内部動作
+
+  sys_socket()                              /* net/socket.c */
+    │
+    ▼
+  sock_create()
+    │
+    ├── socket_alloc()                      /* struct socket を割り当て */
+    │     └── inode 割り当て (sockfs)
+    │
+    ├── net_families[AF_INET]->create()     /* AF ごとの create 関数 */
+    │     = inet_create()                   /* net/ipv4/af_inet.c */
+    │       │
+    │       ├── sk_alloc()                  /* struct sock を割り当て */
+    │       │
+    │       ├── socket->ops = &inet_stream_ops   /* proto_ops を設定 */
+    │       │
+    │       ├── sk->sk_prot = &tcp_prot          /* struct proto を設定 */
+    │       │
+    │       └── sk->sk_prot->init(sk)            /* tcp_v4_init_sock() */
+    │             └── TCP 状態を TCP_CLOSE に初期化
+    │
+    └── sock_map_fd()                       /* fd を割り当て、file と紐付け */
+          └── fd_install()
+```
+
+プロトコルファミリの登録:
+
+```c
+/* プロトコルファミリの登録 (起動時) */
+static const struct net_proto_family inet_family_ops = {
+    .family = PF_INET,
+    .create = inet_create,
+};
+sock_register(&inet_family_ops);
+
+/* カーネル起動時に各プロトコルファミリが登録される */
+/* AF_INET (IPv4), AF_INET6 (IPv6), AF_UNIX, AF_NETLINK, ... */
+```
+
+---
+
+## 8. GRO / GSO / TSO — オフロード機構
+
+ネットワークのオフロード機構は、パケット処理の効率を大幅に向上させる技術である。
+「大きなパケットをまとめて処理し、分割は可能な限り後回しにする」という原則に基づいている。
+
+### 8.1 GRO (Generic Receive Offload) — 受信側の集約
+
+GRO は受信時に同一フローの小さなパケットを集約して、1 つの大きな skb として
+プロトコルスタックに渡す仕組みである。
+
+```
+  GRO なし:
+  NIC → skb(1500B) → IP → TCP → ソケット
+  NIC → skb(1500B) → IP → TCP → ソケット
+  NIC → skb(1500B) → IP → TCP → ソケット
+  NIC → skb(1500B) → IP → TCP → ソケット
+  (4 回のプロトコル処理)
+
+  GRO あり:
+  NIC → skb(1500B) ┐
+  NIC → skb(1500B) ├→ GRO 集約 → skb(6000B) → IP → TCP → ソケット
+  NIC → skb(1500B) ┤
+  NIC → skb(1500B) ┘
+  (1 回のプロトコル処理)
+```
+
+GRO の集約条件 (TCP の場合):
+
+- 同一フロー (送信元/宛先 IP, ポート, プロトコルが一致)
+- TCP シーケンス番号が連続している
+- TCP フラグが集約可能 (PSH のみ異なるのは許容)
+- パケットサイズの合計が 65535 バイト以下
+
+```c
+/* ドライバの poll 関数内で GRO を使用する */
+napi_gro_receive(napi, skb);     /* GRO を経由して上位層に渡す */
+/* 内部: gro_receive() で集約を試み、フラッシュ時に netif_receive_skb() を呼ぶ */
+
+/* GRO のフラッシュ: 集約を打ち切って蓄積分を上位に送る */
+napi_gro_flush(napi, false);
+```
+
+### 8.2 GSO (Generic Segmentation Offload) — ソフトウェア分割
+
+GSO は送信時の技術である。アプリケーションが大きなデータを `send()` した場合、
+プロトコルスタックは MTU 分割をせずに **大きな skb のまま** 処理を進め、
+NIC ドライバに渡す直前でソフトウェア的にセグメント分割を行う。
+
+```
+  GSO なし (従来):
+  アプリ send(64KB)
+    → TCP: 1500B × 44 個の skb に分割
+      → 44 回の IP 処理
+        → 44 回の Netfilter 処理
+          → NIC に 44 個送信
+
+  GSO あり:
+  アプリ send(64KB)
+    → TCP: 64KB の skb を 1 つ作成 (GSO フラグ付き)
+      → 1 回の IP 処理
+        → 1 回の Netfilter 処理
+          → dev_queue_xmit() 直前で 44 個に分割
+            → NIC に 44 個送信
+```
+
+GSO の利点は、プロトコルスタックの処理 (ルーティング、Netfilter 等) を
+1 回で済ませられることである。
+
+### 8.3 TSO (TCP Segmentation Offload) — ハードウェア分割
+
+TSO は GSO と同じ概念だが、分割を NIC のハードウェアが行う。
+
+```
+  TSO あり:
+  アプリ send(64KB)
+    → TCP: 64KB の skb を 1 つ作成 (GSO フラグ付き)
+      → 1 回の IP 処理
+        → 1 回の Netfilter 処理
+          → NIC に 64KB の skb をそのまま渡す
+            → NIC のハードウェアが 1500B × 44 個に分割して送信
+```
+
+```
+  まとめ: オフロード機構の関係
+
+  受信 (Rx):
+    LRO (NIC HW) → GRO (カーネル) → プロトコルスタック
+    ※ LRO (Large Receive Offload) は HW 版の GRO。
+      ルーティング/ブリッジ環境で問題があるため GRO が推奨される。
+
+  送信 (Tx):
+    プロトコルスタック → GSO (カーネル) → NIC
+    プロトコルスタック → TSO (NIC HW)   → NIC
+    ※ NIC が TSO をサポートしていれば TSO を使用。
+      サポートしていなければ GSO にフォールバック。
+```
+
+```bash
+# オフロード機能の確認
+ethtool -k eth0 | grep -E "gro|gso|tso"
+# generic-receive-offload: on
+# generic-segmentation-offload: on
+# tcp-segmentation-offload: on
+
+# GRO を無効化する場合
+ethtool -K eth0 gro off
+
+# GSO を無効化する場合
+ethtool -K eth0 gso off
+```
+
+---
+
+## 9. ethtool インターフェース
+
+ethtool は NIC ドライバの情報取得・設定変更を行うユーザ空間ツールであり、
+カーネル内では `struct ethtool_ops` の関数ポインタテーブルとして実装されている。
+
+### 9.1 主要な ethtool_ops
+
+```c
+struct ethtool_ops {
+    /* ドライバ情報の取得 */
+    void (*get_drvinfo)(struct net_device *dev,
+                        struct ethtool_drvinfo *info);
+
+    /* リンク設定の取得・変更 (速度, duplex, autoneg) */
+    int  (*get_link_ksettings)(struct net_device *dev,
+                               struct ethtool_link_ksettings *cmd);
+    int  (*set_link_ksettings)(struct net_device *dev,
+                               const struct ethtool_link_ksettings *cmd);
+
+    /* リンク状態の取得 */
+    u32  (*get_link)(struct net_device *dev);
+
+    /* 統計情報の取得 */
+    void (*get_ethtool_stats)(struct net_device *dev,
+                              struct ethtool_stats *stats, u64 *data);
+    int  (*get_sset_count)(struct net_device *dev, int sset);
+    void (*get_strings)(struct net_device *dev,
+                        u32 stringset, u8 *data);
+
+    /* リングバッファサイズの取得・変更 */
+    void (*get_ringparam)(struct net_device *dev,
+                          struct ethtool_ringparam *ring,
+                          struct kernel_ethtool_ringparam *kernel_ring,
+                          struct netlink_ext_ack *extack);
+    int  (*set_ringparam)(struct net_device *dev,
+                          struct ethtool_ringparam *ring,
+                          struct kernel_ethtool_ringparam *kernel_ring,
+                          struct netlink_ext_ack *extack);
+
+    /* coalescing (割り込み統合) の取得・変更 */
+    int  (*get_coalesce)(struct net_device *dev,
+                         struct ethtool_coalesce *ec,
+                         struct kernel_ethtool_coalesce *kernel_ec,
+                         struct netlink_ext_ack *extack);
+    int  (*set_coalesce)(struct net_device *dev,
+                         struct ethtool_coalesce *ec,
+                         struct kernel_ethtool_coalesce *kernel_ec,
+                         struct netlink_ext_ack *extack);
+
+    /* ... 他にも多数 */
+};
+```
+
+### 9.2 実装例
+
+```c
+static void my_get_drvinfo(struct net_device *dev,
+                            struct ethtool_drvinfo *info)
+{
+    strscpy(info->driver, "my_nic", sizeof(info->driver));
+    strscpy(info->version, "1.0", sizeof(info->version));
+    strscpy(info->bus_info, pci_name(priv->pdev),
+            sizeof(info->bus_info));
+}
+
+static int my_get_link_ksettings(struct net_device *dev,
+                                  struct ethtool_link_ksettings *cmd)
+{
+    struct my_nic_priv *priv = netdev_priv(dev);
+
+    ethtool_link_ksettings_zero_link_mode(cmd, supported);
+    ethtool_link_ksettings_add_link_mode(cmd, supported, 1000baseT_Full);
+    ethtool_link_ksettings_add_link_mode(cmd, supported, 100baseT_Full);
+
+    cmd->base.speed = priv->speed;       /* SPEED_1000 等 */
+    cmd->base.duplex = priv->duplex;     /* DUPLEX_FULL 等 */
+    cmd->base.autoneg = AUTONEG_ENABLE;
+
+    return 0;
+}
+
+static const struct ethtool_ops my_ethtool_ops = {
+    .get_drvinfo        = my_get_drvinfo,
+    .get_link           = ethtool_op_get_link,  /* 汎用ヘルパー */
+    .get_link_ksettings = my_get_link_ksettings,
+};
+
+/* probe 内で設定 */
+dev->ethtool_ops = &my_ethtool_ops;
+```
+
+```bash
+# ethtool の使用例
+ethtool eth0                    # リンク速度、duplex 等の表示
+ethtool -i eth0                 # ドライバ情報 (get_drvinfo)
+ethtool -S eth0                 # 統計情報 (get_ethtool_stats)
+ethtool -g eth0                 # リングバッファサイズ (get_ringparam)
+ethtool -c eth0                 # coalescing 設定 (get_coalesce)
+ethtool -k eth0                 # オフロード機能の状態
+```
+
+---
+
+## 10. ネットワーク名前空間
+
+ネットワーク名前空間 (`struct net`) は、コンテナ技術の基盤の一つである。
+各名前空間は独立したネットワークスタックを持つ。
+
+### 10.1 名前空間ごとに独立するもの
+
+```
+  ┌─────────────────────────────────────────────────────────┐
+  │  Network Namespace A (init_net — デフォルト名前空間)      │
+  │                                                         │
+  │  デバイス: eth0, lo                                      │
+  │  ルーティングテーブル: default via 192.168.1.1            │
+  │  Netfilter ルール: nft list ruleset                      │
+  │  ソケット: :80 (nginx), :22 (sshd)                       │
+  │  /proc/net/*, /sys/class/net/*                           │
+  └─────────────────────────────────────────────────────────┘
+
+  ┌─────────────────────────────────────────────────────────┐
+  │  Network Namespace B (コンテナ)                           │
+  │                                                         │
+  │  デバイス: eth0 (veth pair), lo                          │
+  │  ルーティングテーブル: default via 172.17.0.1             │
+  │  Netfilter ルール: (独立した nftables ルール)             │
+  │  ソケット: :80 (コンテナ内 nginx — Namespace A の:80と共存)│
+  │  /proc/net/*, /sys/class/net/*                           │
+  └─────────────────────────────────────────────────────────┘
+```
+
+### 10.2 struct net
+
+```c
+struct net {
+    refcount_t              count;          /* 参照カウント */
+    struct list_head        dev_base_head;  /* この名前空間のデバイスリスト */
+    struct hlist_head       *dev_name_head; /* デバイス名ハッシュテーブル */
+    struct hlist_head       *dev_index_head;/* デバイスインデックスハッシュ */
+    struct net_device       *loopback_dev;  /* この名前空間の lo */
+    struct netns_ipv4       ipv4;           /* IPv4 固有の設定 */
+    struct netns_ipv6       ipv6;           /* IPv6 固有の設定 */
+    struct netns_nf         nf;             /* Netfilter の名前空間データ */
+    struct netns_ct         ct;             /* conntrack の名前空間データ */
+    /* ... */
+};
+```
+
+カーネル内のネットワーク関連関数は、多くの場合 `struct net *` を引数に取る。
+これにより同じ関数が異なる名前空間で動作できる。
+
+```c
+/* 名前空間を考慮した API の例 */
+struct net_device *dev_get_by_name(struct net *net, const char *name);
+int nf_register_net_hook(struct net *net, const struct nf_hook_ops *ops);
+```
+
+### 10.3 ユーザ空間からの操作
+
+```bash
+# 新しいネットワーク名前空間を作成
+ip netns add my_ns
+
+# 名前空間内でコマンドを実行
+ip netns exec my_ns ip link list
+
+# veth ペアを作成して名前空間間を接続
+ip link add veth0 type veth peer name veth1
+ip link set veth1 netns my_ns
+
+# 名前空間内で IP を設定
+ip netns exec my_ns ip addr add 10.0.0.2/24 dev veth1
+ip netns exec my_ns ip link set veth1 up
+```
+
+Docker や Kubernetes は内部でこの仕組みを使用している。
+各コンテナは独自のネットワーク名前空間を持ち、veth ペアやブリッジを通じて
+ホストや他のコンテナと通信する。
+
+---
+
+## 11. PHY vs MAC vs NIC の区別
+
+この区別は [Ch 28](/part8-practice/28-rust-frontiers/) で概要を述べたが、
+ネットワークスタックの文脈で改めて整理する。
+
+### 11.1 3 層のアーキテクチャ
+
+```
+  NIC のハードウェア構成
+
+  ┌───────────────────────────────────────────────────────────┐
+  │  NIC (Network Interface Card) — 物理カード全体             │
+  │                                                           │
+  │  ┌─────────────────────┐     MDIO     ┌────────────────┐ │
+  │  │  MAC コントローラ     │◄───────────►│  PHY チップ     │ │
+  │  │                     │     バス      │                │ │
+  │  │  ・フレーム組立/分解  │              │  ・信号変換     │ │
+  │  │  ・DMA エンジン      │              │  ・Auto-Neg    │ │
+  │  │  ・リングバッファ管理 │              │  ・リンク検出   │ │
+  │  │  ・チェックサム計算   │              │  ・MDI/MDI-X   │ │
+  │  │  ・TSO / RSS         │              │                │ │
+  │  └──────────┬──────────┘              └───────┬────────┘ │
+  │             │ PCIe                            │ RJ-45     │
+  └─────────────┼─────────────────────────────────┼──────────┘
+                │                                 │
+          ┌─────┴─────┐                    ┌──────┴──────┐
+          │    CPU    │                    │  Ethernet   │
+          │  (ホスト) │                    │   ケーブル   │
+          └───────────┘                    └─────────────┘
+```
+
+### 11.2 Linux ドライバの分離
+
+```
+  カーネル内のドライバ構造
+
+  ┌──────────────────────────────────────────────────────────┐
+  │  NIC (MAC) ドライバ                                       │
+  │  drivers/net/ethernet/intel/igb/                          │
+  │                                                          │
+  │  ・struct net_device を登録                                │
+  │  ・net_device_ops (ndo_start_xmit 等) を実装              │
+  │  ・NAPI poll を実装                                       │
+  │  ・DMA / リングバッファを管理                               │
+  │  ・ethtool_ops を実装                                      │
+  └──────────────────────────┬───────────────────────────────┘
+                             │ phylink / phylib API
+                             ▼
+  ┌──────────────────────────────────────────────────────────┐
+  │  PHY ドライバ                                             │
+  │  drivers/net/phy/                                        │
+  │                                                          │
+  │  ・struct phy_driver を登録                                │
+  │  ・config_init, read_status 等を実装                      │
+  │  ・MDIO バス経由で PHY レジスタを読み書き                    │
+  │  ・リンク速度/duplex のネゴシエーション                      │
+  └──────────────────────────────────────────────────────────┘
+```
+
+SoC (System on Chip) では MAC コントローラと PHY が別チップであることが多い。
+例: STM32 の Ethernet MAC + 外付け Realtek RTL8211F PHY。
+この場合、MAC ドライバ (`stmmac`) と PHY ドライバ (`realtek`) は完全に独立しており、
+phylink フレームワークを介して連携する。
+
+一方、Intel I210 のような PCIe NIC カードでは MAC と PHY が
+同じカード上に搭載されているが、ドライバ内部では依然として分離されている。
+
+---
+
+## 12. Rust の現状 — ネットワークスタックの抽象
+
+### 12.1 現在 upstream にある Rust ネットワーク抽象
+
+2026 年 4 月時点で、upstream の Linux カーネルに存在する Rust ネットワーク抽象は
+**`kernel::net::phy` のみ** である。
+
+```rust
+// rust/kernel/net/phy.rs (簡略化)
+
+/// PHY ドライバトレイト
+pub trait Driver {
+    /// PHY の初期化
+    fn probe(dev: &mut Device) -> Result<()> { Ok(()) }
+
+    /// PHY レジスタの読み取り
+    fn read_status(dev: &mut Device) -> Result<u16>;
+
+    /// ソフトリセット
+    fn soft_reset(dev: &mut Device) -> Result<()>;
+
+    /// Auto-negotiation の設定
+    fn config_aneg(dev: &mut Device) -> Result<()>;
+
+    /// リンク変化時の処理
+    fn link_change_notify(dev: &mut Device);
+}
+
+/// PHY ドライバの登録マクロ
+// kernel::module_phy_driver! で使用
+```
+
+upstream に存在する Rust PHY ドライバの一覧:
+
+| ドライバ | 対象 PHY | マージバージョン | ソースパス |
+|---|---|---|---|
+| `ax88796b_rust` | ASIX AX88796B | 6.8 | `drivers/net/phy/ax88796b_rust.rs` |
+| Realtek PHY | Realtek 各種 | 6.9 | `drivers/net/phy/realtek/` |
+| QT2025 PHY | QT2025 10GbE | 6.12 | `drivers/net/phy/qt2025.rs` |
+
+### 12.2 存在しない抽象 (今後の課題)
+
+以下の構造体・API の Rust 抽象は upstream に存在しない。
+
+| 構造体 / API | 困難な理由 |
+|---|---|
+| `struct net_device` | 約 50 のコールバックを持つ `net_device_ops` の設計が膨大 |
+| `struct sk_buff` | 4 ポインタモデル、paged data、clone/cow の参照セマンティクスが複雑 |
+| NAPI | `napi_struct` と `net_device` の相互参照、softirq コンテキストの制約 |
+| Netfilter hooks | フック関数内で skb を変更する可能性があり、所有権モデルが複雑 |
+| TC qdisc | classful qdisc の階層構造と動的なクラス追加/削除 |
+| `struct sock` | 参照カウント、TCP 状態マシン、タイマーとの相互作用 |
+
+### 12.3 実験的な取り組み
+
+FUJITA Tomonori 氏が Intel e1000 NIC の Rust 実装を out-of-tree で開発している。
+この実装は `net_device`, `sk_buff`, NAPI の最小限の Rust ラッパーを含むが、
+upstream にはマージされていない。
+
+主な技術的課題:
+
+1. **`sk_buff` の所有権モデル**: skb は作成後、複数のサブシステム間で受け渡される。
+   clone や cow による共有があり、どの時点で誰が所有者かを型システムで表現するのが困難である。
+
+2. **コールバックのライフタイム**: `net_device_ops` のコールバックは `net_device` の
+   ライフタイム中いつでも呼ばれる可能性がある。Rust のライフタイムシステムで
+   これを安全に表現するには、`Pin` や `Arc` の慎重な使い方が必要になる。
+
+3. **softirq コンテキスト**: NAPI の poll 関数は softirq コンテキストで実行される。
+   sleep 不可、mutex 不可という制約を型レベルで強制する設計が理想的だが、
+   現時点では Rust カーネル API にそのような仕組みがない。
+
+### 12.4 sk_buff の Rust ラッパーが困難な理由
+
+具体例で困難さを示す。
+
+```rust
+// 仮想的な sk_buff ラッパー (実際には存在しない)
+
+// 問題 1: 4 ポインタモデルの安全な抽象
+// skb_push() は data ポインタを前方に移動するが、
+// head を超えないことを保証する必要がある。
+// Rust ではスライスの境界チェックで実現可能だが、
+// パフォーマンスへの影響が懸念される。
+
+// 問題 2: clone と参照セマンティクス
+// skb_clone() はデータバッファを共有する。
+// これは Rust の Arc<[u8]> に似ているが、
+// skb_cow() で「必要な時だけコピー」する動作は
+// Arc の意味論とは異なる。
+
+// 問題 3: paged data
+// skb_shinfo(skb)->frags[] はカーネルの struct page を参照する。
+// Page の参照カウント管理を Rust の型システムで安全に行うには、
+// ページアロケータ全体の抽象が必要になる。
+```
+
+> **今後の展望**: ネットワークスタックの Rust 化は PHY ドライバから始まり、
+> 将来的には MAC (NIC) ドライバ、そしてプロトコルスタックのコア部分へと
+> 段階的に進むと予想されるが、`sk_buff` と `net_device` の安全な抽象が
+> 設計・マージされるまでには相当な時間がかかるだろう。
+
+---
+
+## 送信パスの補足
+
+受信パスを詳しく見たので、送信パスも概観しておく。
+
+```
+  パケット送信パス (Tx Path)
+
+  ┌─────────────┐
+  │  アプリ      │  1. send() / write() システムコール
+  │  send(fd,..) │
+  └──────┬──────┘
+         │
+         ▼
+  ┌─────────────┐
+  │  Socket 層   │  2. proto_ops->sendmsg() → proto->sendmsg()
+  │  sendmsg()   │     TCP: tcp_sendmsg() — 送信バッファにデータを追加
+  └──────┬──────┘     UDP: udp_sendmsg() — skb を作成
+         │
+         ▼
+  ┌─────────────┐
+  │ Transport   │  3. TCP: セグメント化、skb にTCPヘッダー追加
+  │  Layer      │     tcp_transmit_skb()
+  └──────┬──────┘
+         │
+         ▼
+  ┌─────────────┐
+  │  IP Layer   │  4. ip_queue_xmit() → IPヘッダー追加、ルーティング
+  │             │     NF_INET_LOCAL_OUT フック
+  └──────┬──────┘
+         │
+         ▼
+  ┌─────────────┐
+  │ Netfilter   │  5. NF_INET_POST_ROUTING フック (SNAT 等)
+  │ POST_ROUTING│
+  └──────┬──────┘
+         │
+         ▼
+  ┌─────────────┐
+  │  TC Layer   │  6. TC qdisc にエンキュー
+  │  qdisc      │     qdisc のスケジューリングに従いデキュー
+  └──────┬──────┘
+         │
+         ▼
+  ┌─────────────┐
+  │dev_queue_   │  7. dev_queue_xmit() → GSO/TSO 処理
+  │  xmit()     │     ndo_start_xmit() を呼び出し
+  └──────┬──────┘
+         │
+         ▼
+  ┌─────────────┐
+  │  NIC Driver │  8. DMA でリングバッファにマップ
+  │  xmit()     │     NIC にドアベルを鳴らす
+  └──────┬──────┘
+         │
+         ▼
+  ┌─────────────┐
+  │   NIC HW    │  9. NIC がフレームをワイヤに送出
+  │             │     TSO 対応なら HW でセグメント分割
+  └─────────────┘     送信完了割り込みで skb を解放
+```
+
+---
+
+## デバッグとトラブルシューティング
+
+ネットワークスタックの理解はトラブルシューティングに直結する。
+以下に実践的なデバッグ手法をまとめる。
+
+### パケットドロップの調査
+
+```bash
+# インターフェース統計 (rx_dropped, tx_dropped 等)
+ip -s link show eth0
+
+# プロトコル統計
+cat /proc/net/snmp        # IP, TCP, UDP の統計
+cat /proc/net/netstat      # TCP 拡張統計
+
+# ドロップ理由の追跡 (perf)
+perf trace -e 'skb:kfree_skb' --call-graph dwarf
+
+# softnet_stat: softirq の処理統計
+cat /proc/net/softnet_stat
+# 各行 (CPU ごと): processed | dropped | time_squeeze | ...
+# time_squeeze > 0 → softirq の budget/time が不足している
+```
+
+### NAPI 関連の性能問題
+
+```bash
+# NAPI の budget を増やす
+sysctl -w net.core.netdev_budget=600
+
+# RPS (Receive Packet Steering) で受信処理を複数 CPU に分散
+echo f > /sys/class/net/eth0/queues/rx-0/rps_cpus
+
+# IRQ affinity の設定
+echo 1 > /proc/irq/XX/smp_affinity  # CPU 0 に固定
+```
+
+### sk_buff 関連
+
+```bash
+# skb の割り当て失敗を監視
+perf stat -e 'kmem:kmalloc' -a -- sleep 5
+
+# /proc/slabinfo で SLUB キャッシュの状態確認
+grep skbuff /proc/slabinfo
+```
+
+---
+
+## まとめ
+
+この章で学んだ Linux ネットワークスタックの主要コンポーネントを整理する。
+
+| コンポーネント | 役割 | 主要構造体 / API |
+|---|---|---|
+| **sk_buff** | パケットのカーネル内表現 | `head/data/tail/end`, `skb_push/pull/put` |
+| **net_device** | ネットワークインターフェース | `net_device_ops`, `register_netdev` |
+| **NAPI** | 高速受信 (割り込み抑制) | `napi_schedule`, `napi_poll`, budget=64 |
+| **Netfilter** | パケットフィルタリング | 5 フックポイント, `nf_hook_ops`, conntrack |
+| **TC** | トラフィック制御 | qdisc, class, filter, TC-BPF |
+| **ソケット層** | ユーザ空間インターフェース | `struct socket` / `struct sock`, `proto_ops` / `proto` |
+| **GRO/GSO/TSO** | パケット集約・分割のオフロード | 受信集約, ソフトウェア分割, HW 分割 |
+| **ethtool** | NIC の情報取得・設定 | `ethtool_ops` |
+| **ネットワーク名前空間** | ネットワークの分離 | `struct net`, コンテナの基盤 |
+
+### 次のステップ
+
+- [Ch 28](/part8-practice/28-rust-frontiers/) で他のカーネルサブシステムの Rust 化状況を確認する
+- `drivers/net/ethernet/` 以下の実際の NIC ドライバコードを読む
+  (Intel `igb` や Realtek `r8169` が比較的読みやすい)
+- `net/core/dev.c` の `netif_receive_skb()` を起点にカーネルソースを追跡する
+- `net/ipv4/tcp_input.c` で TCP の受信処理を読む
+- カーネルの `Documentation/networking/` ディレクトリを参照する
+
+> **参考文献**
+> - [Linux Networking Documentation (docs.kernel.org)](https://docs.kernel.org/networking/)
+> - [Understanding Linux Network Internals — Christian Benvenuti (O'Reilly)](https://www.oreilly.com/library/view/understanding-linux-network/0596002556/)
+> - [Linux Kernel Networking — Rami Rosen (Apress)](https://www.apress.com/gp/book/9781430261964)
+> - [NAPI Documentation (docs.kernel.org)](https://docs.kernel.org/networking/napi.html)
+> - [Netfilter Documentation](https://www.netfilter.org/documentation/)
+> - [TC man page: tc(8)](https://man7.org/linux/man-pages/man8/tc.8.html)

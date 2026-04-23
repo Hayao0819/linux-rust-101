@@ -1,0 +1,1401 @@
+---
+title: "カーネルブートプロセスと初期化"
+description: "UEFI/BIOS → ブートローダ → start_kernel() → initramfs → PID 1 — カーネル起動の全貌とモジュールの初期化順序"
+---
+
+## この章で学ぶこと
+
+- BIOS/UEFI からカーネルに制御が渡るまでの流れを説明できる
+- `start_kernel()` 内部の初期化シーケンスを追える
+- initcall レベルの仕組みと `module_init()` の対応を理解する
+- initramfs の役割と switch_root の動作を把握する
+- PID 1 (init プロセス) の特殊性を説明できる
+- UEFI Secure Boot の信頼チェーンを理解する
+- Device Tree と ACPI によるハードウェア記述の違いを把握する
+- kexec / KHO によるファストリブートの仕組みを知る
+- CONFIG_RUST 有効時のブートへの影響を正確に理解する
+## 前提
+
+- [Ch 4](/part2-first-module/04-hello-c/)--[Ch 5](/part2-first-module/05-hello-rust/) (C/Rust モジュール) を完了している
+- [Ch 6](/part2-first-module/06-kbuild-ffi/) (kbuild と FFI) を完了している
+- [Ch 11](/part5-hardware/15-device-model/) (デバイスモデル) の基本を理解している
+
+---
+
+## ブートシーケンスの全体像
+
+電源投入からユーザ空間の PID 1 が起動するまで、Linux システムは多段階の初期化を経る。
+以下の ASCII 図で全体の流れを俯瞰しよう。
+
+```
+ 電源投入 (Power On)
+     |
+     v
++===================================================================+
+|  Phase 0: ファームウェア                                          |
+|===================================================================|
+|                                                                   |
+|  +------------------+       +------------------+                  |
+|  |   Legacy BIOS    |       |     UEFI         |                  |
+|  |  (MBR ベース)     |  or   |  (GPT ベース)     |                  |
+|  +--------+---------+       +--------+---------+                  |
+|           |                          |                            |
+|    POST (自己診断)            SEC → PEI → DXE → BDS               |
+|    INT 19h で                 ESP パーティションから               |
+|    MBR 読み込み               EFI アプリ起動                      |
+|           |                          |                            |
+|           +------------+-------------+                            |
+|                        |                                          |
++========================|==========================================+
+                         v
++===================================================================+
+|  Phase 1: ブートローダ                                            |
+|===================================================================|
+|                                                                   |
+|  +-------------------------------------------------------------+ |
+|  |  GRUB2 / systemd-boot / EFISTUB                             | |
+|  |                                                              | |
+|  |  1. grub.cfg / loader.conf を読む                            | |
+|  |  2. vmlinuz (圧縮カーネル) をメモリにロード                  | |
+|  |  3. initramfs (initrd) をメモリにロード                      | |
+|  |  4. カーネルコマンドラインを設定                              | |
+|  |  5. ARM/RISC-V: DTB (Device Tree Blob) をロード             | |
+|  |  6. カーネルエントリポイントにジャンプ                        | |
+|  +-------------------------------------------------------------+ |
+|                                                                   |
++========================|==========================================+
+                         v
++===================================================================+
+|  Phase 2: カーネル初期化 (early)                                  |
+|===================================================================|
+|                                                                   |
+|  +--------------------------+                                     |
+|  | アーキテクチャ固有の      |                                     |
+|  | アセンブリコード          |                                     |
+|  | (arch/x86/boot/         |                                     |
+|  |  compressed/head_64.S)  |                                     |
+|  +-----------+--------------+                                     |
+|              |                                                    |
+|              v                                                    |
+|  +--------------------------+                                     |
+|  | カーネル展開 (decompress) |                                     |
+|  | zstd / gzip / lz4 / xz   |                                     |
+|  +-----------+--------------+                                     |
+|              |                                                    |
+|              v                                                    |
+|  +--------------------------+                                     |
+|  | start_kernel()           |   <--- init/main.c                  |
+|  |   setup_arch()           |   アーキテクチャ固有初期化           |
+|  |   mm_init()              |   メモリ管理初期化                   |
+|  |   sched_init()           |   スケジューラ初期化                 |
+|  |   init_IRQ()             |   割り込み初期化                     |
+|  |   console_init()         |   コンソール初期化                   |
+|  |   ...                    |                                     |
+|  |   rest_init()            |   最後の仕上げ                      |
+|  +-----------+--------------+                                     |
+|              |                                                    |
++==============|====================================================+
+               v
++===================================================================+
+|  Phase 3: カーネル初期化 (late) — rest_init() 以降               |
+|===================================================================|
+|                                                                   |
+|  rest_init()                                                      |
+|      |                                                            |
+|      +---> kernel_thread(kernel_init, ...)   [PID 1]              |
+|      |                                                            |
+|      +---> kernel_thread(kthreadd, ...)      [PID 2]              |
+|      |                                                            |
+|      +---> cpu_startup_entry()  (idle ループ) [PID 0]             |
+|                                                                   |
+|  kernel_init():                                                   |
+|      |                                                            |
+|      +---> kernel_init_freeable()                                 |
+|      |         |                                                  |
+|      |         +---> do_basic_setup()                              |
+|      |         |         |                                        |
+|      |         |         +---> do_initcalls()                      |
+|      |         |                   |                              |
+|      |         |          level 0: pure_initcall                   |
+|      |         |          level 1: core_initcall                   |
+|      |         |          level 2: postcore_initcall               |
+|      |         |          level 3: arch_initcall                   |
+|      |         |          level 4: subsys_initcall                 |
+|      |         |          level 5: fs_initcall                     |
+|      |         |          level 6: device_initcall  <-- module_init|
+|      |         |          level 7: late_initcall                   |
+|      |         |                                                  |
+|      |         +---> initramfs 展開 & マウント                    |
+|      |                                                            |
+|      +---> /init (initramfs 内) を exec                           |
+|                                                                   |
++========================|==========================================+
+                         v
++===================================================================+
+|  Phase 4: initramfs (初期ユーザ空間)                              |
+|===================================================================|
+|                                                                   |
+|  /init スクリプト (or systemd in initramfs):                      |
+|      |                                                            |
+|      +---> udev 起動 → デバイスノード作成                        |
+|      +---> ルートファイルシステムのドライバをロード               |
+|      +---> ルートファイルシステムをマウント (/sysroot)            |
+|      +---> switch_root /sysroot /sbin/init                        |
+|                                                                   |
++========================|==========================================+
+                         v
++===================================================================+
+|  Phase 5: 本ルートの PID 1                                       |
+|===================================================================|
+|                                                                   |
+|  systemd / OpenRC / busybox init:                                 |
+|      |                                                            |
+|      +---> ファイルシステムマウント                               |
+|      +---> ネットワーク設定                                       |
+|      +---> サービス起動                                           |
+|      +---> ログイン画面 / getty                                   |
+|                                                                   |
++===================================================================+
+```
+
+上図の各フェーズについて、以下で詳しく見ていこう。
+
+---
+
+## Phase 0: UEFI と Legacy BIOS
+
+### Legacy BIOS ブート
+
+Legacy BIOS は 1981 年の IBM PC から続く起動方式である。
+
+1. **POST (Power-On Self-Test)**: ハードウェアの自己診断。メモリテスト、デバイス検出。
+2. **MBR 読み込み**: ブートディスクの先頭 512 バイト (Master Boot Record) を `0x7C00` にロード。
+3. **ブートローダ起動**: MBR 内の小さなコードが Stage 2 ブートローダをロードする。
+4. **リアルモード → プロテクトモード**: ブートローダが CPU モードを切り替え、カーネルをロードする。
+
+MBR の制限は深刻である。パーティションテーブルは最大 4 エントリ、ディスクサイズは 2 TB が上限。
+ブートローダのコード領域も 446 バイトしかないため、多段ロードが必須になる。
+
+### UEFI (Unified Extensible Firmware Interface)
+
+UEFI は Legacy BIOS を置き換えるモダンなファームウェアインタフェースである。
+
+UEFI の起動は以下の段階で進む:
+
+| 段階 | 名称 | 役割 |
+|---|---|---|
+| SEC | Security Phase | CPU リセットベクタから最初に実行。キャッシュを RAM 代わりに使用 |
+| PEI | Pre-EFI Initialization | メモリコントローラの初期化。DRAM が使用可能になる |
+| DXE | Driver Execution Environment | UEFI ドライバのロード。GOP (グラフィック)、ネットワーク等 |
+| BDS | Boot Device Selection | ブートデバイスの選択。ESP から EFI アプリを起動 |
+
+UEFI の主な利点:
+
+- **GPT 対応**: 128 パーティション、ディスクサイズ 9.4 ZB まで
+- **ESP (EFI System Partition)**: FAT32 パーティションにブートローダを配置
+- **UEFI アプリケーション**: ブートローダ自体が PE32+ 形式の実行ファイル
+- **Secure Boot**: 署名検証による信頼チェーン (後述)
+- **EFISTUB**: カーネル自体を直接 EFI アプリとして起動可能
+
+```
+# EFISTUB: ブートローダなしでカーネルを直接起動
+# EFI シェルまたは efibootmgr で設定
+efibootmgr --create --disk /dev/sda --part 1 \
+    --label "Linux Direct" \
+    --loader /vmlinuz \
+    --unicode 'root=/dev/sda2 ro initrd=\initramfs.img'
+```
+
+### UEFI と BIOS の比較
+
+| 特徴 | Legacy BIOS | UEFI |
+|---|---|---|
+| パーティション方式 | MBR (最大 2 TB) | GPT (最大 9.4 ZB) |
+| ブートコード | 512 バイト MBR | ESP 上の EFI アプリ |
+| CPU モード | 16 ビットリアルモードから開始 | 32/64 ビットモードで動作 |
+| Secure Boot | なし | あり |
+| ネットワークブート | PXE (限定的) | HTTP Boot 対応 |
+| 後方互換 | -- | CSM (Compatibility Support Module) |
+
+現在出荷される PC はほぼ全て UEFI である。CSM を無効にし、UEFI ネイティブモードで運用するのが標準となっている。
+
+---
+
+## Phase 1: ブートローダ (GRUB2)
+
+ブートローダはファームウェアとカーネルの橋渡し役である。
+最も普及している GRUB2 (GRand Unified Bootloader 2) の動作を見よう。
+
+### GRUB2 の役割
+
+1. **カーネルイメージ (vmlinuz) のロード**: 圧縮されたカーネルをメモリに配置する
+2. **initramfs のロード**: 初期 RAM ファイルシステムをメモリに配置する
+3. **カーネルコマンドラインの設定**: `root=`, `init=`, `quiet` などのパラメータを渡す
+4. **Device Tree のロード** (ARM/RISC-V): ハードウェア記述をメモリに配置する
+5. **制御の移譲**: カーネルのエントリポイントにジャンプする
+
+### grub.cfg の例
+
+```bash
+menuentry "Linux 7.0" {
+    set root=(hd0,gpt2)
+    linux /boot/vmlinuz-7.0.0 root=/dev/sda3 ro quiet
+    initrd /boot/initramfs-7.0.0.img
+}
+```
+
+`linux` コマンドでカーネルとコマンドラインを指定し、`initrd` コマンドで initramfs を指定する。
+
+### systemd-boot (UEFI 専用)
+
+systemd-boot は UEFI 環境向けのシンプルなブートマネージャである。
+
+```ini
+# /boot/loader/entries/linux.conf
+title   Linux 7.0
+linux   /vmlinuz-7.0.0
+initrd  /initramfs-7.0.0.img
+options root=/dev/sda3 ro quiet
+```
+
+GRUB2 と比べて設定がシンプルだが、UEFI 環境でしか動作しない。
+
+---
+
+## Phase 2: カーネル初期化 -- start_kernel()
+
+ブートローダからカーネルに制御が渡ると、まずアーキテクチャ固有のアセンブリコードが実行される。
+x86_64 の場合、`arch/x86/boot/compressed/head_64.S` がエントリポイントとなる。
+
+### カーネル展開
+
+vmlinuz は圧縮されたカーネルイメージである。"vmlinuz" の "z" は圧縮 (zipped) を意味する。
+
+```
+vmlinuz の構造:
++---------------------------+
+| setup header (リアルモード)|  ← ブートプロトコル情報
++---------------------------+
+| 圧縮されたカーネル本体     |  ← zstd/gzip/lz4/xz で圧縮
++---------------------------+
+| 展開コード (decompressor)  |  ← 自己展開ルーチン
++---------------------------+
+```
+
+展開コードが圧縮カーネルを物理メモリ上に展開し、展開されたカーネルの `startup_64()` にジャンプする。
+最終的に `init/main.c` の `start_kernel()` が呼ばれる。
+
+### start_kernel() の呼び出しシーケンス
+
+`start_kernel()` は全アーキテクチャ共通のカーネル初期化関数である。
+`init/main.c` に定義されており、数十の初期化関数を順番に呼び出す。
+
+以下に主要な呼び出しを時系列順に示す。
+
+```c
+/* init/main.c (簡略化) */
+asmlinkage __visible void __init start_kernel(void)
+{
+    /* === 1. 最初期の初期化 === */
+    set_task_stack_end_magic(&init_task);  /* PID 0 (swapper) のスタック保護 */
+    local_irq_disable();                  /* 割り込み無効化 */
+
+    boot_cpu_init();                      /* ブート CPU を online にマーク */
+    setup_command_line(command_line);      /* コマンドライン保存 */
+
+    /* === 2. アーキテクチャ固有の初期化 === */
+    setup_arch(&command_line);            /* ★ 後述 */
+
+    /* === 3. メモリ管理の初期化 === */
+    mm_init();                            /* ★ 後述 */
+
+    /* === 4. スケジューラ初期化 === */
+    sched_init();                         /* ★ 後述 */
+
+    /* === 5. 割り込み初期化 === */
+    init_IRQ();                           /* ★ 後述 */
+    softirq_init();                       /* ソフト割り込み */
+
+    /* === 6. タイマー・時刻 === */
+    tick_init();
+    init_timers();
+    hrtimers_init();
+    time_init();                          /* アーキテクチャ固有のクロック */
+
+    /* === 7. コンソール === */
+    console_init();                       /* ★ 後述 */
+
+    /* === 8. その他の初期化 === */
+    vfs_caches_init();                    /* VFS キャッシュ */
+    signals_init();                       /* シグナル */
+    proc_root_init();                     /* /proc ファイルシステム */
+
+    /* === 9. 最後の仕上げ === */
+    rest_init();                          /* ★ 後述 */
+}
+```
+
+各関数の役割を詳しく見ていこう。
+
+### setup_arch(): アーキテクチャ固有の初期化
+
+`setup_arch()` は `arch/<arch>/kernel/setup.c` に定義される。
+アーキテクチャごとに異なる処理を行うが、主な責務は共通している。
+
+| 処理 | 説明 |
+|---|---|
+| メモリマップの取得 | BIOS の E820 テーブル / UEFI メモリマップをパース |
+| CPU 機能の検出 | CPUID で機能を判定。AVX, SME, CET など |
+| ページテーブル初期化 | カーネル空間のページテーブルを構築 |
+| NUMA トポロジ解析 | ACPI SRAT テーブルからノード構成を取得 |
+| 予約メモリの登録 | ACPI テーブル、カーネル本体、initramfs 領域を予約 |
+| Device Tree のパース | ARM/RISC-V: DTB からハードウェア情報を取得 |
+
+```c
+/* arch/x86/kernel/setup.c (大幅に簡略化) */
+void __init setup_arch(char **cmdline_p)
+{
+    /* E820 メモリマップの取得 */
+    e820__memory_setup();
+
+    /* コマンドラインの処理 */
+    *cmdline_p = boot_command_line;
+
+    /* CPU の検出と機能フラグ設定 */
+    early_cpu_init();
+    identify_boot_cpu();
+
+    /* ACPI テーブルの初期パース */
+    acpi_boot_table_init();
+
+    /* ページテーブルの設定 */
+    init_mem_mapping();
+
+    /* NUMA ノードの設定 */
+    x86_numa_init();
+}
+```
+
+### mm_init(): メモリ管理の初期化
+
+`mm_init()` はカーネルのメモリ管理サブシステム全体を初期化する。
+
+```c
+static void __init mm_init(void)
+{
+    /* ページアロケータ (Buddy System) の初期化 */
+    mem_init();           /* 全メモリをページアロケータに登録 */
+
+    /* SLUB アロケータの初期化 */
+    kmem_cache_init();    /* kmalloc 用のキャッシュを作成 */
+
+    /* vmalloc 領域の初期化 */
+    vmalloc_init();
+
+    /* ページテーブルキャッシュの初期化 */
+    pgtable_init();
+}
+```
+
+この関数が完了した後、`kmalloc()` や `vmalloc()` が使用可能になる。
+それ以前のコードは静的メモリか `memblock` (ブート専用アロケータ) を使わなければならない。
+
+### sched_init(): スケジューラの初期化
+
+```c
+void __init sched_init(void)
+{
+    /* CPU ごとの runqueue を初期化 */
+    for_each_possible_cpu(i) {
+        rq = cpu_rq(i);
+        raw_spin_lock_init(&rq->lock);
+        rq->nr_running = 0;
+        /* CFS, RT, DL 各スケジューラクラスの初期化 */
+        cfs_rq_init(&rq->cfs);
+        rt_rq_init(&rq->rt);
+        dl_rq_init(&rq->dl);
+    }
+
+    /* init_task (PID 0 = swapper) のスケジューリングパラメータ設定 */
+    set_load_weight(&init_task, false);
+
+    /* スケジューラのデバッグ機能初期化 */
+    scheduler_running = 1;
+}
+```
+
+この時点ではまだ SMP (マルチプロセッサ) は有効になっていない。
+ブート CPU だけがコードを実行している。他の CPU は `smp_init()` で後から起動される。
+
+### init_IRQ(): 割り込みコントローラの初期化
+
+```c
+void __init init_IRQ(void)
+{
+    /* x86: APIC の初期化、IRQ ベクタの設定 */
+    /* ARM: GIC (Generic Interrupt Controller) の初期化 */
+    /* RISC-V: PLIC / APLIC の初期化 */
+
+    /* IRQ ディスクリプタの割り当て */
+    /* デフォルトの割り込みハンドラを設定 */
+}
+```
+
+割り込みコントローラはアーキテクチャによって大きく異なる。
+x86 では APIC (Advanced Programmable Interrupt Controller)、ARM では GIC、RISC-V では PLIC が使われる。
+
+### console_init(): コンソールの初期化
+
+```c
+void __init console_init(void)
+{
+    /* 登録済みの early console ドライバを呼び出す */
+    /* シリアルコンソール (ttyS0) が典型的 */
+    /* ここから printk の出力がコンソールに表示される */
+}
+```
+
+`console_init()` が完了するまでの `printk()` 出力はログバッファに蓄積されている。
+コンソール初期化後、バッファ内のメッセージが一気に表示される。
+`earlyprintk` カーネルパラメータを使えば、この関数の前からコンソール出力が可能になる (デバッグ用)。
+
+### rest_init(): カーネルスレッドの生成
+
+`rest_init()` は `start_kernel()` の最後に呼ばれる、極めて重要な関数である。
+
+```c
+noinline void __ref rest_init(void)
+{
+    /* PID 1: kernel_init スレッドを作成 */
+    pid = kernel_thread(kernel_init, NULL, CLONE_FS);
+
+    /* PID 2: kthreadd (カーネルスレッドデーモン) を作成 */
+    pid = kernel_thread(kthreadd, NULL, CLONE_FS | CLONE_FILES);
+
+    /* PID 0 (現在のコンテキスト) はアイドルスレッドになる */
+    cpu_startup_entry(CPUHP_ONLINE);
+}
+```
+
+ここで Linux の最初の 3 つのプロセスが確定する:
+
+| PID | 名前 | 役割 |
+|---|---|---|
+| 0 | swapper (idle) | アイドルタスク。他に実行するタスクがないときに CPU を省電力モードにする |
+| 1 | kernel_init → /sbin/init | initcall を実行し、最終的にユーザ空間の init に `exec` する |
+| 2 | kthreadd | 全てのカーネルスレッドの親。`kthread_create()` のリクエストを処理する |
+
+---
+
+## Initcall レベル
+
+`kernel_init()` から呼ばれる `do_initcalls()` は、カーネルに組み込まれた初期化関数を
+優先度順に実行する仕組みである。
+
+### Initcall レベル一覧
+
+| レベル | 番号 | マクロ | 用途と代表例 |
+|---|---|---|---|
+| pure | 0 | `pure_initcall(fn)` | 副作用のない最初期の初期化。CPU 周波数テーブル等 |
+| core | 1 | `core_initcall(fn)` | コアサブシステム。IRQ ドメイン、DMA マッピング |
+| postcore | 2 | `postcore_initcall(fn)` | コア後。kobject、デバイスモデルのバスタイプ登録 |
+| arch | 3 | `arch_initcall(fn)` | アーキテクチャ固有。ACPI テーブル、トポロジ |
+| subsys | 4 | `subsys_initcall(fn)` | サブシステム。PCI バス、USB コア、ネットワークスタック |
+| fs | 5 | `fs_initcall(fn)` | ファイルシステム。ext4, btrfs, procfs, sysfs の登録 |
+| device | 6 | `device_initcall(fn)` | デバイスドライバ。**`module_init()` のデフォルト** |
+| late | 7 | `late_initcall(fn)` | 最後。他の全てが初期化された後に実行 |
+
+### module_init() と initcall レベルの関係
+
+`module_init()` マクロは、モジュールのビルド方式によって異なる展開をする。
+
+```c
+/* include/linux/module.h (簡略化) */
+
+#ifdef MODULE
+  /* ローダブルモジュール (.ko) の場合 */
+  #define module_init(fn)  int init_module(void) __attribute__((alias(#fn)));
+  /* → insmod 時に init_module() として呼ばれる */
+#else
+  /* ビルトイン (obj-y) の場合 */
+  #define module_init(fn)  device_initcall(fn);
+  /* → レベル 6 の initcall として登録される */
+#endif
+```
+
+つまり、同じ `module_init(my_init)` というコードが:
+- **obj-m** (ローダブル) → `insmod` 時に動的に呼ばれる
+- **obj-y** (ビルトイン) → ブート中の initcall レベル 6 で呼ばれる
+
+### ELF セクションによる実装
+
+initcall は ELF バイナリのセクション名で実現される。
+
+```
+セクション名: .initcallN.init  (N = 0..7)
+
+リンカスクリプト (vmlinux.lds) で以下のように配置:
+  .initcall0.init  ← pure
+  .initcall1.init  ← core
+  .initcall2.init  ← postcore
+  .initcall3.init  ← arch
+  .initcall4.init  ← subsys
+  .initcall5.init  ← fs
+  .initcall6.init  ← device (module_init)
+  .initcall7.init  ← late
+
+do_initcalls() はこの順にセクションをスキャンし、
+各セクション内の関数ポインタを順番に呼び出す。
+```
+
+同一レベル内の実行順序は、リンク時のオブジェクトファイルの並び順で決まる。
+Makefile 内の `obj-y += a.o b.o` の記述順が初期化順序に直結する。
+
+### Rust モジュールと initcall レベル
+
+従来、`module!` マクロで定義された Rust カーネルモジュールは全てレベル 6 (device_initcall) に配置されていた。
+2026 年 2 月に投稿されたパッチにより、`module!` マクロに `initcall` フィールドが追加され、
+任意の initcall レベルを指定できるようになった。
+
+```rust
+// SPDX-License-Identifier: GPL-2.0
+
+//! 例: subsys レベルで初期化される Rust モジュール
+
+use kernel::prelude::*;
+
+module! {
+    type: MySubsystem,
+    name: "my_subsystem",
+    author: "Author",
+    description: "A subsystem-level Rust module",
+    license: "GPL",
+    initcall: subsys,  // ← レベル 4 で初期化
+}
+```
+
+指定可能な値は `pure`, `core`, `postcore`, `arch`, `subsys`, `fs`, `device`, `late` の 8 種類である。
+`initcall` フィールドを省略した場合はデフォルトの `device` (レベル 6) が使われるため、
+既存のモジュールは変更不要である。
+
+なお、ローダブルモジュール (.ko) の場合は `initcall` フィールドに関係なく、
+常に `init_module()` 経由でロード時に初期化される。
+`initcall` レベルの指定はビルトインモジュールにのみ影響する。
+
+---
+
+## Initramfs
+
+### initramfs とは何か
+
+initramfs (initial RAM filesystem) は、カーネルが本来のルートファイルシステムをマウントするために必要な
+ドライバやツールを含む小さなファイルシステムである。
+
+なぜ必要なのか。ルートファイルシステムが例えば NVMe SSD 上の Btrfs にある場合、
+カーネルはまず NVMe ドライバをロードし、Btrfs モジュールをロードしなければ
+ルートをマウントできない。しかしそのドライバ自体はルートファイルシステム上にある
+-- 鶏と卵の問題が発生する。
+
+initramfs はこの問題を解決する。必要最小限のドライバとツールをカーネルと一緒にメモリにロードし、
+そこからルートファイルシステムをマウントする。
+
+### initramfs の内容
+
+典型的な initramfs には以下が含まれる:
+
+```
+initramfs の典型的なディレクトリ構造:
+
+/init                    ← 最初に実行されるスクリプト (PID 1)
+/bin/busybox             ← 基本コマンド群
+/lib/modules/7.0.0/      ← カーネルモジュール (.ko)
+    ├── nvme.ko          ← NVMe ドライバ
+    ├── ext4.ko          ← ext4 ファイルシステム
+    ├── btrfs.ko         ← btrfs ファイルシステム
+    ├── dm-crypt.ko      ← ディスク暗号化
+    └── ...
+/lib/udev/               ← udev ルールとヘルパー
+/etc/modprobe.d/         ← モジュール設定
+/sbin/modprobe           ← モジュールローダ
+/sbin/switch_root        ← ルート切り替えコマンド
+```
+
+### cpio アーカイブと tmpfs
+
+initramfs は **cpio** 形式のアーカイブとして圧縮され、ブートローダによってメモリにロードされる。
+カーネルはこのアーカイブを **tmpfs** (メモリ上のファイルシステム) に展開する。
+
+```bash
+# initramfs の中身を確認する
+lsinitrd /boot/initramfs-7.0.0.img
+
+# 手動で展開する場合
+mkdir /tmp/initramfs && cd /tmp/initramfs
+zstd -d < /boot/initramfs-7.0.0.img | cpio -idmv
+```
+
+initramfs の生成は通常 `dracut` (Fedora/RHEL) や `mkinitcpio` (Arch Linux)、
+`initramfs-tools` (Debian/Ubuntu) が行う。
+
+```bash
+# dracut で initramfs を再生成
+dracut --force /boot/initramfs-$(uname -r).img $(uname -r)
+
+# mkinitcpio で再生成
+mkinitcpio -p linux
+```
+
+### switch_root: 本ルートへの切り替え
+
+initramfs 内の `/init` スクリプトがルートファイルシステムのマウントに成功すると、
+`switch_root` コマンドでルートを切り替える。
+
+```bash
+#!/bin/sh
+# initramfs 内の /init スクリプト (簡略化)
+
+# 1. 必要なモジュールをロード
+modprobe nvme
+modprobe ext4
+
+# 2. ルートファイルシステムをマウント
+mount -t ext4 /dev/nvme0n1p2 /sysroot
+
+# 3. ルート切り替え
+# switch_root は:
+#   - initramfs 上の全ファイルを削除 (メモリ解放)
+#   - /sysroot を新しい / にマウント
+#   - /sysroot/sbin/init を exec
+exec switch_root /sysroot /sbin/init
+```
+
+`switch_root` は initramfs の tmpfs 上の全ファイルを削除してメモリを解放した後、
+新しいルートに `chroot` して指定されたプログラムを `exec` する。
+
+### Linux 7.0: レガシー initrd コードの削除
+
+Linux 7.0 (2026 年 4 月リリース) で、レガシーな initrd (initial RAM disk) のコードが削除された。
+レガシー initrd と initramfs は異なる仕組みである:
+
+| 特徴 | レガシー initrd | initramfs |
+|---|---|---|
+| 実装 | ブロックデバイス (ramdisk) | tmpfs (ページキャッシュ) |
+| カーネルパラメータ | `load_ramdisk=1` | `initrd=` (名前は紛らわしい) |
+| ルート切り替え | `linuxrc` → `pivot_root` | `/init` → `switch_root` |
+| メモリ効率 | 固定サイズの ramdisk を確保 | 必要な分だけ使用 |
+| 非推奨化 | 2020 年 | -- |
+| 削除 | Linux 7.0 | 現行方式 |
+
+レガシー initrd は 2020 年に非推奨 (deprecated) となり、Linux 7.0 で約 1000 行のコードが削除された。
+`load_ramdisk` と `prompt_ramdisk` カーネルパラメータ、`/proc/sys/kernel/real-root-dev` も削除されている。
+現代の Linux では initramfs のみが使われる。
+
+---
+
+## PID 1: init プロセス
+
+### init プロセスの役割
+
+`kernel_init()` 関数は initcall と initramfs の処理を終えた後、ユーザ空間の init プログラムを `exec` する。
+
+```c
+/* init/main.c (簡略化) */
+static int __ref kernel_init(void *unused)
+{
+    kernel_init_freeable();  /* initcall + initramfs */
+
+    /* ユーザ空間の init を試す */
+    if (ramdisk_execute_command)
+        run_init_process(ramdisk_execute_command);  /* initramfs の /init */
+
+    if (execute_command)
+        run_init_process(execute_command);  /* init= パラメータで指定 */
+
+    /* デフォルトの候補を順に試す */
+    if (!run_init_process("/sbin/init") ||
+        !run_init_process("/etc/init") ||
+        !run_init_process("/bin/init") ||
+        !run_init_process("/bin/sh"))
+        ;
+
+    panic("No working init found.");
+}
+```
+
+### PID 1 の特殊性
+
+PID 1 のプロセスはカーネルから特別な扱いを受ける。
+
+1. **kill できない**: `SIGKILL` や `SIGSTOP` を送っても無視される。
+   init が死ぬとカーネルパニックになるため、カーネルが保護している。
+
+   ```c
+   /* kernel/signal.c */
+   /* PID 1 が明示的にハンドラを設定したシグナルのみ配送される */
+   if (is_global_init(current) && !force)
+       return;  /* シグナルを無視 */
+   ```
+
+2. **孤児プロセスの再養育 (reparenting)**: 親プロセスが死んだ子プロセスは PID 1 の子になる。
+   init は定期的に `wait()` を呼んでゾンビプロセスを回収する。
+
+3. **名前空間ごとの PID 1**: PID 名前空間 (コンテナ) 内にもその名前空間の PID 1 がある。
+   コンテナ内の PID 1 が死ぬとその名前空間の全プロセスが `SIGKILL` される。
+
+### 主要な init 実装
+
+| init | 採用ディストリビューション | 特徴 |
+|---|---|---|
+| systemd | Fedora, Ubuntu, Debian, RHEL, SUSE | サービスの並列起動、ソケット/D-Bus アクティベーション |
+| OpenRC | Gentoo, Alpine (選択可能) | シェルスクリプトベースの init スクリプト |
+| busybox init | 組み込み Linux | 最小構成。`/etc/inittab` ベース |
+| runit | Void Linux | シンプルなプロセス監視 |
+| dinit | Chimera Linux | 依存関係ベースのサービスマネージャ |
+
+---
+
+## カーネルコマンドライン
+
+### コマンドラインの渡し方
+
+カーネルコマンドラインはブートローダからカーネルに渡される文字列で、
+カーネルとモジュールの動作を制御するパラメータの集合である。
+
+```
+GRUB:  linux /vmlinuz root=/dev/sda2 ro quiet loglevel=3 modprobe.blacklist=nouveau
+DT:    /chosen { bootargs = "root=/dev/mmcblk0p2 rootwait console=ttyS0,115200"; };
+UEFI:  efistub のオプションとして直接指定
+```
+
+### 主要なカーネルパラメータ
+
+```bash
+# ルートファイルシステム
+root=/dev/sda2                  # ルートデバイスの指定
+rootfstype=ext4                 # ファイルシステムタイプ
+ro                              # 読み取り専用でマウント (後で remount rw)
+rootwait                        # ルートデバイスの出現を待つ (USB, MMC)
+
+# コンソールとデバッグ
+console=ttyS0,115200            # シリアルコンソール
+console=tty0                    # VGA コンソール (複数指定可)
+earlyprintk=serial,ttyS0,115200 # console_init() 前からの出力
+loglevel=7                      # printk のログレベル (0-7)
+debug                           # loglevel=7 と同等
+quiet                           # loglevel=4 (警告以上のみ)
+
+# init プロセス
+init=/bin/bash                  # init の代わりに bash を起動 (レスキュー用)
+systemd.unit=rescue.target      # systemd をレスキューモードで起動
+
+# メモリ
+mem=4G                          # 使用メモリを制限
+memmap=1G$2G                    # メモリ領域の予約/マッピング
+hugepagesz=2M hugepages=512     # 2MB Huge Page を 512 個確保
+
+# モジュール
+modprobe.blacklist=nouveau      # nouveau ドライバのロードを禁止
+module.sig_enforce=1            # 署名なしモジュールのロードを拒否
+
+# セキュリティ
+lockdown=integrity              # カーネルロックダウン (integrity モード)
+lockdown=confidentiality        # カーネルロックダウン (機密性モード)
+
+# デバッグ (トラブルシューティング)
+nokaslr                         # KASLR 無効化
+nosmp                           # SMP 無効化 (シングル CPU で起動)
+noapic                          # APIC 無効化
+acpi=off                        # ACPI 無効化
+```
+
+### __setup() マクロによるパラメータ処理
+
+カーネル内部では `__setup()` マクロで独自のコマンドラインパラメータを定義できる。
+
+```c
+/* 例: "mydriver.debug=1" というパラメータを処理する */
+static int mydriver_debug = 0;
+
+static int __init set_mydriver_debug(char *str)
+{
+    get_option(&str, &mydriver_debug);
+    return 1;  /* パラメータを消費 */
+}
+__setup("mydriver.debug=", set_mydriver_debug);
+```
+
+### モジュールパラメータ
+
+ローダブルモジュールは `module_param()` マクロでパラメータを定義し、
+コマンドラインまたは `insmod` / `modprobe` の引数として値を受け取れる。
+
+```c
+/* C モジュール */
+static int timeout = 30;
+module_param(timeout, int, 0644);
+MODULE_PARM_DESC(timeout, "Timeout in seconds (default: 30)");
+```
+
+```rust
+// Rust モジュール (kernel::module_param 経由)
+// ※ Rust のモジュールパラメータ API は発展途上
+```
+
+カーネルコマンドラインでは `モジュール名.パラメータ名=値` の形式で指定する:
+
+```
+linux /vmlinuz root=/dev/sda2 mydriver.timeout=60 snd_hda_intel.power_save=1
+```
+
+### earlyprintk によるブートデバッグ
+
+`console_init()` が完了する前のカーネル出力を見たい場合、`earlyprintk` を使う。
+
+```
+earlyprintk=serial,ttyS0,115200   # シリアルポート経由
+earlyprintk=vga                   # VGA テキストモード直接書き込み
+earlyprintk=dbgp                  # USB デバッグポート (EHCI)
+earlyprintk=xdbc                  # USB デバッグポート (xHCI)
+```
+
+`earlyprintk` はハードウェアに直接書き込むため、ドライバの初期化を待つ必要がない。
+ブート初期段階の問題をデバッグする際に不可欠なツールである。
+
+---
+
+## Device Tree ブートと ACPI
+
+### Device Tree (ARM / RISC-V)
+
+ARM や RISC-V などの組み込み向けアーキテクチャでは、ハードウェアの構成を
+**Device Tree** (DT) で記述する。
+
+Device Tree はハードウェアの「設計図」をデータ構造として表現したものである。
+ソースファイル (.dts) をコンパイルしてバイナリ (.dtb) にし、ブートローダがカーネルに渡す。
+
+```dts
+/* 例: UART を持つ SoC の Device Tree (簡略化) */
+/dts-v1/;
+
+/ {
+    compatible = "vendor,my-board";
+    model = "My Development Board";
+
+    cpus {
+        cpu@0 {
+            compatible = "arm,cortex-a72";
+            reg = <0>;
+        };
+    };
+
+    soc {
+        uart0: serial@10000000 {
+            compatible = "ns16550a";
+            reg = <0x10000000 0x100>;
+            interrupts = <0 33 4>;
+            clock-frequency = <48000000>;
+            status = "okay";
+        };
+
+        i2c0: i2c@10010000 {
+            compatible = "vendor,my-i2c";
+            reg = <0x10010000 0x100>;
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            temperature-sensor@48 {
+                compatible = "ti,tmp102";
+                reg = <0x48>;
+            };
+        };
+    };
+};
+```
+
+カーネルは DTB をパースし、`compatible` 文字列を使ってドライバとデバイスをマッチングする。
+
+### DT オーバーレイ
+
+実行時に Device Tree を動的に変更できるのが **DT オーバーレイ** である。
+ハードウェアのホットプラグや拡張ボードの接続に使われる。
+
+```dts
+/* DT オーバーレイの例: I2C デバイスの追加 */
+/dts-v1/;
+/plugin/;
+
+&i2c0 {
+    accelerometer@1d {
+        compatible = "nxp,mma8452";
+        reg = <0x1d>;
+    };
+};
+```
+
+```bash
+# 実行時にオーバーレイを適用 (ConfigFS 経由)
+mkdir /sys/kernel/config/device-tree/overlays/accel
+cat my_overlay.dtbo > /sys/kernel/config/device-tree/overlays/accel/dtbo
+```
+
+### ACPI (x86)
+
+x86 システムでは **ACPI** (Advanced Configuration and Power Interface) がハードウェアを記述する。
+ACPI テーブルはファームウェア (UEFI/BIOS) がメモリ上に配置し、カーネルがパースする。
+
+| テーブル | 正式名称 | 役割 |
+|---|---|---|
+| DSDT | Differentiated System Description Table | デバイスとメソッドの定義 |
+| SSDT | Secondary System Description Table | DSDT の補足 |
+| MADT | Multiple APIC Description Table | CPU と割り込みコントローラの列挙 |
+| SRAT | System Resource Affinity Table | NUMA ノードの構成 |
+| MCFG | Memory Mapped Configuration | PCI Express 構成空間のベースアドレス |
+| HPET | High Precision Event Timer | HPET の情報 |
+
+```
+# ACPI テーブルの確認
+ls /sys/firmware/acpi/tables/
+cat /sys/firmware/acpi/tables/MADT | hexdump -C | head
+```
+
+### Device Tree vs ACPI 比較
+
+| 特徴 | Device Tree | ACPI |
+|---|---|---|
+| 主な対象 | ARM, RISC-V, PowerPC | x86, ARM サーバ |
+| 記述言語 | DTS (Device Tree Source) | ASL (ACPI Source Language) |
+| バイナリ | DTB | AML (ACPI Machine Language) |
+| 配置場所 | ブートローダがメモリにロード | ファームウェアがメモリに配置 |
+| 動的変更 | DT オーバーレイ | SSDT の動的ロード |
+| 電源管理 | 限定的 | 包括的 (S0-S5 スリープステート) |
+| サーバ用途 | ARM サーバでも ACPI 推奨 | 標準 |
+
+ARM サーバの世界では、SBSA (Server Base System Architecture) 準拠のために
+Device Tree ではなく ACPI を使うケースが増えている。
+
+---
+
+## UEFI Secure Boot
+
+### 信頼チェーン
+
+UEFI Secure Boot は、ブートプロセスの各段階で署名を検証し、
+改ざんされたコードの実行を防ぐ仕組みである。
+
+```
+信頼チェーン (Chain of Trust):
+
+  [UEFI ファームウェア]
+        |
+        | PK (Platform Key) で KEK を検証
+        v
+  [KEK (Key Exchange Key)]
+        |
+        | KEK で db (署名データベース) を検証
+        v
+  [db (署名データベース)]
+        |
+        | db 内の証明書でブートローダを検証
+        v
+  [ブートローダ (GRUB2 / shim)]
+        |
+        | カーネルの署名を検証
+        v
+  [カーネル (vmlinuz)]
+        |
+        | CONFIG_MODULE_SIG でモジュールの署名を検証
+        v
+  [カーネルモジュール (.ko)]
+```
+
+### 主要な鍵と証明書
+
+| 名称 | 役割 |
+|---|---|
+| PK (Platform Key) | プラットフォームの所有者 (通常は OEM) が設定。KEK の更新を制御 |
+| KEK (Key Exchange Key) | OS ベンダが署名データベースを更新するための鍵 |
+| db (Signature Database) | 信頼されたブートローダ/カーネルの署名リスト |
+| dbx (Forbidden Signatures) | 取り消された (脆弱な) 署名のブラックリスト |
+
+### Microsoft 2011 証明書の期限切れ (2026 年 6 月)
+
+現在の Secure Boot インフラは、以下の 3 つの 2011 年発行の Microsoft 証明書に依存している:
+
+- **Microsoft Corporation KEK CA 2011**
+- **Microsoft Windows Production PCA 2011**
+- **Microsoft Corporation UEFI CA 2011**
+
+これらの証明書は **2026 年 6 月** に期限切れを迎える。
+Microsoft は 2023 年版の後継証明書を発行しており、2025 年後半から Windows Update を通じて
+デバイスのファームウェアに新証明書のロールアウトを開始している。
+
+この移行が Linux に与える影響:
+
+1. **shim の再署名**: Linux ディストリビューションが使う shim ブートローダは
+   Microsoft の UEFI CA で署名されている。新証明書で再署名が必要。
+2. **古いハードウェア**: ファームウェアアップデートを受けられない古いマシンでは、
+   新証明書で署名されたブートローダが起動できない可能性がある。
+3. **自前の鍵**: 自分の PK/KEK/db を登録すれば Microsoft の証明書に依存しない。
+   `mokutil` や `KeyTool.efi` で管理できる。
+
+### カーネルモジュールの署名
+
+```
+カーネル設定オプション:
+
+CONFIG_MODULE_SIG=y          # モジュール署名の検証を有効化
+                             # (未署名モジュールは警告付きでロード可能)
+
+CONFIG_MODULE_SIG_FORCE=y    # 署名なしモジュールのロードを完全に拒否
+
+CONFIG_MODULE_SIG_SHA512=y   # 署名のハッシュアルゴリズム
+
+CONFIG_SYSTEM_TRUSTED_KEYS="certs/signing_key.pem"
+                             # ビルド時に自動生成される署名鍵
+```
+
+モジュールへの署名:
+
+```bash
+# カーネルビルドツリー内のスクリプトで署名
+scripts/sign-file sha512 \
+    certs/signing_key.pem \
+    certs/signing_key.x509 \
+    my_module.ko
+
+# 署名の確認
+modinfo my_module.ko | grep sig
+```
+
+### カーネルロックダウンモード
+
+Secure Boot が有効な場合、カーネルは自動的に **lockdown モード** に入ることがある。
+lockdown モードでは、カーネルの完全性を脅かす操作が制限される。
+
+| 制限される操作 | integrity モード | confidentiality モード |
+|---|---|---|
+| `/dev/mem` への書き込み | 制限 | 制限 |
+| `/dev/kmem` へのアクセス | 制限 | 制限 |
+| カスタム ACPI テーブルのロード | 制限 | 制限 |
+| kexec (未署名カーネル) | 制限 | 制限 |
+| BPF による任意の読み取り | 許可 | 制限 |
+| `/proc/kcore` の読み取り | 許可 | 制限 |
+| perf によるカーネルアドレス漏洩 | 許可 | 制限 |
+
+```
+# ロックダウンの状態を確認
+cat /sys/kernel/security/lockdown
+# 出力例: [none] integrity confidentiality
+```
+
+---
+
+## モジュールのロードと依存関係
+
+### ビルトイン (obj-y) vs ローダブル (obj-m)
+
+カーネルモジュールは 2 つの形態で存在できる。
+
+```makefile
+# drivers/net/Makefile
+obj-y     += core_net.o       # ビルトイン: vmlinuz に直接組み込まれる
+obj-m     += optional_net.o   # ローダブル: .ko ファイルとして外部に配置
+
+# CONFIG による切り替え (典型的)
+obj-$(CONFIG_MY_DRIVER) += my_driver.o
+# CONFIG_MY_DRIVER=y → obj-y (ビルトイン)
+# CONFIG_MY_DRIVER=m → obj-m (ローダブル)
+```
+
+| 特徴 | ビルトイン (obj-y) | ローダブル (obj-m) |
+|---|---|---|
+| 配置場所 | vmlinuz 内 | `/lib/modules/$(uname -r)/` |
+| ロードタイミング | initcall で自動 | `modprobe` / `insmod` で手動 |
+| メモリ | 常に使用 | ロード時のみ |
+| 依存関係 | リンク順で解決 | `depmod` / `modprobe` が解決 |
+| アンロード | 不可 | `rmmod` で可能 |
+
+### depmod と modprobe の依存関係解決
+
+`depmod` コマンドは全モジュールをスキャンし、シンボル依存関係のデータベースを構築する。
+
+```bash
+# depmod の実行 (カーネル更新後に実行)
+depmod -a
+
+# 生成されるファイル (/lib/modules/$(uname -r)/ 以下)
+modules.dep        # モジュール間の依存関係 (テキスト形式)
+modules.dep.bin    # 同上 (バイナリ形式、modprobe が使用)
+modules.alias      # デバイス ID → モジュール名のマッピング
+modules.alias.bin  # 同上 (バイナリ形式)
+modules.symbols    # エクスポートシンボル → モジュール名
+modules.builtin    # ビルトインモジュールのリスト
+```
+
+`modprobe` は `modules.dep` を参照して、依存関係を自動解決しながらモジュールをロードする。
+
+```bash
+# modprobe: 依存関係を自動解決
+modprobe btrfs
+# → btrfs が依存する libcrc32c, raid6_pq, xor 等を先にロード
+
+# insmod: 依存関係を解決しない (単体ロードのみ)
+insmod /lib/modules/7.0.0/kernel/fs/btrfs/btrfs.ko
+# → 依存モジュールが未ロードなら失敗する
+
+# modules.dep の中身 (例)
+# kernel/fs/btrfs/btrfs.ko: kernel/lib/libcrc32c.ko kernel/lib/raid6/raid6_pq.ko
+```
+
+### modules.alias とデバイスの自動ロード
+
+`modules.alias` はデバイス ID からモジュール名への対応表である。
+udev がデバイスを検出すると、この表を参照して適切なモジュールを自動ロードする。
+
+```
+# modules.alias の例
+alias pci:v00008086d00001572sv*sd*bc*sc*i* i40e
+alias usb:v046Dp0825d*dc*dsc*dp*ic*isc*ip* uvcvideo
+alias of:Nserial*Tns16550a* 8250_of
+```
+
+### ブートに必須のドライバ
+
+ルートファイルシステムのマウントに必要なドライバは、以下のいずれかの方法で利用可能にする必要がある:
+
+1. **ビルトイン (obj-y)**: vmlinuz に組み込む。確実だがカーネルサイズが増大する
+2. **initramfs に含める**: `dracut` 等で initramfs にドライバを含める。最も一般的
+3. **カーネルコマンドラインで指定**: `rootwait` でデバイスの出現を待つ
+
+```bash
+# initramfs にどのモジュールが含まれているか確認
+lsinitrd /boot/initramfs-7.0.0.img | grep '.ko'
+```
+
+典型的なブートに必須のドライバ:
+- ストレージコントローラ: `ahci`, `nvme`, `virtio_blk`
+- ファイルシステム: `ext4`, `btrfs`, `xfs`
+- ディスク暗号化: `dm_crypt`
+- LVM: `dm_mod`
+- RAID: `md_mod`, `raid456`
+
+---
+
+## kexec: ファームウェアを介さない高速リブート
+
+### kexec の基本
+
+`kexec` はファームウェア (BIOS/UEFI) の初期化をスキップして、
+実行中のカーネルから直接新しいカーネルを起動する仕組みである。
+
+```
+通常のリブート:
+  カーネル → BIOS/UEFI POST → ブートローダ → 新カーネル
+  (数十秒〜数分)
+
+kexec リブート:
+  カーネル → 新カーネル
+  (数秒)
+```
+
+```bash
+# 新しいカーネルをメモリにロード
+kexec -l /boot/vmlinuz-7.0.0 \
+    --initrd=/boot/initramfs-7.0.0.img \
+    --command-line="root=/dev/sda2 ro"
+
+# kexec で再起動
+kexec -e
+# または
+systemctl kexec
+```
+
+サーバの再起動時間を短縮できるため、大規模データセンターでは重要な技術である。
+ファームウェアの POST (メモリテスト等) をスキップすることで、数十秒のダウンタイムを削減できる。
+
+### kexec の注意点
+
+- ハードウェアの再初期化が行われないため、一部のデバイスが不安定になることがある
+- Secure Boot 環境では、kexec で起動するカーネルにも署名が必要 (`CONFIG_KEXEC_SIG`)
+- IOMMU の状態がリセットされないため、DMA を使うデバイスに影響する可能性がある
+
+### Kexec HandOver (KHO) -- Linux 6.16 で導入
+
+Linux 6.16 (2025 年) で **Kexec HandOver (KHO)** が導入された。
+従来の kexec ではカーネルの全状態が破棄されていたが、KHO を使うと
+**特定のカーネル状態をリブート後の新カーネルに引き継ぐ** ことができる。
+
+```
+従来の kexec:
+  旧カーネル → [全状態破棄] → 新カーネル (ゼロから初期化)
+
+KHO:
+  旧カーネル → [指定した状態を保持] → 新カーネル (保持状態を復元)
+```
+
+KHO の主なユースケース:
+
+1. **ライブカーネルアップデート**: セキュリティパッチの適用時に VM やネットワーク接続を
+   維持したままカーネルを更新する。Google Cloud がこのユースケースを推進している。
+2. **メモリの永続化**: 巨大なページテーブルや DMA バッファをリブート後も維持する。
+3. **ダウンタイムの最小化**: データセンターでのカーネル更新時に、サービスの中断を
+   数秒から数ミリ秒に短縮する。
+
+KHO は FDT (Flattened Device Tree) 形式で保持する状態を記述し、
+新カーネルがブート時にこれをパースして状態を復元する。
+
+### kdump: クラッシュ解析
+
+kexec のもう一つの重要な応用が **kdump** である。
+カーネルパニック時に、事前にロードしておいた「キャプチャカーネル」で再起動し、
+クラッシュ時のメモリダンプを保存する。
+
+```bash
+# kdump 用カーネルの事前ロード
+kexec -p /boot/vmlinuz-7.0.0 \
+    --initrd=/boot/initramfs-kdump.img \
+    --command-line="1 irqpoll maxcpus=1 reset_devices"
+
+# クラッシュ発生時:
+# 1. カーネルパニック
+# 2. kexec でキャプチャカーネルが起動
+# 3. /proc/vmcore からクラッシュダンプを保存
+# 4. crash コマンドで解析
+```
+
+```
+kdump の動作フロー:
+
+ [本番カーネル]
+      |
+      | パニック発生!
+      v
+ [kexec -p で事前ロードされたキャプチャカーネル]
+      |
+      | /proc/vmcore → クラッシュダンプを /var/crash/ に保存
+      v
+ [通常リブート]
+      |
+      v
+ [crash ツールでダンプを解析]
+```
+
+---
+
+## CONFIG_RUST とブートプロセス
+
+### ブートシーケンスへの影響
+
+`CONFIG_RUST=y` でカーネルをビルドしても、**ブートシーケンス自体は変わらない**。
+
+Rust サポートが影響するのは以下の点のみ:
+
+1. **vmlinuz のサイズ**: Rust ランタイムライブラリ (libcore 等) が組み込まれるため、
+   カーネルイメージが若干大きくなる。
+
+2. **initcall の追加**: Rust で書かれたビルトインモジュールの init 関数が
+   対応する initcall レベルに追加される。C モジュールと同じ仕組みで呼ばれる。
+
+3. **モジュールフォーマット**: Rust の `.ko` ファイルも C と同じ ELF フォーマットであり、
+   `modprobe` / `insmod` で同じようにロードできる。
+
+### Rust モジュールの initcall
+
+Rust モジュールが initcall に参加する仕組みを確認しよう。
+
+```rust
+module! {
+    type: MyDriver,
+    name: "my_driver",
+    // ...
+    license: "GPL",
+    // initcall を省略 → device_initcall (レベル 6) がデフォルト
+}
+```
+
+`module!` マクロは以下の C ABI シンボルを生成する:
+
+```
+// マクロが生成するコード (概念的)
+#[link_section = ".initcall6.init"]
+static INIT_FN: fn() -> i32 = __my_driver_init;
+
+// → do_initcalls() のレベル 6 で C のドライバと同じタイミングで呼ばれる
+```
+
+C のドライバと Rust のドライバが同じ initcall レベルに混在しても問題ない。
+リンク時のオブジェクトファイル順に実行されるため、Makefile の記述順が初期化順序を決定する。
+
+### ブート時のログ
+
+CONFIG_RUST が有効なカーネルのブートログには以下のようなメッセージが表示される:
+
+```
+[    0.000000] Linux version 7.0.0 (gcc 14.2, rustc 1.85.0) ...
+[    0.123456] rust_minimal: module loaded
+```
+
+`rustc` のバージョンがカーネルバージョン文字列に含まれるのが、
+Rust 対応カーネルの見分け方の一つである。
+
+---
+
+## まとめ: ブートプロセスの全体フロー
+
+```
+ 電源 ON
+   │
+   ├─ UEFI: SEC → PEI → DXE → BDS → ESP からブートローダ起動
+   │  (Secure Boot: 各段階で署名検証)
+   │
+   ├─ Legacy BIOS: POST → MBR → ブートローダ
+   │
+   v
+ ブートローダ (GRUB2 / systemd-boot / EFISTUB)
+   │  vmlinuz + initramfs + (DTB) をロード
+   │  カーネルコマンドラインを設定
+   │
+   v
+ カーネル展開 + start_kernel()
+   │  setup_arch() → mm_init() → sched_init() → init_IRQ()
+   │  → console_init() → rest_init()
+   │
+   v
+ rest_init()
+   │  PID 1: kernel_init()
+   │  PID 2: kthreadd
+   │
+   v
+ do_initcalls()
+   │  level 0 (pure) → 1 (core) → ... → 6 (device) → 7 (late)
+   │  C と Rust のモジュールが同じ仕組みで初期化される
+   │
+   v
+ initramfs の /init
+   │  ドライバロード → ルートマウント → switch_root
+   │
+   v
+ PID 1 (systemd / OpenRC / ...)
+   │  サービス起動 → ログイン画面
+   │
+   v
+ システム稼働中!
+```
+
+ブートプロセスを理解することは、カーネルモジュール開発者にとって不可欠である。
+
+- **モジュールの初期化順序** がなぜ重要なのか: 依存するサブシステムが未初期化だと probe が失敗する
+- **ブートに必須のドライバ** をどこに配置すべきか: ビルトインか initramfs か
+- **デバッグ手法**: `earlyprintk`, `loglevel`, `init=/bin/bash` で問題を切り分ける
+- **セキュリティ**: Secure Boot + モジュール署名 + lockdown で信頼チェーンを維持する
+
+次章では、このブートプロセスの知識を前提に、
+実際にカーネルモジュールが `probe()` される流れをコードレベルで追っていく。
+
+## 参考資料
+
+- [Demystifying the Kernel Boot Sequence (Bootlin)](https://bootlin.com/blog/demystifying-kernel-boot-sequence/)
+- [Kexec HandOver Concepts (kernel.org)](https://docs.kernel.org/next/kho/concepts.html)
+- [Secure Boot playbook for certificates expiring in 2026 (Microsoft)](https://techcommunity.microsoft.com/blog/windows-itpro-blog/secure-boot-playbook-for-certificates-expiring-in-2026/4469235)
+- [An introduction to Linux kernel initcalls (Collabora)](https://www.collabora.com/news-and-blog/blog/2020/07/14/introduction-to-linux-kernel-initcalls/)
+- [Secure Boot certificate changes in 2026: Guidance for RHEL (Red Hat)](https://developers.redhat.com/articles/2026/02/04/secure-boot-certificate-changes-2026-guidance-rhel-environments)

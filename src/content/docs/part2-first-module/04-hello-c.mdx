@@ -1,0 +1,378 @@
+---
+title: "Ch 3. 最初のカーネルモジュール — C 版"
+description: C 言語で Hello World カーネルモジュールを書き、カーネルモジュールの基本構造を理解する
+---
+
+## この章で学ぶこと
+
+- `module_init()` / `module_exit()` によるモジュールのライフサイクルを理解する
+- `printk()` とログレベルの仕組みを把握する
+- `insmod`, `rmmod`, `lsmod`, `modinfo` を使える
+- モジュールパラメータを定義して外部から値を渡せる
+## 前提
+
+- [Ch 3](/part1-introduction/03-setup/) の環境構築が完了している
+- `make LLVM=1 rustavailable` が成功する
+
+## カーネルモジュールとは
+
+Linux カーネルは **モノリシックカーネル** である。
+全てのカーネルコードは同一のアドレス空間で動作し、関数呼び出しのオーバーヘッドが最小限である。
+
+しかし、全てのドライバを常にカーネル本体に組み込むと、カーネルイメージが巨大になる。
+そこで Linux は **ローダブルカーネルモジュール** という仕組みを提供している。
+
+- モジュールは `.ko` (kernel object) ファイルとしてビルドされる
+- 実行中のカーネルに動的にロード (`insmod`) / アンロード (`rmmod`) できる
+- ロードされると、カーネルと同じアドレス空間で動作する (ユーザランドプログラムとは根本的に異なる)
+
+> **重要:** モジュールはユーザランドのプログラムではない。libc は使えない。`malloc` の代わりに `kmalloc`、`printf` の代わりに `printk` を使う。スタックは 16KB しかない。バグは panic やハングを引き起こす。
+
+## 最小のカーネルモジュール
+
+```c title="hello.c"
+#include <linux/init.h>
+#include <linux/module.h>
+
+static int __init hello_init(void)
+{
+    pr_info("hello: module loaded\n");
+    return 0;
+}
+
+static void __exit hello_exit(void)
+{
+    pr_info("hello: module unloaded\n");
+}
+
+module_init(hello_init);
+module_exit(hello_exit);
+
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Your Name");
+MODULE_DESCRIPTION("A minimal hello world kernel module");
+```
+
+### 逐行解説
+
+**`#include <linux/init.h>`**
+`__init` と `__exit` マクロを定義する。これらはメモリ最適化のためのセクション指示子である。
+
+**`#include <linux/module.h>`**
+`module_init()`, `module_exit()`, `MODULE_LICENSE()` などのマクロを定義する。
+全てのカーネルモジュールはこのヘッダを include する。
+
+**`static int __init hello_init(void)`**
+モジュールがロードされたときに呼ばれる初期化関数。
+
+- `static` — このファイル外から直接呼ばれないため
+- `__init` — 初期化完了後にメモリを解放してよいことをカーネルに伝える
+- 戻り値 `0` は成功、負の errno は失敗を意味する
+
+**`static void __exit hello_exit(void)`**
+モジュールがアンロードされたときに呼ばれるクリーンアップ関数。
+
+- `__exit` — カーネル本体に built-in (`=y`) の場合、この関数は省略される
+
+**`module_init(hello_init)`**
+カーネルに「この関数を init 時に呼べ」と伝えるマクロ。
+内部的には `init_module` シンボルを生成する。
+
+**`module_exit(hello_exit)`**
+カーネルに「この関数を cleanup 時に呼べ」と伝えるマクロ。
+内部的には `cleanup_module` シンボルを生成する。
+
+**`MODULE_LICENSE("GPL")`**
+モジュールのライセンスを宣言する。`"GPL"` を指定しないと、
+GPL-only でエクスポートされたカーネルシンボル (`kmalloc` など) が使えない。
+
+## Makefile
+
+```makefile title="Makefile"
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+obj-m += hello.o
+
+all:
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+```
+
+- `obj-m += hello.o` — `hello.c` をモジュールとしてビルドする指示
+- `$(MAKE) -C $(KDIR)` — カーネルのビルドシステムに制御を委譲する
+- `M=$(PWD)` — 「このディレクトリのモジュールをビルドせよ」
+
+ビルド:
+
+```bash
+make
+# hello.ko が生成される
+```
+
+## モジュールの操作
+
+```bash
+# モジュールをロード
+sudo insmod hello.ko
+
+# カーネルログを確認
+dmesg | tail -5
+# [12345.678] hello: module loaded
+
+# ロード済みモジュールを一覧
+lsmod | grep hello
+# hello    16384  0
+
+# モジュール情報を表示
+modinfo hello.ko
+# filename:    hello.ko
+# license:     GPL
+# author:      Your Name
+# description: A minimal hello world kernel module
+
+# モジュールをアンロード
+sudo rmmod hello
+
+dmesg | tail -5
+# [12345.789] hello: module unloaded
+```
+
+## printk とログレベル
+
+`printk` はカーネルの printf である。ただし stdout に出力するのではなく、
+カーネルのリングバッファ (`/dev/kmsg`) にメッセージを書き込む。
+
+### ログレベル
+
+| マクロ | レベル | 用途 |
+|---|---|---|
+| `pr_emerg()` | 0 | システムが使用不能 |
+| `pr_alert()` | 1 | 直ちに対処が必要 |
+| `pr_crit()` | 2 | 致命的な状態 |
+| `pr_err()` | 3 | エラー |
+| `pr_warn()` | 4 | 警告 |
+| `pr_notice()` | 5 | 正常だが注目すべき状態 |
+| `pr_info()` | 6 | 情報 |
+| `pr_debug()` | 7 | デバッグ (CONFIG_DYNAMIC_DEBUG で制御) |
+
+`pr_info()` は `printk(KERN_INFO "...")` の省略形である。
+
+### dmesg の使い方
+
+```bash
+# 全ログを表示
+dmesg
+
+# 最後の 20 行
+dmesg | tail -20
+
+# ログレベルでフィルタ (err 以上)
+dmesg -l err
+
+# リアルタイムで監視
+dmesg -w
+
+# タイムスタンプを人間が読める形式で
+dmesg -T
+```
+
+## モジュールパラメータ
+
+```c title="hello_param.c"
+#include <linux/init.h>
+#include <linux/module.h>
+#include <linux/moduleparam.h>
+
+static int count = 1;
+module_param(count, int, 0644);
+MODULE_PARM_DESC(count, "Number of greetings");
+
+static char *name = "World";
+module_param(name, charp, 0644);
+MODULE_PARM_DESC(name, "Name to greet");
+
+static int __init hello_init(void)
+{
+    int i;
+    for (i = 0; i < count; i++)
+        pr_info("hello: Hello, %s! (%d/%d)\n", name, i + 1, count);
+    return 0;
+}
+
+static void __exit hello_exit(void)
+{
+    pr_info("hello: Goodbye, %s!\n", name);
+}
+
+module_init(hello_init);
+module_exit(hello_exit);
+MODULE_LICENSE("GPL");
+```
+
+```bash
+# パラメータを指定してロード
+sudo insmod hello_param.ko count=3 name="Linux"
+
+dmesg | tail -3
+# hello: Hello, Linux! (1/3)
+# hello: Hello, Linux! (2/3)
+# hello: Hello, Linux! (3/3)
+
+# sysfs 経由でパラメータを確認・変更
+cat /sys/module/hello_param/parameters/count
+# 3
+```
+
+`module_param` の第 3 引数はパーミッション:
+
+- `0644` — オーナー読み書き、グループ・他者読み取りのみ → sysfs に表示される
+- `0` — sysfs にエントリを作らない
+
+## /proc/modules と /sys/module/
+
+モジュールをロードすると、2 つの場所に情報が現れる:
+
+- **`/proc/modules`** — `lsmod` が読む元データ。モジュール名、サイズ、使用カウント
+- **`/sys/module/<name>/`** — sysfs エントリ。パラメータ、refcount、セクション情報
+
+```bash
+# モジュールのセクションアドレス (GDB デバッグに使う)
+cat /sys/module/hello/sections/.text
+```
+
+## C カーネルコードのエラーハンドリング
+
+カーネルの C コードでは、エラーハンドリングに独自のパターンが確立している。
+ユーザランドの C とは異なり、例外は存在しない。全てのエラーは戻り値で伝播する。
+
+### goto cleanup パターン
+
+カーネルで最も広く使われるエラー処理パターン。リソースを確保した逆順で解放する:
+
+```c
+static int __init my_init(void)
+{
+    int ret;
+
+    ret = alloc_resource_a();
+    if (ret)
+        return ret;
+
+    ret = alloc_resource_b();
+    if (ret)
+        goto err_free_a;
+
+    ret = alloc_resource_c();
+    if (ret)
+        goto err_free_b;
+
+    return 0;
+
+err_free_b:
+    free_resource_b();
+err_free_a:
+    free_resource_a();
+    return ret;
+}
+```
+
+このパターンは「リソース確保の逆順で解放」を保証する。Rust の `?` 演算子 + Drop が自動的に行うことを、C では手動で書く。
+
+### ERR_PTR / IS_ERR / PTR_ERR
+
+カーネル関数がポインタを返す場合、NULL ではなく「エラーコードを埋め込んだポインタ」を返す慣習がある:
+
+```c
+void *ptr = some_kernel_function();
+if (IS_ERR(ptr)) {
+    int err = PTR_ERR(ptr);   /* 負の errno を取り出す */
+    pr_err("failed: %d\n", err);
+    return err;
+}
+/* ptr は有効なポインタ */
+```
+
+| マクロ | 用途 |
+|---|---|
+| `ERR_PTR(-ENOMEM)` | errno をポインタに変換 (関数の戻り値) |
+| `IS_ERR(ptr)` | ポインタがエラーか判定 |
+| `PTR_ERR(ptr)` | ポインタから errno を取り出す |
+| `IS_ERR_OR_NULL(ptr)` | **通常は使うべきでない** — NULL とエラーを混同する |
+
+### 戻り値の規約
+
+| 戻り値 | 意味 |
+|---|---|
+| `0` | 成功 |
+| 負の errno (`-ENOMEM`, `-EINVAL`, ...) | エラー |
+| 正の値 | 関数による (バイト数等) |
+
+Rust ではこれが `Result<T, kernel::error::Error>` に対応する ([Ch 13](/part4-device-drivers/13-chardev-rust/) で詳しく扱う)。
+
+## GPL とカーネルモジュールのライセンス
+
+### なぜ MODULE_LICENSE("GPL") が重要か
+
+`MODULE_LICENSE("GPL")` は単なるメタデータではない。カーネルは GPL-only としてエクスポートされたシンボル (`EXPORT_SYMBOL_GPL`) を、GPL モジュールにのみ公開する。
+
+```c
+/* カーネル本体 */
+EXPORT_SYMBOL(public_function);       /* 全モジュールから利用可能 */
+EXPORT_SYMBOL_GPL(gpl_only_function); /* GPL モジュールのみ利用可能 */
+```
+
+`kmalloc`, `kfree` を含む主要な API の多くが `EXPORT_SYMBOL_GPL` である。
+`MODULE_LICENSE("GPL")` 以外を指定すると、これらが使えずリンクエラーになる。
+
+### Tainted kernel
+
+GPL 以外のモジュールをロードすると、カーネルは **tainted** (汚染) 状態になる:
+
+```bash
+# taint フラグの確認
+cat /proc/sys/kernel/tainted
+# 0 = クリーン
+```
+
+tainted カーネルのバグ報告はカーネル開発者に無視される場合がある。
+
+### Rust モジュールは inherently GPL
+
+Rust カーネルモジュールは `kernel` crate の GPL-only シンボルに依存するため、事実上 GPL が必須である。`module!` マクロの `license: "GPL"` は形式的な宣言ではなく、技術的な必然である。
+
+## よくある罠
+
+1. **`MODULE_LICENSE("GPL")` を書き忘れる** — GPL-only シンボル (`kmalloc` 等) が見えずリンクエラーになる。
+   カーネルログに `module: loading out-of-tree module taints kernel` と表示される。
+
+2. **init 関数で非ゼロを返すのに cleanup しない** — init の途中でエラーが起きた場合、
+   それまでに確保したリソースは自分で解放してから return しなければならない。
+
+3. **`printk` のバッファリング** — `printk` はリングバッファに書き込むだけで、
+   コンソールへの表示にはラグがある場合がある。`dmesg` で確認するのが確実。
+
+4. **`__init` / `__exit` を忘れる** — 動作には影響しないが、初期化後にメモリが解放されない。
+
+## 章末演習
+
+1. 上記の `hello.c` を実際にビルドし、`insmod` / `dmesg` / `rmmod` のサイクルを 3 回繰り返せ。
+
+2. `pr_info` の代わりに `pr_debug`, `pr_warn`, `pr_err` を使うバージョンを書き、
+   `dmesg -l warn,err` でフィルタして表示を確認せよ。
+
+3. `module_param` で `int` 型のパラメータ `delay_ms` を追加し、
+   init 時に `msleep(delay_ms)` で指定ミリ秒待つモジュールを書け。
+   (`#include <linux/delay.h>` が必要)
+
+---
+
+次の章 → [Ch 5. 最初のカーネルモジュール — Rust 版](/part2-first-module/05-hello-rust/)
+
+## 参考資料
+
+- [Linux Kernel Module Programming Guide (LKMPG)](https://sysprog21.github.io/lkmpg/)
+- [Character device drivers (Linux Kernel Labs)](https://linux-kernel-labs.github.io/refs/heads/master/labs/device_drivers.html)
+- [kernel/module/ source](https://elixir.bootlin.com/linux/latest/source/kernel/module)
+- [printk documentation](https://docs.kernel.org/core-api/printk-basics.html)

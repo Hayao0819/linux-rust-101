@@ -1,0 +1,455 @@
+---
+title: "Ch 18. ケーススタディ"
+description: "Binder, rnull, Nova, PHY driver, eBPF/Aya — 実世界の Rust カーネルドライバを読み解く"
+---
+
+## この章で学ぶこと
+
+- Android Binder の Rust 書き直しにおける設計判断と型安全性の効果を理解する
+- rnull (null block driver) が blk-mq 抽象層をどう活用しているか把握する
+- Nova GPU ドライバの二層アーキテクチャを説明できる
+- PHY ドライバが upstream された歴史的意義を理解する
+- eBPF/Aya という別アプローチの位置づけを把握する
+---
+
+この章はコードを書く章ではなく、**読み解く** 章である。
+実際に upstream されたドライバ、あるいは upstream を目指して開発中のドライバのソースコードを題材に、
+これまで学んできた概念がどのように現実のコードに現れるかを確認する。
+
+## 18.1 Android Binder — Rust で書き直された最大のドライバ
+
+### Binder とは何か
+
+Binder は Android の **プロセス間通信 (IPC)** メカニズムである。
+Activity Manager、Package Manager、SurfaceFlinger など、Android のほぼすべてのシステムサービスが Binder を経由して通信している。
+年間数十億台のデバイスで動作するこのドライバは、Linux カーネルの中でも最もセキュリティクリティカルなコンポーネントの一つである。
+
+C 版 Binder (`drivers/android/binder.c`) は約 6,000 行の単一ファイルであり、
+複雑なロック階層と参照カウント管理が手動で行われていた。
+Google の Alice Ryhl を中心とするチームが Rust による書き直しを行い、**Linux 6.13** でマージされた。
+
+### モジュール構成
+
+Rust 版 Binder は C 版の単一ファイル構成とは異なり、責務ごとにモジュールが分離されている。
+
+| モジュール | 役割 |
+|---|---|
+| `process.rs` | Binder を open した各プロセスの状態管理 |
+| `thread.rs` | プロセス内の各スレッドの状態管理 |
+| `transaction.rs` | プロセス間メッセージ (トランザクション) の構築と配送 |
+| `node.rs` | Binder ノード (サービスの実体) の管理 |
+| `range_alloc.rs` | mmap されたバッファ領域のアロケータ |
+| `context.rs` | サービスマネージャとの接続管理 |
+| `defs.rs` | ユーザ空間との ABI 定義 |
+
+この分離自体が大きな改善である。C 版では `binder_proc`、`binder_thread`、`binder_transaction` などの構造体が
+すべて同じファイルに混在し、どのロックがどのデータを保護しているかの把握が困難であった。
+
+### 型安全性の効果
+
+Rust 版 Binder で最も重要な設計上の変化は、**ロックとデータの結合** である。
+
+```rust
+// Rust Binder の Process 構造体 (簡略化)
+pub(crate) struct Process {
+    pub(crate) task: ARef<Task>,
+    pub(crate) inner: SpinLock<ProcessInner>,
+    // ...
+}
+
+pub(crate) struct ProcessInner {
+    pub(crate) threads: RBTree<i32, Arc<Thread>>,
+    pub(crate) nodes: RBTree<usize, Arc<Node>>,
+    pub(crate) ready_threads: List<Thread>,
+    // ...
+}
+```
+
+`ProcessInner` のフィールドにアクセスするには `inner.lock()` を呼ぶしかない。
+C 版では `binder_proc` のフィールドに直接アクセスでき、ロック取得を忘れるバグが実際に存在した。
+
+別の例として、参照カウントを見てみる。C 版では手動の `binder_inc_ref` / `binder_dec_ref` 呼び出しが
+ペアで対応している必要があったが、Rust 版では `Arc<T>` が RAII で参照カウントを管理する。
+
+```rust
+// ノードへの参照を保持 — Drop 時に自動的にカウントが減る
+let node: Arc<Node> = /* ... */;
+// node がスコープを抜けると Arc::drop が呼ばれ、
+// 最後の参照なら Node::drop が実行される
+```
+
+### CVE-2025-68260 — Rust でも防げなかった並行性バグ
+
+Rust 版 Binder にも脆弱性は発見されている。
+CVE-2025-68260 は `death_list` (Binder ノードの死亡通知リスト) に関するレースコンディションであった。
+
+この問題は、2 つの操作が特定の順序で実行された場合にのみ発生する **論理的な並行性バグ** であった。
+
+```
+スレッド A: death notification の登録
+スレッド B: 同じノードの死亡処理
+
+スレッド A がリストに追加 → スレッド B がリストを走査して通知
+→ タイミングによってはスレッド A の登録が不完全な状態で通知が送られる
+```
+
+この種のバグは、各操作が個別にはロックで正しく保護されていても、
+**操作間の不変条件** が維持されない場合に発生する。
+Rust のコンパイラはデータ競合 (data race) は防ぐが、
+レースコンディション (race condition) は防がない。
+これは [Ch 1](/part1-introduction/01-why-rust/) で触れた「Rust が解決しないもの」の具体例である。
+
+**教訓**: Rust の型システムはメモリ安全性バグの大部分を排除するが、
+プロトコルレベルの正しさ (どの順序で何をロックし、どの不変条件を維持するか) は
+依然として設計者の責任である。
+
+## 18.2 rnull — null block driver
+
+### blk-mq 抽象層の実証
+
+`rnull` は Andreas Hindborg が開発した **null block driver** である。
+実際のハードウェアを持たず、すべての I/O を即座に完了させる「ダミー」ブロックデバイスである。
+一見無意味に思えるが、その目的は二つある。
+
+1. **ベンチマーク**: ブロック I/O スタックのオーバーヘッドをハードウェアの影響なしに測定できる
+2. **抽象層の実証**: Rust の blk-mq バインディングが正しく機能することを証明する最小実装
+
+rnull は C の `null_blk` ドライバとほぼ同等の機能を持ちながら、Rust の blk-mq 抽象層を使って実装されている。
+
+```rust
+// rnull のキューデータ型定義 (簡略化)
+struct NullBlkDevice;
+
+#[vtable]
+impl kernel::block::mq::Operations for NullBlkDevice {
+    type HwData = ();
+    type PerRequestData = ();
+    type QueueData = ();
+
+    fn queue_rq(
+        _hw_data: (),
+        _queue_data: &(),
+        rq: ARef<kernel::block::mq::Request<Self>>,
+        _is_last: bool,
+    ) -> Result {
+        // I/O リクエストを即座に完了
+        rq.end_ok();
+        Ok(())
+    }
+}
+```
+
+`Operations` トレイトは C の `struct blk_mq_ops` に対応する。
+C ではこの構造体の関数ポインタを手動で設定するが、
+Rust では `#[vtable]` マクロがコンパイル時にすべてのエントリを検証する。
+必須のコールバックを実装し忘れるとコンパイルエラーになる。
+
+### configfs による動的デバイス生成
+
+rnull は **configfs** を使って動的にデバイスを作成・削除できる。
+
+```bash
+# configfs でデバイスを作成
+mkdir /sys/kernel/config/rnull/mydev
+echo 1024 > /sys/kernel/config/rnull/mydev/block_size
+echo 1 > /sys/kernel/config/rnull/mydev/power
+
+# デバイスが出現
+ls /dev/rnull-mydev
+```
+
+これは C の `null_blk` も持つ機能であるが、Rust 実装では configfs のコールバックも
+型安全な抽象層を経由して実装されている点が特徴である。
+
+## 18.3 Nova — NVIDIA GPU ドライバ
+
+### 二層アーキテクチャ
+
+Nova は **Danilo Krummrich** が中心となって開発している NVIDIA GPU ドライバである。
+既存の C ドライバ `nouveau` の後継として位置づけられている。
+
+Nova の最大の設計上の特徴は **二層アーキテクチャ** である。
+
+```
+┌─────────────────────────────────────────┐
+│            ユーザ空間 (Mesa, etc.)        │
+├─────────────────────────────────────────┤
+│  nova-drm   (DRM/KMS 層)               │
+│  - GPU メモリ管理 (GEM/TTM)              │
+│  - コマンドサブミッション                  │
+│  - モードセッティング                      │
+├─────────────────────────────────────────┤
+│  nova-core   (バス非依存層)              │
+│  - ファームウェア読み込み                  │
+│  - MMIO レジスタアクセス                   │
+│  - 割り込みハンドリング                    │
+│  - GPU 初期化シーケンス                    │
+├─────────────────────────────────────────┤
+│            PCI / Platform バス            │
+└─────────────────────────────────────────┘
+```
+
+**nova-core** はバス非依存 (bus-agnostic) な層であり、GPU ハードウェアとの直接的なやり取りを担当する。
+PCIe に依存しない設計にすることで、将来的に SoC 統合 GPU などの異なるバス接続にも対応できる。
+
+**nova-drm** は DRM サブシステムとのインタフェース層であり、
+ユーザ空間からのリクエスト (メモリ割り当て、コマンドバッファ送信) を nova-core に橋渡しする。
+
+```rust
+// nova-core の Device 構造体 (概念的な簡略化)
+pub struct NovaCore {
+    bar: Devres<IoMem>,         // MMIO 領域
+    fw: Firmware,               // ファームウェアの状態
+    irq: Registration<NovaIrq>, // 割り込みハンドラ
+}
+```
+
+この二層分離により、nova-core のテストは DRM サブシステムに依存せずに行え、
+nova-drm は GPU の具体的なレジスタレイアウトを知る必要がない。
+
+### Devres パターン
+
+Nova の開発を通じて Danilo Krummrich が整備した `Devres<T>` (device-managed resource) は、
+`devres` フレームワークの Rust 版である。
+デバイスが取り除かれた (unbound された) 際に、関連するリソースを自動的に解放する。
+
+```rust
+// デバイスにリソースを紐づける
+let bar: Devres<IoMem> = Devres::new(dev, io_mem, GFP_KERNEL)?;
+
+// デバイスが unbind されると bar は自動的に revoke される
+// revoke 後のアクセスは Err を返す
+let io = bar.try_access().ok_or(ENODEV)?;
+io.writel(0x42, REGISTER_OFFSET);
+```
+
+`try_access()` が `Option<&T>` を返すことで、
+デバイスが既に取り除かれた後にリソースにアクセスしようとする use-after-free バグを
+型レベルで防止している。
+
+## 18.4 PHY ドライバ — ax88796b_rust
+
+### 最初の upstream Rust ネットワークドライバ
+
+**Fujita Tomonori** が開発した `ax88796b_rust` は、
+**Linux カーネルに upstream された最初の Rust ドライバ** として歴史的な意義を持つ。
+Linux 6.9 (2024年) でマージされた。
+
+対象ハードウェアは Asix AX88796B Ethernet PHY であり、
+既存の C ドライバ `ax88796b.c` と機能的に等価な実装を Rust で提供している。
+
+```rust
+// ax88796b_rust.rs (簡略化)
+kernel::module_phy_driver! {
+    drivers: [PhyAX88796B],
+    device_table: [
+        DeviceId::new_with_driver::<PhyAX88796B>(),
+    ],
+    name: "ax88796b_rust",
+    author: "Fujita Tomonori <fujita.tomonori@gmail.com>",
+    description: "Asix AX88796B PHY driver (Rust)",
+    license: "GPL",
+}
+
+struct PhyAX88796B;
+
+#[vtable]
+impl Driver for PhyAX88796B {
+    const FLAGS: u32 = 0;
+    const NAME: &CStr = c_str!("Asix Electronics AX88796B");
+    const PHY_DEVICE_ID: DeviceId =
+        DeviceId::new_with_exact_mask(0x003b_1841);
+
+    fn link_change_notify(dev: &mut Device) {
+        // リンク状態変化時のコールバック
+        // FDX フロー制御の設定を行う
+        if dev.state() == DeviceState::Running {
+            let phydev = dev.phy();
+            // ... 省略 ...
+        }
+    }
+}
+```
+
+PHY ドライバが最初に選ばれた理由は明確である。
+
+1. **コードが小さい**: C 版は約 80 行、Rust 版も同程度
+2. **カーネル API の依存が少ない**: `phylib` の薄い抽象層だけで足りる
+3. **ハードウェアの入手性**: QEMU で動作確認可能
+4. **既存 C ドライバとの比較が容易**: 同じハードウェアに対する実装が並存できる
+
+この「最小のドライバから始めて抽象層を検証する」アプローチは、
+Rust for Linux プロジェクト全体の戦略を象徴している。
+
+## 18.5 eBPF/Aya — もう一つの「Rust for カーネル」
+
+eBPF (extended Berkeley Packet Filter) はカーネル内で安全にプログラムを実行する仮想マシンである。
+**Aya** はその eBPF プログラムを Rust で記述するためのフレームワークである。
+
+```rust
+// Aya による XDP プログラムの例
+#[xdp]
+pub fn xdp_firewall(ctx: XdpContext) -> u32 {
+    match try_xdp_firewall(&ctx) {
+        Ok(ret) => ret,
+        Err(_) => xdp_action::XDP_ABORTED,
+    }
+}
+
+fn try_xdp_firewall(ctx: &XdpContext) -> Result<u32, ()> {
+    let eth = ctx.load::<EthHdr>(0).map_err(|_| ())?;
+    if eth.ether_type != EtherType::Ipv4 {
+        return Ok(xdp_action::XDP_PASS);
+    }
+    // パケットフィルタリングロジック ...
+    Ok(xdp_action::XDP_DROP)
+}
+```
+
+Aya と Rust for Linux は補完的な関係にある。
+
+| 特性 | Rust for Linux | eBPF/Aya |
+|---|---|---|
+| 実行環境 | カーネルモジュールとして直接実行 | eBPF VM 上でサンドボックス実行 |
+| 対象 | デバイスドライバ、ファイルシステム | ネットワーク、トレーシング、セキュリティ |
+| カーネルビルド | カーネルツリー内でビルド | ユーザ空間からロード |
+| 安全性保証 | Rust の型システム | eBPF verifier + Rust の型システム |
+| API アクセス | カーネル全 API | eBPF helper 関数のみ |
+| 再起動 | モジュールのロード/アンロードが必要 | 実行中のカーネルに動的に注入可能 |
+
+eBPF/Aya は「カーネルを変更せずに Rust でカーネルレベルの機能を実装する」手段として、
+特にネットワーク処理 (XDP, TC) や可観測性 (tracepoint, kprobe) の分野で広く使われている。
+
+## 18.6 "No new C DRM drivers" — Dave Airlie の方針
+
+DRM (Direct Rendering Manager) サブシステムのメンテナである **Dave Airlie** は、
+2025 年に「新規の C DRM ドライバは受け入れない」方針を公式に表明した。
+
+この宣言の背景には以下の事情がある。
+
+1. **GPU ドライバの複雑さ**: DRM ドライバは数万行規模になることが多く、メモリ安全性バグのリスクが特に高い
+2. **nouveau の教訓**: NVIDIA GPU の C ドライバ `nouveau` は長年にわたるメンテナンス困難に陥っていた
+3. **Nova の進展**: Rust で書かれた Nova が実用的な代替となり得ることが示された
+
+この方針はカーネルコミュニティ全体に影響を与えている。
+DRM は Linux カーネルの中でも最大のサブシステムの一つであり、
+ここが Rust を公式に採用したことで、他のサブシステムへの波及効果が期待されている。
+
+現在 Rust で開発が進んでいる DRM ドライバには以下がある。
+
+| ドライバ | GPU | 開発者 |
+|---|---|---|
+| **Nova** | NVIDIA (GSP 対応世代) | Danilo Krummrich |
+| **Tyr** | ARM Mali | Alyssa Rosenzweig |
+| **asahi** (計画) | Apple M シリーズ | Asahi Linux チーム |
+
+## 18.7 横断的な観察
+
+ここまでのケーススタディから、いくつかの共通パターンが見える。
+
+### パターン 1: ロックとデータの結合
+
+すべての Rust ドライバで、`Mutex<T>` や `SpinLock<T>` がデータを内包する設計が使われている。
+C ではロックとデータが分離しているため「このフィールドはどのロックで保護されている?」をコメントに書くしかない。
+
+```c
+/* C: コメントに頼るしかない */
+struct binder_proc {
+    struct mutex outer_lock;    /* protects: todo, ... */
+    struct spinlock inner_lock; /* protects: threads, nodes, ... */
+    struct rb_root threads;     /* protected by inner_lock */
+    struct rb_root nodes;       /* protected by inner_lock */
+    struct list_head todo;      /* protected by outer_lock */
+};
+```
+
+```rust
+// Rust: 型システムが強制する
+struct Process {
+    inner: SpinLock<ProcessInner>,  // threads, nodes はここに入る
+    outer: Mutex<ProcessOuter>,     // todo はここに入る
+}
+```
+
+### パターン 2: RAII による確実なクリーンアップ
+
+C ドライバでは `goto err_cleanup` パターンが多用されるが、
+Rust ドライバでは `Drop` トレイトが自動的にリソースを解放する。
+Nova の `Devres<T>` はこのパターンの極致である。
+
+### パターン 3: #[vtable] による構造体の型安全化
+
+C のカーネルサブシステムは `struct xxx_ops` に関数ポインタを並べる設計が標準であるが、
+Rust では `#[vtable]` 付きトレイトでこれを型安全に表現する。
+PHY ドライバ、blk-mq ドライバ、DRM ドライバのすべてでこのパターンが使われている。
+
+## 章末演習
+
+### 演習 18-1: Binder Process 構造体の分析
+
+以下は Rust Binder の `Process` 構造体の抜粋である (簡略化済み)。
+
+```rust
+pub(crate) struct Process {
+    pub(crate) ctx: Arc<Context>,
+    pub(crate) task: ARef<Task>,
+    pub(crate) inner: SpinLock<ProcessInner>,
+    #[cfg(CONFIG_BINDERFS)]
+    pub(crate) binderfs_entry: Mutex<Option<binderfs::Entry>>,
+}
+
+pub(crate) struct ProcessInner {
+    pub(crate) threads: RBTree<i32, Arc<Thread>>,
+    pub(crate) nodes: RBTree<usize, Arc<Node>>,
+    pub(crate) ready_threads: List<Thread>,
+    pub(crate) requested_thread_count: u32,
+    pub(crate) max_threads: u32,
+    pub(crate) started_thread_count: u32,
+    pub(crate) is_dead: bool,
+}
+```
+
+以下の問いに答えよ。
+
+1. `threads` フィールドにアクセスするためにはどのロックを取得する必要があるか。
+   型定義からその根拠を説明せよ。
+
+2. `ctx` フィールドはロックなしでアクセスできる。なぜ安全と言えるのか。
+   `Arc<T>` のセマンティクスを踏まえて説明せよ。
+
+3. C 版では `binder_proc->threads` へのアクセスにロック取得を忘れるバグが存在した。
+   この Rust の設計でそのバグがどのように防止されるか、コンパイラの挙動の観点から説明せよ。
+
+4. `is_dead` が `ProcessInner` の中にある設計上の意味を考察せよ。
+   もし `Process` の直接のフィールド (`AtomicBool`) としたら、どのような問題が生じ得るか。
+
+### 演習 18-2: ドライバ比較
+
+PHY ドライバ (ax88796b_rust) と rnull (null block driver) を比較し、以下の表を埋めよ。
+
+| 観点 | ax88796b_rust | rnull |
+|---|---|---|
+| 対象サブシステム | | |
+| `#[vtable]` で実装するトレイト | | |
+| コード行数 (概算) | | |
+| configfs 対応の有無 | | |
+| upstream 状況 | | |
+
+### 演習 18-3: 設計判断
+
+Nova の二層アーキテクチャ (nova-core / nova-drm) において、
+「ファームウェア読み込み」機能はどちらの層に配置されているか。その理由を、
+「バス非依存」というキーワードを使って 3 行以内で説明せよ。
+
+## 参考資料
+
+- [Rust for Linux 公式サイト](https://rust-for-linux.com/)
+- [Binder — Rust for Linux](https://rust-for-linux.com/android-binder-driver)
+- [Null block driver (rnull) — Rust for Linux](https://rust-for-linux.com/null-block-driver)
+- [Nova GPU driver — Rust for Linux](https://rust-for-linux.com/nova-gpu-driver)
+- [PHY driver — Rust for Linux](https://rust-for-linux.com/phy-driver)
+- [Aya — eBPF in Rust](https://aya-rs.dev/)
+- [Dave Airlie "No new C DRM drivers" (LWN.net)](https://lwn.net/Articles/998278/)
+- [CVE-2025-68260 (NVD)](https://nvd.nist.gov/vuln/detail/CVE-2025-68260)
+- [Alice Ryhl "Rust Binder" talk (Linux Plumbers Conference)](https://lpc.events/)
+- [Danilo Krummrich "Nova" talk (XDC 2024)](https://www.x.org/wiki/Events/XDC2024/)
